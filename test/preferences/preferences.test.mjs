@@ -984,3 +984,89 @@ test('desktop and terminal Codex root sessions can supply selections while autom
     ['desktop', 'terminal'],
   )
 })
+
+test('native Codex completed user items verify a typed selection once across legacy fanout and hook prompts never replace the person', async (t) => {
+  // Arrange
+  const { root, repo, store } = createFixture(t)
+  const codex = join(root, 'test-codex')
+  const brief =
+    'D1 — ' +
+    bug.question +
+    '\nA) Fix in this PR\nB) Open a separate issue\n<gstack-qid:bug-scope>'
+  const item = (value, at) =>
+    codexEvent(
+      'event_msg',
+      {
+        type: 'item_completed',
+        thread_id: 'native',
+        turn_id: 'turn',
+        item: value,
+      },
+      at,
+    )
+  const agent = (at) =>
+    item(
+      {
+        type: 'AgentMessage',
+        id: 'a' + at,
+        phase: 'final_answer',
+        content: [{ type: 'Text', text: brief }],
+      },
+      at,
+    )
+  const user = (text, at) =>
+    item(
+      {
+        type: 'UserMessage',
+        id: 'u' + at,
+        client_id: 'typed-' + at,
+        content: [{ type: 'text', text, text_elements: [] }],
+      },
+      at,
+    )
+  saveLines(
+    join(codex, 'sessions', '2025', '01', '01', 'rollout-current.jsonl'),
+    [
+      codexEvent(
+        'session_meta',
+        {
+          id: 'native',
+          cwd: repo,
+          source: 'vscode',
+          originator: 'codex-tui',
+          thread_source: 'user',
+        },
+        0,
+      ),
+      agent(1000),
+      codexEvent('event_msg', { type: 'agent_message', message: brief }, 1001),
+      user('A', 2000),
+      codexEvent(
+        'event_msg',
+        { type: 'user_message', client_id: 'typed-2000', message: 'A' },
+        2002,
+      ),
+      agent(4000),
+      item(
+        { type: 'HookPrompt', id: 'hook', fragments: [{ text: 'B' }] },
+        4500,
+      ),
+      user('B', 5000),
+    ],
+  )
+
+  // Act
+  const report = await store.importHistory({ codex })
+
+  // Assert
+  assert.equal(report.observations, 1)
+  assert.deepEqual(store.humanResponsesSince(0), [
+    {
+      source: 'codex',
+      sessionId: 'native',
+      responseId: 'prompt:typed-2000',
+      at: base + 2000,
+    },
+  ])
+  assert.equal(store.evaluate(bug, { cwd: repo }).summary.choices[0].current, 1)
+})
