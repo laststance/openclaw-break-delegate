@@ -249,6 +249,7 @@ export class LocalActivityProbe {
   readonly #env: NodeJS.ProcessEnv
   readonly #home: string
   readonly #pendingReplies = new Map<string, VerifiedReply>()
+  readonly #pendingExclusions = new Map<string, VerifiedReply>()
   readonly #detector: RolloutDetector
   readonly #now: () => number
   readonly #timeout: number
@@ -351,10 +352,17 @@ export class LocalActivityProbe {
     const results = await Promise.allSettled(sources.map(([, read]) => read))
     // Readers have advanced their offsets. Retain every witnessed reply before a snapshot can fail.
     for (const result of results) {
-      if (result.status === 'fulfilled')
-        for (const reply of result.value.replies ?? [])
-          if (!this.#pendingReplies.get(reply.originId)?.observedLive)
-            this.#pendingReplies.set(reply.originId, reply)
+      if (result.status !== 'fulfilled') continue
+      for (const reply of result.value.excludedReplies ?? []) {
+        this.#pendingReplies.delete(reply.originId)
+        this.#pendingExclusions.set(reply.originId, reply)
+      }
+      for (const reply of result.value.replies ?? [])
+        if (
+          !this.#pendingExclusions.has(reply.originId) &&
+          !this.#pendingReplies.get(reply.originId)?.observedLive
+        )
+          this.#pendingReplies.set(reply.originId, reply)
     }
     for (const [i, result] of results.entries()) {
       const source = sources[i][0]
@@ -373,6 +381,10 @@ export class LocalActivityProbe {
         status: partial ? 'partial' : 'available',
         detail,
       })
+    }
+    for (const [id, reply] of this.#pendingExclusions) {
+      supervision.retractHumanReply({ provider: 'codex', ...reply })
+      this.#pendingExclusions.delete(id)
     }
     for (const [id, reply] of this.#pendingReplies) {
       supervision.humanReply({ provider: 'codex', ...reply })

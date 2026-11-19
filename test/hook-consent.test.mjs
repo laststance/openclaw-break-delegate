@@ -102,7 +102,7 @@ test('Claude conveys an incomplete instruction and a qualified answer without co
   assert.equal(JSON.stringify(observed).includes(note), false)
 })
 
-test('an oversized terminal task still places an instruction hold on its originating process', async (t) => {
+test('a 300 KB task routes its instruction hold to the authenticated top-level session after the private prompt', async (t) => {
   // Arrange
   const directory = await mkdtemp(join(tmpdir(), 'bd-overflow-'))
   t.after(() => rm(directory, { recursive: true, force: true }))
@@ -112,14 +112,27 @@ test('an oversized terminal task still places an instruction hold on its origina
     return true
   })
   t.after(close)
-  const wire = JSON.stringify({
-    prompt: 'a'.repeat(300_000) + ' Do not change the code.',
-    session_id: 'terminal-A',
-    hook_event_name: 'UserPromptSubmit',
-  })
+  const wire = Buffer.from(
+    JSON.stringify({
+      prompt:
+        'private \\"session_id\\": "quoted-decoy" }{ '.repeat(10_000) +
+        ' Do not change the code.',
+      nested: [
+        {
+          session_id: 'nested-decoy',
+          hook_event_name: 'Stop',
+          agent_id: 'unused',
+        },
+      ],
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 'terminal-A',
+    }).replace('"terminal-A"', '"terminal-\\u0041"'),
+  )
+  const parts = []
+  for (let i = 0; i < wire.length; i += 47) parts.push(wire.subarray(i, i + 47))
 
   // Act
-  const body = await readHookInput(Readable.from([Buffer.from(wire)]))
+  const body = await readHookInput(Readable.from(parts))
   await runHook(
     directory,
     body,
@@ -130,6 +143,58 @@ test('an oversized terminal task still places an instruction hold on its origina
 
   // Assert
   assert.deepEqual(requests, [
-    { op: 'incomplete-instruction', incarnation: 'process-A' },
+    {
+      op: 'incomplete-instruction',
+      incarnation: 'process-A',
+      sessionId: 'terminal-A',
+    },
+  ])
+  assert.ok(wire.length > 300_000)
+  assert.equal(JSON.stringify(body).includes('private'), false)
+})
+
+test('malformed or ambiguous oversized JSON protects the process while identified subagent tasks leave the root session alone', async (t) => {
+  // Arrange
+  const directory = await mkdtemp(join(tmpdir(), 'bd-unknown-routing-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const requests = []
+  const close = await listenGateway(directory, async (request) => {
+    requests.push(request)
+    return true
+  })
+  t.after(close)
+  const long = 'x'.repeat(310_000)
+  const submitted = {
+    hook_event_name: 'UserPromptSubmit',
+    session_id: 'root',
+    prompt: long,
+  }
+  const inputs = [
+    JSON.stringify(submitted).slice(0, -1),
+    JSON.stringify(submitted).replace('x"', 'x\\z"'),
+    JSON.stringify(submitted).replace(
+      '"session_id":',
+      '"session_id":"decoy","session_id":',
+    ),
+    JSON.stringify({ ...submitted, agent_id: 'subagent' }),
+  ]
+
+  // Act
+  for (const wire of inputs) {
+    const body = await readHookInput(Readable.from([wire]))
+    await runHook(
+      directory,
+      body,
+      async () => {},
+      'same-process',
+      'UserPromptSubmit',
+    )
+  }
+
+  // Assert
+  assert.deepEqual(requests, [
+    { op: 'incomplete-instruction', incarnation: 'same-process' },
+    { op: 'incomplete-instruction', incarnation: 'same-process' },
+    { op: 'incomplete-instruction', incarnation: 'same-process' },
   ])
 })

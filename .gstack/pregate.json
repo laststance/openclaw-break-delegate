@@ -1,0 +1,5 @@
+{
+  "strays": {
+    "allow": ["openclaw.plugin.json", "pnpm-workspace.yaml"]
+  }
+}

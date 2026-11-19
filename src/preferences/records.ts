@@ -1,4 +1,16 @@
 import {
+  automated,
+  automaticCodexRecord,
+  automaticCodexRequest,
+  codexCallId,
+  codexInputTool,
+  parseObject,
+  readCodexResult,
+  record,
+  str,
+  type Row,
+} from '../provenance.js'
+import {
   EvidenceDatabase,
   typedResponseId,
   type EvidenceSource,
@@ -16,19 +28,6 @@ import { canonicalRepository, digest } from './repository.js'
 
 export type HistoryFormat =
   'claude' | 'codex' | 'gstack' | 'claude-input' | 'codex-input'
-type Row = Record<string, unknown>
-const record = (v: unknown): Row =>
-  v && typeof v === 'object' && !Array.isArray(v) ? (v as Row) : {}
-const str = (v: unknown) => (typeof v === 'string' ? v : '')
-const parseObject = (v: unknown): Row => {
-  if (typeof v !== 'string') return record(v)
-  try {
-    return record(JSON.parse(v))
-  } catch {
-    return {}
-  }
-}
-
 /** Detect a qualification attached to this exact Claude question without forwarding the person's note.
  * The live hook and transcript importer use identical semantics.
  * @example hasAnswerNotes({Scope:{notes:'Only after review'}}, 'Scope')
@@ -47,86 +46,6 @@ function timestamp(v: unknown): number | null {
 }
 const pairableId = (v: string) =>
   v.length > 0 && v.length <= 256 && !/[\x00-\x1f]/u.test(v)
-const machineSources = new Set([
-  'auto',
-  'auto-decided',
-  'agent',
-  'hook',
-  'model',
-  'assistant',
-  'automation',
-  'delegated',
-  'system',
-  'subagent',
-  'coordinator',
-  'peer',
-  'spawned-env-deny',
-  'config',
-])
-const humanAuthors = new Set([
-  'human',
-  'person',
-  'user',
-  'typed',
-  'interactive',
-  'user_temporary',
-])
-
-function automated(row: Row): boolean {
-  const author = record(row.author)
-  const origin = record(row.origin)
-  const claims = [
-    typeof row.author === 'string' ? row.author : author.role,
-    origin.kind,
-    row.answerSource,
-    row.answer_source,
-    row.responder,
-    row.authorship,
-  ]
-  return (
-    row.isSidechain === true ||
-    row.isMeta === true ||
-    row.isCompactSummary === true ||
-    row.isSynthetic === true ||
-    row.isDelegated === true ||
-    row.delegated === true ||
-    !!row.agentId ||
-    !!row.agent_id ||
-    claims.some((v) => v != null && !humanAuthors.has(str(v).toLowerCase())) ||
-    machineSources.has(str(row.source).toLowerCase())
-  )
-}
-
-function automaticCodexRecord(row: Row): boolean {
-  return (
-    automated(row) ||
-    row.autoResolutionMs != null ||
-    row.auto_resolution_ms != null ||
-    [
-      row.automated,
-      row.timedOut,
-      row.timed_out,
-      row.autoResolved,
-      row.auto_resolved,
-    ].some((flag) => flag != null && flag !== false)
-  )
-}
-
-const codexInputTool = (name: unknown) =>
-  ['request_user_input', 'functions.request_user_input'].includes(str(name))
-
-function codexResult(raw: unknown): Row {
-  // The wire output is a JSON string or a single text content item containing the same JSON.
-  if (Array.isArray(raw)) {
-    const block = record(raw[0])
-    return raw.length === 1 &&
-      ['text', 'input_text', 'output_text', 'Text'].includes(str(block.type))
-      ? parseObject(block.text)
-      : {}
-  }
-  return parseObject(raw)
-}
-
 interface StoredQuestion {
   key: string
   card: QuestionCard
@@ -633,14 +552,10 @@ function codexRow(
     sessionId: state.session!,
     toolUseId: id,
   })
-  const nativeCall = (part: Row) =>
-    origin(str(part.call_id) || str(part.callId) || str(part.id))
+  const nativeCall = (part: Row) => origin(codexCallId(part))
   const request = (call: Origin, args: Row, ...envelopes: Row[]) => {
     delete state.brief
-    if (
-      args.answers !== undefined ||
-      [row, payload, args, ...envelopes].some(automaticCodexRecord)
-    ) {
+    if (automaticCodexRequest(args, row, payload, ...envelopes)) {
       db.exclude(call)
       counts.unverified++
       return
@@ -648,21 +563,14 @@ function codexRow(
     rememberCall(db, call, state.repo, readQuestions(args.questions), at)
   }
   const result = (call: Origin, raw: unknown, ...envelopes: Row[]) => {
-    const output = codexResult(raw)
-    const answers = Object.values(record(output.answers)).map(record)
-    const content = Array.isArray(raw) ? raw.map(record) : []
-    // A mirror may supply provenance after (or before) the unmarked copy. Tombstone the canonical call before consulting its original offer.
-    if (
-      [
-        row,
-        payload,
-        record(raw),
-        output,
-        ...content,
-        ...envelopes,
-        ...answers,
-      ].some(automaticCodexRecord)
-    ) {
+    const { output, automatic } = readCodexResult(
+      raw,
+      row,
+      payload,
+      ...envelopes,
+    )
+    // A mirror may supply provenance before or after the unmarked copy of the same call.
+    if (automatic) {
       db.exclude(call)
       counts.unverified++
       return

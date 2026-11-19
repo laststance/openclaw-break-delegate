@@ -648,6 +648,15 @@ export async function startService(
           r.incarnation.length > 180
         )
           return false
+        if (
+          typeof r.sessionId === 'string' &&
+          r.sessionId.length > 0 &&
+          r.sessionId.length <= 256 &&
+          !/[\x00-\x1f]/u.test(r.sessionId)
+        ) {
+          preferences.recordInstruction('claude', r.sessionId, '', now(), true)
+          return true
+        }
         db.prepare(
           'INSERT OR REPLACE INTO bd_incomplete_prompts VALUES(?,?)',
         ).run(r.incarnation, now())

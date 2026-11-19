@@ -17,6 +17,7 @@ import {
   parseClaudeAgents,
 } from '../../dist/supervision/activity.js'
 import { RolloutDetector } from '../../dist/supervision/codex-rollout.js'
+import { PreferenceStore } from '../../dist/preferences/index.js'
 
 const now = Date.UTC(2026, 5, 1, 12)
 const ts = new Date(now).toISOString()
@@ -222,6 +223,172 @@ test('auto-resolutions, unrelated prompts, malformed selections, and spawned age
   assert.deepEqual(
     result.observations.map((o) => [o.sessionId, o.status]),
     [['desktop', 'idle']],
+  )
+})
+
+test('live and history readers give zero credit to auto-resolved Codex outputs at every native envelope and four points to a human selection', async (t) => {
+  // Arrange
+  const { home, file } = await isolated(t)
+  const db = new DatabaseSync(':memory:')
+  t.after(() => db.close())
+  const supervisor = new Supervision(db, { now: () => now })
+  const preferences = new PreferenceStore(db)
+  const probe = new LocalActivityProbe({
+    codexHome: home,
+    now: () => now,
+    readClaude: empty,
+    readCodex: empty,
+    readWriters: async () => [file],
+  })
+  const ask = (id) =>
+    input(id, {
+      questions: [
+        {
+          id: 'layout',
+          question: 'Which layout should we use?',
+          options: [{ label: 'Compact' }, { label: 'Wide' }],
+        },
+      ],
+    })
+  const nativeOutput = (id, extra) =>
+    event('item_completed', {
+      thread_id: 'cli',
+      item: {
+        type: 'FunctionCallOutput',
+        id,
+        name: 'request_user_input',
+        output: JSON.stringify({
+          answers: { layout: { answers: ['Compact'] } },
+        }),
+        ...extra,
+      },
+    })
+  const nested = answer('function-output')
+  nested.payload.autoResolved = true
+  const content = item('custom_tool_call_output', {
+    call_id: 'content',
+    output: [
+      {
+        type: 'text',
+        text: JSON.stringify({ answers: { layout: { answers: ['Compact'] } } }),
+        responder: 'agent',
+      },
+    ],
+  })
+  await writeFile(file, jsonl(session('cli'), event('task_started')))
+  await probe.poll(supervisor)
+
+  // Act
+  await appendFile(
+    file,
+    jsonl(
+      ask('autoResolved'),
+      answer('autoResolved', { autoResolved: true }),
+      ask('snake'),
+      answer('snake', { auto_resolved: true }),
+      ask('row'),
+      { ...answer('row'), timedOut: true },
+      ask('function-output'),
+      nested,
+      ask('answer'),
+      answer('answer', {
+        answers: { layout: { answers: ['Compact'], autoResolved: true } },
+      }),
+      ask('content'),
+      content,
+      nativeOutput('early-native', { autoResolved: true }),
+      ask('early-native'),
+      answer('early-native'),
+      { ...ask('request'), auto_resolution_ms: 0 },
+      ask('request'),
+      answer('request'),
+    ),
+  )
+  await probe.poll(supervisor)
+  await preferences.importHistory({ codex: home })
+
+  // Assert
+  assert.equal(supervisor.status().score, 0)
+  assert.deepEqual(preferences.humanResponsesSince(0), [])
+  await appendFile(
+    file,
+    jsonl(
+      ask('human'),
+      answer('human', {
+        autoResolved: false,
+        auto_resolved: false,
+        automated: false,
+      }),
+    ),
+  )
+  await probe.poll(supervisor)
+  await preferences.importHistory({ codex: home })
+  assert.equal(supervisor.status().score, 4)
+  assert.deepEqual(
+    preferences.humanResponsesSince(0).map((reply) => reply.responseId),
+    ['tool:human'],
+  )
+})
+
+test('a later marked native mirror retracts the provisional live selection while independent human answers keep their four points', async (t) => {
+  // Arrange
+  const { home, file } = await isolated(t)
+  const db = new DatabaseSync(':memory:')
+  t.after(() => db.close())
+  const supervisor = new Supervision(db, { now: () => now })
+  const probe = new LocalActivityProbe({
+    codexHome: home,
+    now: () => now,
+    readClaude: empty,
+    readCodex: empty,
+    readWriters: async () => [file],
+  })
+  await writeFile(file, jsonl(session('cli'), event('task_started')))
+  await probe.poll(supervisor)
+  await appendFile(
+    file,
+    jsonl(input('late'), answer('late'), input('human'), answer('human')),
+  )
+  await probe.poll(supervisor)
+  assert.equal(supervisor.status().score, 8)
+
+  // Act
+  await appendFile(
+    file,
+    jsonl(
+      event('item_completed', {
+        thread_id: 'cli',
+        item: {
+          type: 'FunctionCallOutput',
+          id: 'late',
+          name: 'request_user_input',
+          output: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                answers: { layout: { answers: ['Compact'] } },
+                autoResolved: true,
+              }),
+            },
+          ],
+        },
+      }),
+    ),
+  )
+  await probe.poll(supervisor)
+  await appendFile(file, jsonl(input('late'), answer('late')))
+  await probe.poll(supervisor)
+
+  // Assert
+  assert.equal(supervisor.status().score, 4)
+  assert.equal(
+    supervisor.humanReply({
+      provider: 'codex',
+      sessionId: 'cli',
+      responseId: 'tool:late',
+      observedLive: true,
+    }),
+    false,
   )
 })
 

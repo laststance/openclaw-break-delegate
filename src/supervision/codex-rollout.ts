@@ -2,6 +2,13 @@ import { createHash } from 'node:crypto'
 import { constants } from 'node:fs'
 import { open, realpath } from 'node:fs/promises'
 import { isAbsolute, relative, resolve, sep } from 'node:path'
+import {
+  automaticCodexRecord,
+  automaticCodexRequest,
+  codexCallId,
+  codexInputTool,
+  readCodexResult,
+} from '../provenance.js'
 import type { Activity, Observation } from './workload.js'
 
 type Json = Record<string, unknown>
@@ -15,6 +22,7 @@ export interface VerifiedReply {
 export interface DetectorResult {
   observations: Observation[]
   replies?: VerifiedReply[]
+  excludedReplies?: VerifiedReply[]
   partial?: boolean
   detail: string
 }
@@ -123,8 +131,7 @@ function jsonValue(value: unknown): Json | undefined {
 /** Read the documented answer format and exclude skipped, defaulted, and unrecognized selections. */
 function selectionsMatch(request: Request, payload: Json): boolean {
   const answers = object(payload.answers)
-  if (!answers || request.automatic || request.questions.size === 0)
-    return false
+  if (!answers || request.questions.size === 0) return false
   if (Object.keys(answers).length !== request.questions.size) return false
   for (const [key, choices] of request.questions) {
     const selected = object(answers[key])?.answers
@@ -138,7 +145,7 @@ function selectionsMatch(request: Request, payload: Json): boolean {
   return true
 }
 
-function requestFor(args: Json): Request {
+function requestFor(args: Json, ...envelopes: Json[]): Request {
   const questions = new Map<string, Set<string>>()
   for (const q of Array.isArray(args.questions) ? args.questions : []) {
     const row = object(q)
@@ -156,8 +163,7 @@ function requestFor(args: Json): Request {
   return {
     questions,
     blocking: args.isBlocking !== false && args.is_blocking !== false,
-    automatic:
-      (args.autoResolutionMs ?? args.auto_resolution_ms ?? null) !== null,
+    automatic: automaticCodexRequest(args, ...envelopes),
   }
 }
 
@@ -202,16 +208,18 @@ function applyEvent(
   sessionId: string,
   turn: Turn,
   replies: VerifiedReply[],
+  excludedReplies: VerifiedReply[],
   observedLive: boolean,
 ) {
   const payload = object(value.payload)
   if (!payload || (payload.thread_id && payload.thread_id !== sessionId)) return
   const p = value.type === 'event_msg' ? nativeMessage(payload) : payload
+  const id = codexCallId(p)
   const at =
     typeof value.timestamp === 'string' ? Date.parse(value.timestamp) : NaN
-  const record = (responseId: string) => {
+  const record = (responseId: string, excluded = false) => {
     if (Number.isFinite(at))
-      replies.push({
+      (excluded ? excludedReplies : replies).push({
         sessionId,
         responseId,
         originId: 'codex:' + sessionId + ':' + responseId,
@@ -219,7 +227,87 @@ function applyEvent(
         observedLive,
       })
   }
+  const trackRequest = (
+    id: string,
+    args: Json | undefined,
+    ...envelopes: Json[]
+  ) => {
+    turn.previousQuestion = undefined
+    if (!args) {
+      if ([value, payload, ...envelopes].some(automaticCodexRecord))
+        record('tool:' + id, true)
+      return
+    }
+    const request = requestFor(args, value, payload, ...envelopes)
+    const previous = turn.pending.get(id)
+    // The app-server may report an automatic choice on another envelope for the same call.
+    if (previous) {
+      request.automatic ||= previous.automatic
+      request.blocking &&= previous.blocking
+      if (!request.questions.size) request.questions = previous.questions
+    }
+    if (request.automatic) record('tool:' + id, true)
+    turn.pending.set(id, request)
+  }
+  const finishRequest = (
+    id: string,
+    raw: unknown,
+    complete: boolean,
+    ...envelopes: Json[]
+  ) => {
+    const request = turn.pending.get(id)
+    const { output, automatic } = readCodexResult(
+      raw,
+      value,
+      payload,
+      ...envelopes,
+    )
+    // An early or late marked mirror excludes the same call even after its pending request has closed.
+    if (automatic || request?.automatic) record('tool:' + id, true)
+    else if (complete && request && selectionsMatch(request, output))
+      record('tool:' + id)
+    if (complete) turn.pending.delete(id)
+  }
   if (value.type === 'event_msg') {
+    const item = object(payload.item)
+    if (
+      item &&
+      (payload.type === 'item_started' || payload.type === 'item_completed')
+    ) {
+      const id = codexCallId(item)
+      const inputTool =
+        codexInputTool(item.name) &&
+        (!item.namespace || item.namespace === 'functions')
+      if (id) {
+        if (item.type === 'FunctionCallOutput' && inputTool) {
+          finishRequest(
+            id,
+            item.output,
+            payload.type === 'item_completed',
+            item,
+          )
+          return
+        }
+        if (
+          item.type === 'RequestUserInput' ||
+          (item.type === 'FunctionCall' && inputTool)
+        ) {
+          trackRequest(
+            id,
+            item.questions ? item : jsonValue(item.arguments ?? item.input),
+            item,
+          )
+          return
+        }
+      }
+    }
+    if (
+      (p.type === 'agent_message' || p.type === 'user_message') &&
+      [value, payload, p].some(automaticCodexRecord)
+    ) {
+      turn.previousQuestion = undefined
+      return
+    }
     if (p.type === 'task_started' || p.type === 'turn_started') {
       turn.state = 'running'
       turn.pending.clear()
@@ -268,8 +356,7 @@ function applyEvent(
         return
       if (
         (p.source && !['user', 'human'].includes(String(p.source))) ||
-        (p.author && !['user', 'human'].includes(String(p.author))) ||
-        p.automated === true
+        (p.author && !['user', 'human'].includes(String(p.author)))
       )
         return
       if (
@@ -295,49 +382,30 @@ function applyEvent(
         'request_permissions',
         'request_user_input',
       ].includes(String(p.type)) &&
-      typeof p.call_id === 'string'
+      id
     ) {
-      // The runtime event may add an auto-resolution timer absent from the model's arguments.
-      if (p.type === 'request_user_input') {
-        const request = requestFor(p),
-          previous = turn.pending.get(p.call_id)
-        if (previous) {
-          request.automatic ||= previous.automatic
-          request.blocking &&= previous.blocking
-          if (!request.questions.size) request.questions = previous.questions
-        }
-        turn.pending.set(p.call_id, request)
-      } else turn.pending.set(p.call_id, null)
+      if (p.type === 'request_user_input') trackRequest(id, p)
+      else turn.pending.set(id, null)
       turn.previousQuestion = undefined
     }
   } else if (value.type === 'response_item') {
-    const id = p.call_id
-    if (typeof id !== 'string') return
+    if (!id) return
     if (p.type === 'function_call' || p.type === 'custom_tool_call') {
       turn.previousQuestion = undefined
       const name =
         typeof p.name === 'string' ? p.name.split('.').at(-1) : undefined
       const args = jsonValue(p.arguments ?? p.input)
-      if (name === 'request_user_input' && args)
-        turn.pending.set(id, requestFor(args))
+      if (
+        codexInputTool(p.name) &&
+        (!p.namespace || p.namespace === 'functions')
+      )
+        trackRequest(id, args)
       else if (name === 'request_permissions') turn.pending.set(id, null)
     } else if (
       p.type === 'function_call_output' ||
       p.type === 'custom_tool_call_output'
     ) {
-      const request = turn.pending.get(id)
-      const result = jsonValue(p.output)
-      // A matching typed answer on an interactive client without an auto-resolution timer is observable.
-      if (
-        request &&
-        result &&
-        result.automated !== true &&
-        !result.timedOut &&
-        !result.timed_out &&
-        selectionsMatch(request, result)
-      )
-        record('tool:' + id)
-      turn.pending.delete(id)
+      finishRequest(id, p.output, true)
     }
   }
 }
@@ -360,7 +428,8 @@ export class RolloutDetector {
 
   async read(paths: string[]): Promise<DetectorResult> {
     const observations: Observation[] = [],
-      replies: VerifiedReply[] = []
+      replies: VerifiedReply[] = [],
+      excludedReplies: VerifiedReply[] = []
     const live = new Set(paths.slice(0, 64))
     let misses = Math.max(0, paths.length - live.size)
     for (const path of this.#tails.keys())
@@ -427,6 +496,7 @@ export class RolloutDetector {
                   tail.sessionId,
                   tail.state,
                   replies,
+                  excludedReplies,
                   observedLive,
                 )
               else {
@@ -453,9 +523,11 @@ export class RolloutDetector {
         misses++
       }
     }
+    const excludedIds = new Set(excludedReplies.map((reply) => reply.originId))
     return {
       observations,
-      replies,
+      replies: replies.filter((reply) => !excludedIds.has(reply.originId)),
+      excludedReplies,
       partial:
         misses > 0 ||
         observations.some((observation) => observation.status === 'unknown'),

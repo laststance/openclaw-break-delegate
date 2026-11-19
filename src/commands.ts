@@ -6,7 +6,7 @@ import {
   isObject,
   type ObjectValue,
 } from './ipc.js'
-import { runHook } from './hooks.js'
+import { IncompleteHookInstruction, runHook } from './hooks.js'
 
 export const commandDescription =
   'Manage break invitations and delegated Claude Code questions'
@@ -25,6 +25,124 @@ export const usage =
   commandNames.join('|') +
   '> [--state-dir PATH] [--settings PATH]'
 
+const routingKeys = new Set([
+  'session_id',
+  'hook_event_name',
+  'agent_id',
+  'agent_type',
+  'prompt',
+])
+
+/** Project oversized hook JSON onto its top-level routing fields for {@link readHookInput}.
+ * Preserve delimiters and validate string escapes so JSON.parse can verify the complete envelope without storing its prompt.
+ * @example const envelope = new HookEnvelopeReader()
+ */
+class HookEnvelopeReader {
+  private readonly decoder = new TextDecoder('utf-8', { fatal: true })
+  private readonly seen = new Set<string>()
+  private json = ''
+  private depth = 0
+  private key = ''
+  private expectingKey = false
+  private inString = false
+  private capture = false
+  private token = ''
+  private escaped = false
+  private hexLeft = 0
+
+  write(input: Buffer | string): void {
+    // An upstream iterator can hand over an arbitrarily large chunk. Decode bounded slices, including split UTF-8 sequences.
+    for (let offset = 0; offset < input.length;) {
+      let end = Math.min(offset + 16_384, input.length)
+      if (
+        typeof input === 'string' &&
+        end < input.length &&
+        /[\uD800-\uDBFF]/u.test(input[end - 1]!)
+      )
+        end++
+      const bytes =
+        typeof input === 'string'
+          ? Buffer.from(input.slice(offset, end))
+          : input.subarray(offset, end)
+      this.consume(this.decoder.decode(bytes, { stream: true }))
+      offset = end
+    }
+  }
+
+  private consume(text: string): void {
+    for (const c of text) {
+      if (this.inString) {
+        if (this.hexLeft) {
+          if (!/[0-9a-f]/iu.test(c)) throw Error('Invalid JSON escape')
+          this.hexLeft--
+        } else if (this.escaped) {
+          if (!'"\\/bfnrtu'.includes(c)) throw Error('Invalid JSON escape')
+          this.escaped = false
+          if (c === 'u') this.hexLeft = 4
+        } else if (c === '"') {
+          const value: string = this.capture
+            ? JSON.parse('"' + this.token + '"')
+            : '\u0000'
+          this.inString = false
+          if (this.depth === 1 && this.expectingKey) {
+            this.key = routingKeys.has(value) ? value : ''
+            if (this.key && this.seen.has(this.key))
+              throw Error('Duplicate hook metadata')
+            if (this.key) this.seen.add(this.key)
+            this.expectingKey = false
+            this.json += JSON.stringify(this.key)
+          } else this.json += JSON.stringify(value)
+          continue
+        } else if (c === '\\') this.escaped = true
+        else if (c < ' ') throw Error('Invalid JSON string')
+        // 256 session characters fit even when each one uses a JSON Unicode escape.
+        if (this.capture && this.token.length < 1536) this.token += c
+        else this.capture = false
+        continue
+      }
+      if (this.json.length > 65_536)
+        throw Error('Hook metadata exceeds the limit')
+      if (c === '"') {
+        this.inString = true
+        this.token = ''
+        this.capture =
+          this.depth === 1 &&
+          (this.expectingKey || (!!this.key && this.key !== 'prompt'))
+        continue
+      }
+      if (c === '{' || c === '[') {
+        this.depth++
+        if (this.depth === 1) this.expectingKey = true
+      } else if (c === '}' || c === ']') this.depth--
+      else if (c === ',' && this.depth === 1) {
+        this.expectingKey = true
+        this.key = ''
+      }
+      // Collapse JSON whitespace without merging the tokens on its two sides.
+      if (' \n\r\t'.includes(c)) {
+        if (!this.json.endsWith(' ')) this.json += ' '
+      } else this.json += c
+    }
+  }
+
+  finish(): unknown {
+    this.consume(this.decoder.decode())
+    if (this.inString) return undefined
+    const value: unknown = JSON.parse(this.json)
+    if (!isObject(value) || typeof value.hook_event_name !== 'string')
+      return undefined
+    if (value.agent_id || value.agent_type) return {}
+    if (value.hook_event_name !== 'UserPromptSubmit') return undefined
+    if (
+      typeof value.session_id !== 'string' ||
+      !/^[^\x00-\x1f]{1,256}$/u.test(value.session_id) ||
+      typeof value.prompt !== 'string'
+    )
+      return undefined
+    return new IncompleteHookInstruction(value.session_id)
+  }
+}
+
 /** Bound the input from the installed hook and signal oversized or unreadable tasks to the consent gate.
  * @example
  * const body = await readHookInput(process.stdin)
@@ -34,13 +152,22 @@ export async function readHookInput(
 ): Promise<unknown> {
   const chunks: Buffer[] = []
   let size = 0
-  for await (const part of input) {
-    const b = Buffer.isBuffer(part) ? part : Buffer.from(part)
-    size += b.length
-    if (size > 256 * 1024) return undefined
-    chunks.push(b)
-  }
+  let envelope: HookEnvelopeReader | undefined
   try {
+    for await (const part of input) {
+      size += typeof part === 'string' ? Buffer.byteLength(part) : part.length
+      if (!envelope && size <= 256 * 1024) {
+        chunks.push(Buffer.isBuffer(part) ? part : Buffer.from(part))
+        continue
+      }
+      if (!envelope) {
+        envelope = new HookEnvelopeReader()
+        for (const buffered of chunks) envelope.write(buffered)
+        chunks.length = 0
+      }
+      envelope.write(part)
+    }
+    if (envelope) return envelope.finish()
     return JSON.parse(Buffer.concat(chunks, size).toString('utf8'))
   } catch {
     return undefined

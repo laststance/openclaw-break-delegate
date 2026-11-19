@@ -5,8 +5,9 @@ import { execFileSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
+import { Readable } from 'node:stream'
 import { startService } from '../dist/service.js'
-import { requestReview } from '../dist/commands.js'
+import { readHookInput, requestReview } from '../dist/commands.js'
 import { runHook } from '../dist/hooks.js'
 import { requestGateway } from '../dist/ipc.js'
 import { PreferenceStore } from '../dist/preferences/index.js'
@@ -253,4 +254,146 @@ test('an accepted break answers the original Claude card once and keeps its repl
     true,
   )
   verify.close()
+})
+
+test('a large task veto follows the resumed Claude session and permits a different session in the former process', async (t) => {
+  // Arrange
+  const root = await mkdtemp(join(tmpdir(), 'bd-session-overflow-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const directory = join(root, 'profile'),
+    cwd = join(root, 'repo')
+  await mkdir(directory)
+  await mkdir(cwd)
+  execFileSync('git', ['init', '-q', cwd])
+  const card = {
+    question: 'How should we handle an unrelated bug?',
+    options: [{ label: 'Fix in this PR' }, { label: 'Open a separate issue' }],
+  }
+  const now = Date.now()
+  const db = new DatabaseSync(join(directory, 'state.sqlite'))
+  const preferences = new PreferenceStore(db)
+  for (let i = 0; i < 25; i++)
+    preferences.recordHumanSelection({
+      source: 'claude',
+      sessionId: 'training',
+      toolUseId: 't' + i,
+      cwd,
+      card,
+      label: 'Fix in this PR',
+      askedAt: now - 1000 + i * 10,
+      answeredAt: now - 999 + i * 10,
+    })
+  preferences.replay()
+  db.close()
+  const pass = async () => ({ status: 'authorized' })
+  let invite,
+    onAction,
+    seeded = false
+  const base = {
+    directory,
+    roots: {},
+    log: () => {},
+    judge: async () => true,
+    tickMs: 60_000,
+    nativeFactory(callback) {
+      onAction = callback
+      return {
+        status: pass,
+        authorize: pass,
+        invite: async (id) => {
+          invite = id
+          return pass()
+        },
+        active: pass,
+        summary: pass,
+        clear: pass,
+        close() {},
+      }
+    },
+  }
+  const stopOriginal = await startService({ ...base, poll: async () => {} })
+  const raw = JSON.stringify({
+    hook_event_name: 'UserPromptSubmit',
+    prompt: 'private instruction '.repeat(20_000),
+    metadata: { session_id: 'distractor' },
+    session_id: 'session-A',
+  })
+  try {
+    const body = await readHookInput(Readable.from([Buffer.from(raw)]))
+    await runHook(
+      directory,
+      body,
+      async () => {},
+      'original-process',
+      'UserPromptSubmit',
+    )
+  } finally {
+    await stopOriginal()
+  }
+  const stopResumed = await startService({
+    ...base,
+    poll: async (coordinator) => {
+      if (seeded) return
+      seeded = true
+      for (const [sessionId, incarnation] of [
+        ['session-A', 'resumed-process'],
+        ['session-B', 'original-process'],
+      ])
+        coordinator.observe({
+          provider: 'claude',
+          sessionId,
+          incarnation,
+          newSession: true,
+          canDelegate: true,
+          source: 'hook',
+          status: 'running',
+        })
+      for (let i = 0; i < 12; i++)
+        coordinator.humanReply({
+          provider: 'claude',
+          sessionId: 'session-A',
+          responseId: 'prior-' + i,
+        })
+    },
+  })
+  t.after(stopResumed)
+  for (let i = 0; i < 50 && !invite; i++)
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  assert.ok(invite)
+  await onAction({ kind: 'start', id: invite })
+  const answers = []
+
+  // Act
+  for (const [session, process] of [
+    ['session-A', 'resumed-process'],
+    ['session-B', 'original-process'],
+  ]) {
+    await runHook(
+      directory,
+      {
+        session_id: session,
+        cwd,
+        hook_event_name: 'PreToolUse',
+        tool_name: 'AskUserQuestion',
+        tool_use_id: 'question-' + session,
+        tool_input: { questions: [card] },
+      },
+      async (value) =>
+        answers.push([
+          session,
+          JSON.parse(value).hookSpecificOutput.updatedInput.answers[
+            card.question
+          ],
+        ]),
+      process,
+    )
+  }
+  const review = await requestReview(directory)
+
+  // Assert
+  assert.deepEqual(answers, [['session-B', 'Fix in this PR']])
+  assert.equal(
+    review.find((row) => row.sessionId === 'session-A')?.outcome,
+    'held',
+  )
 })

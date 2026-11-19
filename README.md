@@ -50,13 +50,15 @@ openclaw break-delegate replay
 
 A question type qualifies after at least 20 chronological test predictions with at least 95% agreement with the person's actual answers. Each live card also needs at least five comparable human answers in the current repository with 80% agreement on one available choice. For example, enough verified choices to fix an unrelated bug in the current PR can support that answer to a new card. Held-out agreement and the share of questions the policy could answer are reported together. A new installation may initially hold every question.
 
-The local policy supplies an eligible choice to the configured OpenClaw agent for confirmation. Its fresh, tool-free call receives the current question, its options and a summary with counts. Original history, workspace paths, transcripts and historical free text stay on the Mac. A model timeout or disagreement leaves the original Claude prompt available for the person. Multi-question cards require every choice to qualify.
+The local policy supplies an eligible choice to the configured OpenClaw agent for confirmation. Its fresh, tool-free call receives the current question, its options and a summary with counts. Original history, workspace paths, transcripts and historical free text stay on the Mac. A model timeout or disagreement leaves the original Claude prompt available for the person. Multi-question cards require every choice to qualify. A reply appears as sent when the original Claude session confirms the selected answers.
 
 ## Configuration and removal
 
 Plugin configuration lives under `plugins.entries.break-delegate.config`. `agentId` selects the configured OpenClaw agent (default `main`). `historyRoots` can override the local state directories for `claude`, `codex` and `gstack`. If you supply this object, only its listed history sources are imported. State and review data are stored in a user-private `break-delegate` directory under the local OpenClaw profile. The service and installed hooks must use the same Mac account and profile.
 
 To change when the invitation appears, set `workload.threshold` (default 45), `workload.activePointsPerMinute` (1), `workload.additionalPointsPerMinute` (0.1), or `workload.humanReplyPoints` (4) in the plugin configuration, then restart the Gateway. A break runs for up to 15 minutes. Snoozing asks for a reminder 15 minutes later if the score still qualifies and you are still supervising.
+
+`maxConfirmationsPerBreak` limits model requests in each accepted break. Its default is 60. Once the allowance is used, further question cards wait for your return.
 
 To stop delegating immediately, use `return`. To disable the integration, remove the hooks before unloading the plugin. If you installed the hooks with `setup --settings`, pass the same `--settings` path to `uninstall-hooks`.
 

@@ -104,6 +104,13 @@ function humanMarker(value: unknown): boolean {
   )
 }
 
+/** Carry the verified logical session when {@link runHook} receives a prompt too large to retain.
+ * @example new IncompleteHookInstruction('terminal-session')
+ */
+export class IncompleteHookInstruction {
+  constructor(readonly sessionId: string) {}
+}
+
 /** Forward an actual interactive Claude hook; a missing service leaves Claude's normal prompt in control.
  * The original stdout belongs to this exact tool request, so no terminal keystrokes or resumed conversation are needed.
  * @example
@@ -117,16 +124,22 @@ export async function runHook(
   expectedEvent?: string,
 ): Promise<void> {
   if (
-    !body &&
+    (!body || body instanceof IncompleteHookInstruction) &&
     incarnation &&
     (expectedEvent === 'UserPromptSubmit' ||
       expectedEvent === undefined ||
       expectedEvent.startsWith('openclaw-break-delegate-hook-'))
   ) {
-    // An oversized or unreadable task still places a veto on this exact interactive process.
+    // An identified task follows the logical session across restarts. An unreadable envelope holds only the originating process.
     await requestGateway(
       directory,
-      { op: 'incomplete-instruction', incarnation },
+      {
+        op: 'incomplete-instruction',
+        incarnation,
+        ...(body instanceof IncompleteHookInstruction
+          ? { sessionId: body.sessionId }
+          : {}),
+      },
       1800,
     ).catch(() => undefined)
     return
