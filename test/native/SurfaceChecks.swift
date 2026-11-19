@@ -26,18 +26,22 @@ enum SurfaceChecks {
             .init(question: "Should the public changelog mention this migration?",
                   reason: "The current repository has too few comparable publication decisions.")
         ], answeredTotal: 2, heldTotal: 6)
+        let profile = NotificationProfile(key: String(repeating: "a", count: 64))!
+        let secondProfile = NotificationProfile(key: String(repeating: "b", count: 64))!
         let invitation = GatewayCommand(request: 1, kind: .invite, id: "invite-one", endsAt: nil, review: nil)
-        let offer = Surface(command: invitation)!
-        let restored = Surface(command: invitation)!
-        let active = Surface(command: .init(request: 2, kind: .active, id: "break-one", endsAt: 1_900_000, review: nil))!
-        let digest = Surface(command: .init(request: 3, kind: .summary, id: "break-one", endsAt: nil, review: review))!
+        let offer = Surface(command: invitation, profile: profile)!
+        let restored = Surface(command: invitation, profile: profile)!
+        let otherOffer = Surface(command: invitation, profile: secondProfile)!
+        let active = Surface(command: .init(request: 2, kind: .active, id: "break-one", endsAt: 1_900_000, review: nil), profile: profile)!
+        let digest = Surface(command: .init(request: 3, kind: .summary, id: "break-one", endsAt: nil, review: review), profile: profile)!
 
         // Act — use real Apple request/category objects without opening a notification center.
         let request = offer.notification
-        let category = offer.category
+        let category = offer.kind.category
         func select(_ surface: Surface, _ action: String, at date: Date = start) -> Selection? {
-            surface.selection(request: surface.notification.identifier, category: surface.notification.content.categoryIdentifier,
-                              subject: surface.notification.content.userInfo["subject"] as? String, action: action, now: date)
+            let request = surface.notification
+            return surface.selection(NativeChoice(request: request.identifier, category: request.content.categoryIdentifier,
+                                                  action: action, subject: request.content.userInfo["subject"] as? String), now: date)
         }
 
         // Assert — consent requires a current explicit action, including after a gateway restart.
@@ -49,18 +53,38 @@ enum SurfaceChecks {
         precondition(select(offer, category.actions[2].identifier) == .send(.dismiss))
         precondition(select(offer, UNNotificationDismissActionIdentifier) == .send(.dismiss))
         precondition(select(offer, UNNotificationDefaultActionIdentifier) == .showMenu)
-        precondition(select(restored, category.actions[0].identifier) == nil)
-        precondition(offer.selection(request: request.identifier, category: category.identifier, subject: "other",
-                                     action: category.actions[0].identifier, now: start) == nil)
+        precondition(restored.selection(offer.menuChoice(.start), now: start) == nil)
+        precondition(offer.selection(NativeChoice(request: request.identifier, category: category.identifier,
+                                                  action: category.actions[0].identifier, subject: "other"), now: start) == nil)
         precondition(select(active, UNNotificationDismissActionIdentifier) == nil)
-        precondition(select(active, active.identifier(for: .back)) == .send(.back))
-        precondition(select(active, active.identifier(for: .back), at: Date(timeIntervalSince1970: 1_900)) == nil)
+        precondition(select(active, Button.back.actionID) == .send(.back))
+        precondition(select(active, Button.back.actionID, at: Date(timeIntervalSince1970: 1_900)) == nil)
         precondition(select(digest, UNNotificationDefaultActionIdentifier) == .readReview)
-        precondition(select(digest, digest.identifier(for: .review)) == .readReview)
+        precondition(select(digest, Button.review.actionID) == .readReview)
         precondition(digest.notification.content.body == "2 answered · 6 held. Open the review to read them.")
         precondition(digest.notification.content.userInfo.count == 1)
         precondition(digest.notification.content.userInfo["subject"] as? String == "break-one")
-        precondition(Surface(command: .init(request: 4, kind: .invite, id: "", endsAt: nil, review: nil)) == nil)
+        precondition(Surface(command: .init(request: 4, kind: .invite, id: "", endsAt: nil, review: nil), profile: profile) == nil)
+
+        // Every profile registers all three categories, independent of its surface or subject.
+        let registered = Set(BreakCategory.all.map(\.identifier))
+        precondition(registered == ["break-delegate.category.invitation", "break-delegate.category.active", "break-delegate.category.summary"])
+        precondition(otherOffer.notification.content.categoryIdentifier == request.content.categoryIdentifier)
+        precondition(otherOffer.kind.category.actions.map(\.identifier) == category.actions.map(\.identifier))
+        precondition(registered.contains(active.notification.content.categoryIdentifier))
+        precondition(registered.contains(digest.notification.content.categoryIdentifier))
+
+        // A second profile can use the same subject yet cannot consume its peer's banner or stale menu item.
+        precondition(offer.selection(otherOffer.menuChoice(.start), now: start) == nil)
+        precondition(otherOffer.selection(offer.menuChoice(.start), now: start) == nil)
+        precondition(otherOffer.selection(otherOffer.menuChoice(.start), now: start) == .send(.start))
+        let unscoped = "break-delegate.00000000-0000-0000-0000-000000000001"
+        let sharedStore = [offer.requestID, otherOffer.requestID, restored.requestID, unscoped]
+        precondition(profile.orphanedIDs(in: sharedStore, keeping: restored.requestID) == [offer.requestID])
+        precondition(secondProfile.orphanedIDs(in: sharedStore, keeping: otherOffer.requestID).isEmpty)
+        precondition(secondProfile.orphanedIDs(in: sharedStore, keeping: nil) == [otherOffer.requestID])
+        precondition(NotificationProfile(key: "") == nil)
+        precondition(NotificationProfile(key: String(repeating: "z", count: 64)) == nil)
 
         if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--render-review" {
             try captureReview(review, directory: URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true))

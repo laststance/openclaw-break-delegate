@@ -12,7 +12,9 @@ func writeFrame(_ message: [String: Any]) {
 
 // A notification delivered after gateway shutdown may relaunch the bundle without its pipe.
 // Ignore that launch before registering delegates, showing a window or handling any action.
-guard CommandLine.arguments.dropFirst() == ["--bridge"] else { exit(0) }
+let arguments = CommandLine.arguments
+guard arguments.count == 3, arguments[1] == "--bridge",
+      let profile = NotificationProfile(key: arguments[2]) else { exit(0) }
 guard Bundle.main.bundleIdentifier == "io.laststance.openclaw-break-delegate",
       let session = CGSessionCopyCurrentDictionary() as? [String: Any],
       let uid = session[kCGSessionUserIDKey as String] as? NSNumber, uid.uint32Value == getuid(),
@@ -29,6 +31,6 @@ guard LSRegisterURL(Bundle.main.bundleURL as CFURL, true) == noErr else {
 }
 let application = NSApplication.shared
 application.setActivationPolicy(.accessory)
-let delegate = BreakApp()
+let delegate = BreakApp(profile: profile)
 application.delegate = delegate
 application.run()

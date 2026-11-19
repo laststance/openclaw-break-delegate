@@ -15,6 +15,7 @@ const repo = fileURLToPath(new URL('../../', import.meta.url))
 function gateway(t, options = {}) {
   const children = []
   const commands = []
+  const profileKeys = []
   const actions = []
   const events = new EventEmitter()
   const ui = createNativeBreakUi(
@@ -24,7 +25,8 @@ function gateway(t, options = {}) {
     },
     {
       ...options,
-      launch() {
+      launch(profileKey) {
+        profileKeys.push(profileKey)
         const child = spawn(process.execPath, [fixture], {
           stdio: ['pipe', 'pipe', 'ignore', 'ipc'],
         })
@@ -42,8 +44,29 @@ function gateway(t, options = {}) {
     },
   )
   t.after(() => ui.close())
-  return { children, commands, actions, events, ui }
+  return { children, commands, actions, events, ui, profileKeys }
 }
+
+test('independent gateways launch their helpers with distinct stable profile scopes', async (t) => {
+  // Arrange
+  const alpha = gateway(t, { profileDirectory: '/tmp/break-delegate/./alpha' })
+  const restored = gateway(t, { profileDirectory: '/tmp/break-delegate/alpha' })
+  const beta = gateway(t, { profileDirectory: '/tmp/break-delegate/beta' })
+
+  // Act
+  await Promise.all([alpha.ui.status(), restored.ui.status(), beta.ui.status()])
+
+  // Assert
+  assert.deepEqual(alpha.profileKeys, [
+    'fc0815c50847b6ee333af0a776feb589c9cb85ca89e1f08b01e59ba30ed48fcf',
+  ])
+  assert.deepEqual(restored.profileKeys, [
+    'fc0815c50847b6ee333af0a776feb589c9cb85ca89e1f08b01e59ba30ed48fcf',
+  ])
+  assert.deepEqual(beta.profileKeys, [
+    'e8c5cce4a400a85175ad6201c66dacdcc2ea6bb015dfd7b48ede40d8ab069cef',
+  ])
+})
 
 test(
   "only the current invitation's first explicit choice reaches the gateway",
@@ -270,7 +293,7 @@ test(
     // Act — the actual program cannot reach WindowServer, Launch Services or Notification Center.
     const result = spawnSync(
       '/usr/bin/sandbox-exec',
-      ['-p', noDesktop, executable, '--bridge'],
+      ['-p', noDesktop, executable, '--bridge', 'a'.repeat(64)],
       { encoding: 'utf8', timeout: 5000 },
     )
 

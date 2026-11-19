@@ -11,6 +11,7 @@ struct NotificationStatus {
 /// Holds the interactive surface for one gateway pipe. AppKit owns its main-thread lifecycle.
 final class BreakApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     private let center = UNUserNotificationCenter.current()
+    private let profile: NotificationProfile
     private var current: Surface?
     private var latestReview: BreakReview?
     private var statusItem: NSStatusItem?
@@ -18,14 +19,28 @@ final class BreakApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
     private var expiry: Timer?
     private var permission = NotificationStatus("not-determined")
 
+    init(profile: NotificationProfile) { self.profile = profile }
+
     func applicationWillFinishLaunching(_ notification: Notification) {
         center.delegate = self
+        center.setNotificationCategories(BreakCategory.all)
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // This bundle serves a single gateway. Remove banners orphaned by a previous crash.
-        center.removeAllPendingNotificationRequests()
-        center.removeAllDeliveredNotifications()
+        // Notification Center enumerates the entire bundle. Only this gateway may retire its prior requests.
+        center.getPendingNotificationRequests { requests in
+            self.center.getDeliveredNotifications { notifications in
+                let snapshot = requests.map(\.identifier) + notifications.map(\.request.identifier)
+                DispatchQueue.main.async {
+                    let ids = self.profile.orphanedIDs(in: snapshot, keeping: self.current?.requestID)
+                    if !ids.isEmpty {
+                        // A request can move from pending to delivered between the two snapshots.
+                        self.center.removePendingNotificationRequests(withIdentifiers: ids)
+                        self.center.removeDeliveredNotifications(withIdentifiers: ids)
+                    }
+                }
+            }
+        }
         readGatewayCommands()
     }
 
@@ -73,14 +88,13 @@ final class BreakApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
             refreshMenu()
             readPermission { self.reply(command.request, $0) }
         case .invite, .active, .summary:
-            guard let surface = Surface(command: command) else {
+            guard let surface = Surface(command: command, profile: profile) else {
                 reply(command.request, NotificationStatus("unavailable", "Invalid native presentation."))
                 return
             }
             removeCurrent()
             current = surface
             if case .summary(let review) = surface.content { latestReview = review }
-            center.setNotificationCategories([surface.category])
             if case .active(let end) = surface.content {
                 guard end > Date() else {
                     removeCurrent()
@@ -89,7 +103,7 @@ final class BreakApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
                     return
                 }
                 let timer = Timer(fire: end, interval: 0, repeats: false) { [weak self] _ in
-                    guard let self, self.current?.token == surface.token else { return }
+                    guard let self, self.current?.requestID == surface.requestID else { return }
                     self.removeCurrent()
                     self.refreshMenu()
                 }
@@ -143,11 +157,11 @@ final class BreakApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
     }
 
     private func post(_ surface: Surface, permission: NotificationStatus, done: @escaping (NotificationStatus) -> Void) {
-        guard current?.token == surface.token, permission.code == "authorized" else { done(permission); return }
+        guard current?.requestID == surface.requestID, permission.code == "authorized" else { done(permission); return }
         center.add(surface.notification) { error in
             DispatchQueue.main.async {
                 // An authorization check or delivery may finish after return or replacement.
-                if self.current?.token != surface.token { self.removeNotification(surface) }
+                if self.current?.requestID != surface.requestID { self.removeNotification(surface) }
                 done(error == nil ? permission : NotificationStatus("unavailable", "macOS could not schedule this notification."))
             }
         }
@@ -174,7 +188,9 @@ final class BreakApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
                                 withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
         DispatchQueue.main.async {
-            completionHandler(self.current?.requestID == notification.request.identifier ? [.banner, .list] : [])
+            let id = notification.request.identifier
+            let stale = self.profile.owns(id) && self.current?.requestID != id
+            completionHandler(stale ? [] : [.banner, .list])
         }
     }
 
@@ -183,10 +199,9 @@ final class BreakApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
         let request = response.notification.request
         DispatchQueue.main.async {
             defer { completionHandler() }
-            guard let selected = self.current?.selection(
-                request: request.identifier, category: request.content.categoryIdentifier,
-                subject: request.content.userInfo["subject"] as? String, action: response.actionIdentifier, now: Date()
-            ) else { return }
+            let choice = NativeChoice(request: request.identifier, category: request.content.categoryIdentifier,
+                                      action: response.actionIdentifier, subject: request.content.userInfo["subject"] as? String)
+            guard let selected = self.current?.selection(choice, now: Date()) else { return }
             self.perform(selected)
         }
     }
@@ -220,13 +235,13 @@ final class BreakApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
         if let surface = current {
             let heading = menu.addItem(withTitle: surface.notification.content.title, action: nil, keyEquivalent: "")
             heading.isEnabled = false
-            for button in surface.buttons {
+            for button in surface.kind.buttons {
                 let choice = menu.addItem(withTitle: button.title, action: #selector(menuAction(_:)), keyEquivalent: "")
                 choice.target = self
-                choice.representedObject = surface.identifier(for: button)
+                choice.representedObject = surface.menuChoice(button)
             }
         }
-        if latestReview != nil, !(current?.buttons.contains(.review) ?? false) {
+        if latestReview != nil, current?.kind != .summary {
             let choice = menu.addItem(withTitle: "Read last break review", action: #selector(openReview), keyEquivalent: "")
             choice.target = self
         }
@@ -241,9 +256,7 @@ final class BreakApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
     }
 
     @objc private func menuAction(_ item: NSMenuItem) {
-        guard let surface = current, let id = item.representedObject as? String,
-              let selected = surface.selection(request: surface.requestID, category: surface.categoryID,
-                                               subject: surface.subject, action: id, now: Date()) else { return }
+        guard let choice = item.representedObject as? NativeChoice, let selected = current?.selection(choice, now: Date()) else { return }
         perform(selected)
     }
 

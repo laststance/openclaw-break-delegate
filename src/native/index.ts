@@ -1,8 +1,10 @@
 import { spawn, type ChildProcessByStdio } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { accessSync, constants } from 'node:fs'
+import { resolve } from 'node:path'
 import type { Readable, Writable } from 'node:stream'
 import { fileURLToPath } from 'node:url'
-import { isObject } from '../ipc.js'
+import { dataDirectory, isObject } from '../ipc.js'
 
 export interface NativeAction {
   kind: 'start' | 'snooze' | 'dismiss' | 'return'
@@ -39,7 +41,8 @@ type Command = StatusCommand | Presentation
 type Helper = ChildProcessByStdio<Writable, Readable, null>
 type ActionHandler = (action: NativeAction) => void | Promise<void>
 type LaunchOptions = {
-  launch?: () => Helper
+  profileDirectory?: string
+  launch?: (profileKey: string) => Helper
   timeoutMs?: number
   retryMs?: number
 }
@@ -67,9 +70,9 @@ const statuses = new Set([
  * The helper only receives the user/locale environment required by macOS.
  *
  * @example
- * const child = launchHelper();
+ * const child = launchHelper(profileKey);
  */
-function launchHelper(): Helper {
+function launchHelper(profileKey: string): Helper {
   if (process.platform !== 'darwin')
     throw new Error('Native notifications require a macOS desktop session.')
   try {
@@ -92,7 +95,7 @@ function launchHelper(): Helper {
   ]) {
     if (process.env[key]) env[key] = process.env[key]
   }
-  return spawn(executable, ['--bridge'], {
+  return spawn(executable, ['--bridge', profileKey], {
     stdio: ['pipe', 'pipe', 'ignore'],
     env,
   })
@@ -148,7 +151,7 @@ function previewReview(review: NativeReview): ReviewPreview {
  * After a gateway restart the caller restores its current surface from persistent state.
  *
  * @example
- * const ui = createNativeBreakUi((action) => recordOwnerChoice(action));
+ * const ui = createNativeBreakUi((action) => recordOwnerChoice(action), { profileDirectory });
  * await ui.invite(invitationId);
  * ui.close();
  */
@@ -164,6 +167,10 @@ export function createNativeBreakUi(
   let retry: NodeJS.Timeout | undefined
   const pending = new Map<number, Pending>()
   const timeoutMs = options.timeoutMs ?? 8_000
+  // Match the gateway's normalized profile path without exposing a folder name on a banner or in argv.
+  const profileKey = createHash('sha256')
+    .update(resolve(options.profileDirectory ?? dataDirectory()))
+    .digest('hex')
 
   function retire(instance: Helper): void {
     instance.stdin.end()
@@ -254,7 +261,7 @@ export function createNativeBreakUi(
     if (child) return child
     if (retry) clearTimeout(retry)
     retry = undefined
-    const instance = (options.launch ?? launchHelper)()
+    const instance = (options.launch ?? launchHelper)(profileKey)
     child = instance
     let buffer = ''
     const fail = () =>
