@@ -509,7 +509,7 @@ test('a terminal absent from a complete Claude roster cannot enter a break throu
   assert.equal(supervisor.status().activeBreak.sessionCount, 1)
 })
 
-test('returning while answer provenance is being written rolls back both the claim and its provenance', (t) => {
+test('consent expiring while answer provenance is being written rolls back both the claim and its provenance', (t) => {
   // Arrange
   const { supervisor, observe, advance, db } = setup(t, { threshold: 4 })
   observe('a')

@@ -167,6 +167,34 @@ function ordinaryReply(text: string): boolean {
   )
 }
 
+/** Unwrap native TUI items while excluding hook prompts, generated context and tool output. */
+function nativeMessage(payload: Json): Json {
+  if (payload.type !== 'item_completed') return payload
+  const item = object(payload.item)
+  if (
+    !item ||
+    !['UserMessage', 'AgentMessage'].includes(String(item.type)) ||
+    !Array.isArray(item.content)
+  )
+    return payload
+  const human = item.type === 'UserMessage',
+    blocks = item.content.map(object)
+  if (
+    !blocks.length ||
+    !blocks.every(
+      (b) =>
+        b?.type === (human ? 'text' : 'Text') && typeof b.text === 'string',
+    )
+  )
+    return payload
+  return {
+    ...payload,
+    ...item,
+    type: human ? 'user_message' : 'agent_message',
+    message: blocks.map((b) => b!.text).join(''),
+  }
+}
+
 /** Consume only typed native protocol events observed on an identifiable, live interactive thread. */
 function applyEvent(
   value: Json,
@@ -174,8 +202,9 @@ function applyEvent(
   turn: Turn,
   replies: VerifiedReply[],
 ) {
-  const p = object(value.payload)
-  if (!p) return
+  const payload = object(value.payload)
+  if (!payload || (payload.thread_id && payload.thread_id !== sessionId)) return
+  const p = value.type === 'event_msg' ? nativeMessage(payload) : payload
   const at =
     typeof value.timestamp === 'string' ? Date.parse(value.timestamp) : NaN
   const record = (responseId: string) => {

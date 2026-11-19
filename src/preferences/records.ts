@@ -97,6 +97,13 @@ export interface ParseState {
   cwd?: string
   repo?: string | null
   interactive?: boolean
+  nativeUserThread?: boolean
+  lastText?: {
+    speaker: 'agent' | 'user'
+    format: 'item' | 'legacy'
+    hash: string
+    at: number
+  }
   brief?: Brief
 }
 export interface ParseCounts {
@@ -455,6 +462,36 @@ function claudeRow(
   humanText(db, 'claude', state, content, at, human, str(row.promptId), counts)
 }
 
+function codexText(
+  db: EvidenceDatabase,
+  state: ParseState,
+  speaker: 'agent' | 'user',
+  format: 'item' | 'legacy',
+  text: string,
+  at: number,
+  human: boolean,
+  clientId: string,
+  counts: ParseCounts,
+): void {
+  const hash = digest(text)
+  const previous = state.lastText
+  // Some Codex versions fan a completed item out as a legacy event. Never pair that mirror with a later question or treat it as a standing instruction.
+  if (
+    previous &&
+    previous.speaker === speaker &&
+    previous.format !== format &&
+    previous.hash === hash &&
+    Math.abs(at - previous.at) <= 2000
+  ) {
+    if (speaker === 'user' && human)
+      db.typedReceipt({ source: 'codex', sessionId: state.session! }, text, at)
+    return
+  }
+  state.lastText = { speaker, format, hash, at }
+  if (speaker === 'agent') rememberBrief(db, 'codex', state, text, at)
+  else humanText(db, 'codex', state, text, at, human, clientId, counts)
+}
+
 function codexRow(
   db: EvidenceDatabase,
   state: ParseState,
@@ -483,6 +520,9 @@ function codexRow(
           'codex-cli',
           'codex cli',
         ].includes(originator))
+    state.nativeUserThread =
+      state.interactive && threadSource === 'user' && !!originator
+    delete state.lastText
     delete state.brief
     setCwd(
       state,
@@ -513,21 +553,70 @@ function codexRow(
       return
     }
     if (payload.type === 'agent_message')
-      rememberBrief(db, 'codex', state, str(payload.message), at)
+      codexText(
+        db,
+        state,
+        'agent',
+        'legacy',
+        str(payload.message),
+        at,
+        false,
+        '',
+        counts,
+      )
     if (payload.type === 'user_message') {
       const human =
         record(payload.origin).kind === 'human' ||
         payload.prompt_source === 'typed'
-      humanText(
+      codexText(
         db,
-        'codex',
         state,
+        'user',
+        'legacy',
         str(payload.message),
         at,
         human,
         str(payload.client_id),
         counts,
       )
+    }
+    if (payload.type === 'item_completed') {
+      const item = record(payload.item)
+      if (
+        (payload.thread_id && payload.thread_id !== state.session) ||
+        automated(item)
+      ) {
+        delete state.brief
+        return
+      }
+      const blocks = Array.isArray(item.content) ? item.content.map(record) : []
+      if (item.type === 'UserMessage' || item.type === 'AgentMessage') {
+        const user = item.type === 'UserMessage'
+        if (
+          blocks.length !== 1 ||
+          blocks[0]!.type !== (user ? 'text' : 'Text') ||
+          !str(blocks[0]!.text)
+        ) {
+          delete state.brief
+          return
+        }
+        const clientId = str(item.client_id)
+        const verified =
+          !!state.nativeUserThread &&
+          pairableId(clientId) &&
+          payload.thread_id === state.session
+        codexText(
+          db,
+          state,
+          user ? 'user' : 'agent',
+          'item',
+          str(blocks[0]!.text),
+          at,
+          verified,
+          clientId,
+          counts,
+        )
+      } else if (item.type === 'HookPrompt') delete state.brief
     }
     if (payload.type === 'request_user_input') {
       delete state.brief

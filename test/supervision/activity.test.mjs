@@ -395,3 +395,43 @@ test('the Codex Unix WebSocket uses metadata-only methods, pages loaded IDs, and
       .every((r) => r.params.includeTurns === false),
   )
 })
+
+test("the native terminal's completed user item counts once when it answers the preceding final question", async (t) => {
+  // Arrange
+  const { home, file } = await isolated(t)
+  await writeFile(
+    file,
+    jsonl(
+      session('cli', 'vscode', 'codex-tui'),
+      event('task_started'),
+      event('item_completed', {
+        thread_id: 'cli',
+        item: {
+          type: 'AgentMessage',
+          id: 'q',
+          phase: 'final_answer',
+          content: [{ type: 'Text', text: 'Proceed?' }],
+        },
+      }),
+      event('task_complete'),
+      event('task_started'),
+      event('item_completed', {
+        thread_id: 'cli',
+        item: {
+          type: 'UserMessage',
+          id: 'u',
+          client_id: 'n1',
+          content: [{ type: 'text', text: 'Yes', text_elements: [] }],
+        },
+      }),
+      event('user_message', { client_id: 'n1', message: 'Yes' }),
+    ),
+  )
+  // Act
+  const result = await new RolloutDetector(home).read([file])
+  // Assert
+  assert.deepEqual(
+    result.replies.map((reply) => reply.originId),
+    ['codex:cli:prompt:n1'],
+  )
+})
