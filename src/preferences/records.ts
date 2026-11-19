@@ -52,6 +52,7 @@ const pairableId = (v: string) =>
 interface StoredQuestion {
   key: string
   card: QuestionCard
+  freeText?: true
 }
 interface Brief {
   tool: string
@@ -82,20 +83,28 @@ export interface ParseCounts {
   mirrors: number
 }
 
-function readQuestions(raw: unknown): StoredQuestion[] {
+function readQuestions(raw: unknown, codex = false): StoredQuestion[] {
   if (!Array.isArray(raw) || !raw.length || raw.length > 5) return []
   const questions: StoredQuestion[] = []
   for (const value of raw) {
-    const card = normalizeQuestionCard(value)
+    const item = record(value)
+    const freeText =
+      codex &&
+      item.options == null &&
+      pairableId(str(item.id)) &&
+      !!str(item.question).trim()
+    const card = freeText
+      ? { question: str(item.question), options: [] }
+      : normalizeQuestionCard(value)
     if (!card) return []
-    const key = str(record(value).id) || card.question
+    const key = str(item.id) || card.question
     if (
       questions.some(
         (item) => item.key === key || item.card.question === card.question,
       )
     )
       return []
-    questions.push({ key, card })
+    questions.push(freeText ? { key, card, freeText: true } : { key, card })
   }
   return questions
 }
@@ -110,6 +119,7 @@ function rememberCall(
   if (!pairableId(origin.toolUseId) || !questions.length) return
   const args = [origin.source, origin.sessionId, origin.toolUseId] as const
   const value = JSON.stringify(questions)
+  db.primary('pref_calls', origin, [...args, value, askedAt])
   const previous = db.db
     .prepare(
       'SELECT questions FROM pref_calls WHERE source=? AND session=? AND tool=?',
@@ -156,22 +166,39 @@ function answerCall(
     counts.unverified++
     return
   }
-  let responded = false
-  for (const { key, card } of questions) {
+  const responses = questions.flatMap(({ key, card, freeText }) => {
     const value = answers[nativeClaude ? card.question : key]
-    const selections = nativeClaude ? [value] : record(value).answers
+    const selected = nativeClaude ? [value] : record(value).answers
     if (
-      !Array.isArray(selections) ||
-      !selections.length ||
-      selections.some(
-        (v) =>
-          typeof v !== 'string' ||
-          !v.trim() ||
-          /^__(?:unknown|skipped|missing)__$/iu.test(v.trim()),
+      !Array.isArray(selected) ||
+      !selected.length ||
+      !selected.every(
+        (v): v is string =>
+          typeof v === 'string' &&
+          !!v.trim() &&
+          !/^__(?:unknown|skipped|missing)__$/iu.test(v.trim()),
       )
     )
-      continue
-    responded = true
+      return []
+    if (freeText && selected.length !== 1) return []
+    return [{ card, freeText, selections: selected }]
+  })
+  // A free-form Codex form has only one completion event. Its other fields must validate before any answer is credited.
+  if (
+    questions.some((q) => q.freeText) &&
+    (responses.length !== questions.length ||
+      Object.keys(answers).length !== questions.length ||
+      responses.some(
+        ({ card, freeText, selections }) =>
+          !freeText &&
+          !selections.every((label) =>
+            card.options.some((option) => option.label === label),
+          ),
+      ))
+  )
+    return
+  for (const { card, freeText, selections } of responses) {
+    if (freeText) continue
     // A typed condition or multiple selections cannot be converted to a single offered choice.
     const notes = hasAnswerNotes(raw.annotations, card.question)
     if (!card.multiSelect)
@@ -183,7 +210,7 @@ function answerCall(
         true,
       )
   }
-  if (responded) db.humanResponse(origin, 'tool:' + origin.toolUseId, at)
+  if (responses.length) db.humanResponse(origin, 'tool:' + origin.toolUseId, at)
 }
 
 function setCwd(state: ParseState, cwd: string, suppliedRemote?: string): void {
@@ -471,6 +498,25 @@ function claudeRow(
   )
 }
 
+/** Resolve a native reply against actual recent message IDs before the transcript importer attributes it.
+ * @example linkedBrief(state, 'agent-message-id')
+ */
+function linkedBrief(
+  state: ParseState,
+  replyTo: string,
+  inferred?: Brief,
+): Brief | undefined {
+  const targets = (state.recentBriefs ?? []).filter(
+    (brief) => brief.messageId === replyTo,
+  )
+  if (
+    inferred?.messageId === replyTo &&
+    !targets.some((brief) => brief.tool === inferred.tool)
+  )
+    targets.push(inferred)
+  return targets.length === 1 ? targets[0] : undefined
+}
+
 function codexText(
   db: EvidenceDatabase,
   state: ParseState,
@@ -511,15 +557,7 @@ function codexText(
         )
       db.cancelTypedInstruction(session, text, previous.at)
       // Only a native message ID resolves an explicit link. A nearby offer with a different ID cannot inherit this answer.
-      const resolved = (state.recentBriefs ?? []).filter(
-        (b) => b.messageId === replyTo,
-      )
-      if (
-        inferred?.messageId === replyTo &&
-        !resolved.some((b) => b.tool === inferred.tool)
-      )
-        resolved.push(inferred)
-      const target = resolved.length === 1 ? resolved[0] : undefined
+      const target = linkedBrief(state, replyTo, inferred)
       delete previous.unmatched
       delete previous.inferred
       if (target) {
@@ -566,8 +604,15 @@ function codexText(
         ),
         state.brief,
       ].slice(-8)
-  } else
+  } else {
+    if (human && format === 'item' && replyTo) {
+      const target = linkedBrief(state, replyTo, state.brief)
+      // Unknown or ambiguous explicit links cannot act as either a reply to the latest brief or a new standing instruction.
+      if (!target) return
+      state.brief = target
+    }
     humanText(db, 'codex', state, text, at, human, clientId, counts, replyTo)
+  }
 }
 
 function codexRow(
@@ -642,7 +687,7 @@ function codexRow(
       counts.unverified++
       return
     }
-    rememberCall(db, call, state.repo, readQuestions(args.questions), at)
+    rememberCall(db, call, state.repo, readQuestions(args.questions, true), at)
   }
   const result = (
     call: Origin,
@@ -669,6 +714,10 @@ function codexRow(
     if (automatic) {
       if (!known) {
         // A generic result can resemble a question, including an empty answer map. Only a later matching request can establish its tool identity.
+        db.primary('pref_pending_codex_outputs', call, [
+          call.sessionId,
+          call.toolUseId,
+        ])
         db.db
           .prepare(
             'INSERT OR IGNORE INTO pref_pending_codex_outputs VALUES(?,?)',

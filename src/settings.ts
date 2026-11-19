@@ -6,12 +6,12 @@ import {
   mkdir,
   open,
   readFile,
+  readlink,
   realpath,
   rename,
   rm,
 } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
-import { spawnSync } from 'node:child_process'
 import { constants, realpathSync } from 'node:fs'
 import { DatabaseSync } from 'node:sqlite'
 import { basename, dirname, join, resolve } from 'node:path'
@@ -19,7 +19,6 @@ import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { isObject, type ObjectValue } from './ipc.js'
 import { privateDirectory } from './ipc-auth.js'
-import { nativeHelperExecutable } from './native/index.js'
 
 const events = {
   SessionStart: '',
@@ -76,41 +75,6 @@ function lockSettings(path: string): DatabaseSync {
   }
 }
 
-/** Atomically exchange two existing files when the packaged macOS helper and filesystem support it.
- * {@link replaceSettings} uses the displaced inode to detect edits made after its final read.
- * @example
- * const exchanged = exchangeSettings(settingsPath, recoveryPath);
- */
-function exchangeSettings(file: string, recovery: string): boolean {
-  if (process.platform !== 'darwin') return false
-  const reply = spawnSync(
-    nativeHelperExecutable,
-    ['--exchange-settings', file, recovery],
-    {
-      encoding: 'utf8',
-      timeout: 5000,
-      maxBuffer: 256,
-      stdio: ['ignore', 'pipe', 'ignore'],
-    },
-  )
-  if ((reply.error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT')
-    return false
-  if (reply.status === 0 && reply.stdout === 'exchanged\n') return true
-  // A source checkout can have an older helper with no exchange command.
-  if (
-    reply.status === 0 &&
-    (reply.stdout === '' || reply.stdout === 'unsupported\n')
-  )
-    return false
-  throw new Error(
-    'Could not confirm the settings exchange. Compare the files at ' +
-      file +
-      ' and ' +
-      recovery +
-      '.',
-  )
-}
-
 /** Publish a revision only if the editor has left the destination free, including on volumes without links.
  * @example
  * await installIfAbsent(staged, file);
@@ -151,15 +115,8 @@ async function replaceSettings(
         path +
         ' and retry.',
     )
-  if (exchangeSettings(file, staged)) {
-    // The editor can save again at any instant. Retain the displaced revision without a second swap.
-    if ((await readFile(staged, 'utf8')) !== old) throw conflict(staged)
-    await rename(staged, previous)
-    return
-  }
-
-  // Portable fallback captures the current inode and only installs the prepared file if the path is still free.
-  const displaced = staged + '.previous'
+  // Claim the current inode first. A later editor save can then win the pathname via exclusive publication.
+  const displaced = join(dirname(staged), 'pending-original.json')
   await rename(file, displaced)
   try {
     if ((await readFile(displaced, 'utf8')) !== old) throw conflict(displaced)
@@ -172,10 +129,66 @@ async function replaceSettings(
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST')
         throw conflict(displaced)
     }
-    throw conflict(displaced)
+    const archived = staged + '.previous'
+    await rename(displaced, archived)
+    throw conflict(archived)
   }
   await rm(staged, { force: true })
   await rename(displaced, previous)
+}
+
+/** Complete an interrupted settings handoff before setup reads its baseline.
+ * A recovered inode only claims an empty settings path. A subsequent editor save stays active.
+ * @example
+ * await recoverSettings(file, recovery);
+ */
+async function recoverSettings(file: string, recovery: string): Promise<void> {
+  const pending = join(recovery, 'pending-original.json')
+  try {
+    const directory = await lstat(recovery)
+    if (
+      !directory.isDirectory() ||
+      (process.getuid && directory.uid !== process.getuid()) ||
+      (directory.mode & 0o077) !== 0
+    )
+      throw new Error(
+        'Settings recovery requires a private directory owned by this user.',
+      )
+    const info = await lstat(pending)
+    if (!info.isFile() || (process.getuid && info.uid !== process.getuid()))
+      throw new Error('Settings recovery requires an owned regular file.')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+    throw error
+  }
+  try {
+    await installIfAbsent(pending, file)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+  }
+  await rename(pending, join(recovery, 'recovered-' + randomUUID() + '.json'))
+}
+
+/** Resolve an editor-managed symlink even while its target is temporarily in settings recovery.
+ * @example
+ * const file = await settingsTarget(settingsPath);
+ */
+async function settingsTarget(path: string): Promise<string> {
+  let file = resolve(path)
+  for (let depth = 0; depth < 40; depth++) {
+    try {
+      return await realpath(file)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    }
+    try {
+      file = resolve(dirname(file), await readlink(file))
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return file
+      throw error
+    }
+  }
+  throw new Error('Too many links in the Claude settings path.')
 }
 
 /** Install or remove this package's hook commands while preserving unrelated Claude settings.
@@ -192,11 +205,7 @@ export async function configureHooks(
   ),
 ): Promise<{ changed: boolean; file: string }> {
   // Update a managed settings target without replacing its symbolic link.
-  try {
-    file = await realpath(file)
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
-  }
+  file = await settingsTarget(file)
   const folder = dirname(file)
   await mkdir(folder, { recursive: true, mode: 0o700 })
   const lock = lockSettings(file + '.break-delegate-owner.sqlite')
@@ -204,6 +213,7 @@ export async function configureHooks(
   const tmp = join(recovery, 'recovery-' + randomUUID() + '.json')
   let preserveStaged = false
   try {
+    await recoverSettings(file, recovery)
     let old = ''
     let exists = false
     let perms = 0o600
@@ -311,7 +321,7 @@ export async function configureHooks(
         'Claude settings changed. Retry the command against the newer file.',
       )
     if (exists) {
-      // After a swap, the staged path can be the only copy of an editor's latest save.
+      // Keep the proposed revision available if an editor wins the publication race.
       preserveStaged = true
       await replaceSettings(file, tmp, old)
     } else {

@@ -9,7 +9,6 @@ import {
 } from './policy.js'
 import { digest } from './repository.js'
 import {
-  receiptWindow,
   uniqueTypedMatches,
   type TypedCandidate,
   type TypedReceipt,
@@ -133,10 +132,34 @@ function localWinner(counts: Map<string, number>): string | null {
   return null
 }
 
+// Each row is already reduced by the provider decoder. Free-form human text never enters the support index.
+const primaryTables = {
+  pref_calls: 'source,session,tool,questions,asked',
+  pref_pending_codex_outputs: 'session,tool',
+  pref_offers: 'source,session,tool,question,options,repo,kind,signature,asked',
+  pref_primary_choices: 'source,session,tool,question,selected,at',
+  pref_responses: 'source,session,response_id,tool,at',
+  pref_constraints: 'source,session,at,kind,required',
+  pref_human_grants: 'source,session,tool,at',
+  pref_gstack_selections: 'session,tool,summary,label,at',
+  pref_instruction_candidates: 'source,session,hash,at,rules',
+  pref_typed_candidates:
+    'source,session,tool,question,hash,label,at,response_id',
+  pref_misdirected_typed: 'source,session,tool,question,hash,at',
+  pref_submissions: 'source,session,hash,at,submission',
+  pref_direct_text: 'source,session,tool,response_id',
+  pref_cancelled_instructions: 'source,session,hash,at',
+} as const
+type PrimaryTable = keyof typeof primaryTables
+type FactValue = string | number
+
 /** Own the SQLite evidence tables shared by imports, chronological replay, and the hook's bounded lookup.
  * @example new EvidenceDatabase(db)
  */
 export class EvidenceDatabase {
+  private owner = 'live'
+  private deriving = false
+
   constructor(readonly db: DatabaseSync) {
     db.exec(`
       CREATE TABLE IF NOT EXISTS pref_state(id INTEGER PRIMARY KEY, dirty INTEGER NOT NULL);
@@ -182,6 +205,14 @@ export class EvidenceDatabase {
       CREATE TABLE IF NOT EXISTS pref_files(path TEXT PRIMARY KEY,identity TEXT,offset INTEGER,anchor TEXT,skipping INTEGER,state TEXT);
       CREATE TABLE IF NOT EXISTS pref_file_segments(path TEXT,start INTEGER,stop INTEGER,hash TEXT,PRIMARY KEY(path,start));
       CREATE TABLE IF NOT EXISTS pref_file_versions(path TEXT PRIMARY KEY,stamp TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS pref_legacy_refresh(path TEXT PRIMARY KEY);
+      CREATE TABLE IF NOT EXISTS pref_source_facts(owner TEXT, source TEXT, session TEXT, table_name TEXT, row_data TEXT,
+        UNIQUE(owner,source,session,table_name,row_data));
+      CREATE INDEX IF NOT EXISTS pref_source_sessions ON pref_source_facts(source,session);
+      CREATE TABLE IF NOT EXISTS pref_primary_choices(source TEXT,session TEXT,tool TEXT,question TEXT,selected TEXT,at INTEGER,
+        PRIMARY KEY(source,session,tool,question,selected,at));
+      CREATE TABLE IF NOT EXISTS pref_shape_conflicts(source TEXT,session TEXT,tool TEXT,question TEXT,PRIMARY KEY(source,session,tool,question));
+      CREATE TABLE IF NOT EXISTS pref_cancelled_instructions(source TEXT,session TEXT,hash TEXT,at INTEGER,PRIMARY KEY(source,session,hash,at));
       CREATE VIEW IF NOT EXISTS pref_observations AS SELECT o.* FROM pref_offers o WHERE o.answered IS NOT NULL AND o.conflict=0
         AND NOT EXISTS(SELECT 1 FROM pref_exclusions x WHERE x.source=o.source AND x.session=o.session AND x.tool=o.tool);
     `)
@@ -295,6 +326,7 @@ export class EvidenceDatabase {
             toolUseId: String(row.tool),
           },
           String(row.question),
+          false,
         )
       }
       db.prepare(
@@ -351,6 +383,315 @@ export class EvidenceDatabase {
         (SELECT DISTINCT c.session FROM pref_typed_candidates c WHERE c.source='codex' AND EXISTS
           (SELECT 1 FROM pref_submissions r WHERE (r.source,r.session,r.hash)=(c.source,c.session,c.hash) AND r.submission<>'' AND r.at BETWEEN c.at-2000 AND c.at+2000))`)
     })
+    this.transaction(() => {
+      const upgrade = db
+        .prepare('INSERT OR IGNORE INTO pref_decoder_versions VALUES(?)')
+        .run('history-source-ownership-v1')
+      if (
+        !upgrade.changes ||
+        db.prepare('SELECT 1 FROM pref_source_facts LIMIT 1').get()
+      )
+        return
+      // Earlier checkpoints had no per-file provenance. Re-index them once, preserving separately witnessed live or native replies.
+      db.exec(
+        'INSERT OR IGNORE INTO pref_legacy_refresh SELECT path FROM pref_files',
+      )
+      const sessions = db
+        .prepare(
+          `SELECT source,session FROM pref_responses UNION SELECT source,session FROM pref_calls
+        UNION SELECT source,session FROM pref_typed_candidates UNION SELECT source,session FROM pref_instruction_candidates
+        UNION SELECT source,session FROM pref_submissions UNION SELECT source,session FROM pref_constraints`,
+        )
+        .all()
+      for (const item of sessions) {
+        const session = {
+          source: item.source as EvidenceSource,
+          sessionId: String(item.session),
+        }
+        this.adoptLegacySession(session)
+        this.derived(() => this.restoreSession(session))
+      }
+    })
+  }
+
+  /** Preserve provable live and native replies when {@link EvidenceDatabase} upgrades an unowned history cache.
+   * @example this.adoptLegacySession({source:'codex',sessionId:'s'})
+   */
+  private adoptLegacySession(session: Session): void {
+    const args = [session.source, session.sessionId] as const
+    // Archived structured answers always had a native call. Only a positively witnessed live hook could have produced one without it.
+    const live = `r.response_id='tool:'||r.tool AND NOT EXISTS(SELECT 1 FROM pref_calls c WHERE (c.source,c.session,c.tool)=(r.source,r.session,r.tool))`
+    const candidateFiles = this.db
+      .prepare(
+        `SELECT path||'/'||identity AS owner FROM pref_files WHERE json_extract(state,'$.session')=?
+      AND CASE WHEN json_type(state,'$.interactive') IS NULL THEN 'claude' ELSE 'codex' END=?`,
+      )
+      .all(session.sessionId, session.source)
+    const directOwner =
+      candidateFiles.length > 1
+        ? undefined
+        : candidateFiles.length
+          ? String(candidateFiles[0]!.owner)
+          : 'legacy-confirmed-native'
+    const adopt = (
+      table: PrimaryTable,
+      values: readonly FactValue[],
+      owner: string,
+    ) => this.primary(table, session, values, owner)
+    const offers = this.db
+      .prepare(
+        `SELECT o.*, EXISTS(SELECT 1 FROM pref_responses r WHERE (r.source,r.session,r.tool)=(o.source,o.session,o.tool) AND ${live}) AS live,
+      d.selected AS confirmed,d.at AS confirmed_at FROM pref_offers o LEFT JOIN pref_direct_answers d USING(source,session,tool,question)
+      WHERE o.source=? AND o.session=?`,
+      )
+      .all(...args)
+    for (const item of offers) {
+      const owner = item.live ? 'live' : item.confirmed && directOwner
+      if (typeof owner !== 'string' || item.conflict) continue
+      const key = [...args, String(item.tool), String(item.question)]
+      adopt(
+        'pref_offers',
+        [
+          ...key,
+          String(item.options),
+          String(item.repo),
+          String(item.kind),
+          String(item.signature),
+          Number(item.asked),
+        ],
+        owner,
+      )
+      const selected = item.live ? item.selected : item.confirmed
+      const at = item.live ? item.answered : item.confirmed_at
+      if (selected !== null && at !== null)
+        adopt(
+          'pref_primary_choices',
+          [...key, String(selected), Number(at)],
+          owner,
+        )
+    }
+    const responses = this.db
+      .prepare(
+        `SELECT r.*,(${live}) AS live, EXISTS(SELECT 1 FROM pref_direct_text d
+      WHERE (d.source,d.session,d.tool,d.response_id)=(r.source,r.session,r.tool,r.response_id)) AS direct FROM pref_responses r WHERE source=? AND session=?`,
+      )
+      .all(...args)
+    for (const row of responses) {
+      const owner = row.live ? 'live' : row.direct && directOwner
+      if (typeof owner !== 'string') continue
+      adopt(
+        'pref_responses',
+        [...args, String(row.response_id), String(row.tool), Number(row.at)],
+        owner,
+      )
+      if (row.direct)
+        adopt(
+          'pref_direct_text',
+          [...args, String(row.tool), String(row.response_id)],
+          owner,
+        )
+    }
+    // Pre-upgrade constraints lack an authoring channel. Retain known restrictions while their source files are revalidated.
+    for (const row of this.db
+      .prepare(
+        'SELECT at,kind,required FROM pref_constraints WHERE source=? AND session=?',
+      )
+      .all(...args))
+      adopt(
+        'pref_constraints',
+        [...args, Number(row.at), String(row.kind), String(row.required)],
+        'legacy-instruction',
+      )
+  }
+
+  /** Keep joins between independent inputs from certifying their own conclusions during later reconstruction.
+   * @example this.derived(() => this.reconcileGstack(origin))
+   */
+  private derived<T>(work: () => T): T {
+    const previous = this.deriving
+    this.deriving = true
+    try {
+      return work()
+    } finally {
+      this.deriving = previous
+    }
+  }
+
+  /** Attach an independently decoded record even when another file or live hook has already supplied the same canonical row.
+   * @example evidence.primary('pref_calls', origin, ['claude','s','t','[]',1])
+   */
+  primary(
+    table: PrimaryTable,
+    session: Session,
+    values: readonly FactValue[],
+    owner = this.owner,
+  ): void {
+    if (this.deriving) return
+    this.db
+      .prepare('INSERT OR IGNORE INTO pref_source_facts VALUES(?,?,?,?,?)')
+      .run(
+        owner,
+        session.source,
+        session.sessionId,
+        table,
+        JSON.stringify(values),
+      )
+  }
+
+  private insertPrimary(
+    table: PrimaryTable,
+    session: Session,
+    values: readonly FactValue[],
+  ) {
+    this.primary(table, session, values)
+    const placeholders = values.map(() => '?').join(',')
+    return this.db
+      .prepare(
+        'INSERT OR IGNORE INTO ' +
+          table +
+          '(' +
+          primaryTables[table] +
+          ') VALUES(' +
+          placeholders +
+          ')',
+      )
+      .run(...values)
+  }
+
+  /** Remove the changed generation's claims, then rebuild only its affected sessions from independent normalized records.
+   * Permanent provider and delivery exclusions remain authoritative throughout the transaction.
+   * @example evidence.withdrawSource(sourceKey)
+   */
+  withdrawSource(owner: string): void {
+    const sessions = this.db
+      .prepare(
+        'SELECT DISTINCT source,session FROM pref_source_facts WHERE owner=?',
+      )
+      .all(owner)
+    this.db.prepare('DELETE FROM pref_source_facts WHERE owner=?').run(owner)
+    this.derived(() => {
+      for (const row of sessions)
+        this.restoreSession({
+          source: row.source as EvidenceSource,
+          sessionId: String(row.session),
+        })
+    })
+  }
+
+  /** Rebuild the affected session after {@link EvidenceDatabase.withdrawSource} removes one physical witness.
+   * @example this.restoreSession({source:'claude',sessionId:'s'})
+   */
+  private restoreSession(session: Session): void {
+    const args = [session.source, session.sessionId] as const
+    // Workload withdrawals are reversible. A surviving independent response is filtered out again by unmatchedSince.
+    this.db
+      .prepare(
+        'INSERT OR REPLACE INTO pref_lost_typed SELECT source,session,response_id,? FROM pref_responses WHERE source=? AND session=?',
+      )
+      .run(Date.now(), ...args)
+    const tables = Object.keys(primaryTables) as PrimaryTable[]
+    for (const table of [
+      ...tables,
+      'pref_fallback_links',
+      'pref_direct_answers',
+      'pref_shape_conflicts',
+      'pref_typed_receipts',
+    ]) {
+      if (
+        table === 'pref_gstack_selections' ||
+        table === 'pref_pending_codex_outputs'
+      ) {
+        if (
+          session.source ===
+          (table === 'pref_gstack_selections' ? 'claude' : 'codex')
+        )
+          this.db
+            .prepare('DELETE FROM ' + table + ' WHERE session=?')
+            .run(session.sessionId)
+      } else
+        this.db
+          .prepare('DELETE FROM ' + table + ' WHERE source=? AND session=?')
+          .run(...args)
+    }
+    const load = this.db.prepare(
+      'SELECT DISTINCT row_data FROM pref_source_facts WHERE source=? AND session=? AND table_name=? ORDER BY rowid',
+    )
+    for (const table of tables) {
+      for (const fact of load.iterate(...args, table)) {
+        const values = JSON.parse(String(fact.row_data)) as FactValue[]
+        if (table === 'pref_offers') this.noteShape(values)
+        this.insertPrimary(table, session, values)
+      }
+    }
+    this.db
+      .prepare(
+        `DELETE FROM pref_responses AS r WHERE source=? AND session=? AND response_id GLOB 'tool:*'
+      AND NOT EXISTS(SELECT 1 FROM pref_calls c WHERE (c.source,c.session,c.tool)=(r.source,r.session,r.tool))
+      AND NOT EXISTS(SELECT 1 FROM pref_source_facts f WHERE f.owner='live' AND f.table_name='pref_responses'
+        AND (f.source,f.session)=(r.source,r.session) AND json_extract(f.row_data,'$[2]')=r.response_id)`,
+      )
+      .run(...args)
+    this.db
+      .prepare(
+        'INSERT OR IGNORE INTO pref_typed_receipts SELECT source,session,hash,at FROM pref_submissions WHERE source=? AND session=?',
+      )
+      .run(...args)
+    this.db
+      .prepare(
+        `DELETE FROM pref_instruction_candidates AS c WHERE source=? AND session=? AND EXISTS
+       (SELECT 1 FROM pref_cancelled_instructions x WHERE (x.source,x.session,x.hash,x.at)=(c.source,c.session,c.hash,c.at))`,
+      )
+      .run(...args)
+    const rules = this.db
+      .prepare(`SELECT c.at,c.rules FROM pref_instruction_candidates c WHERE source=? AND session=? AND EXISTS
+      (SELECT 1 FROM pref_typed_receipts r WHERE (r.source,r.session,r.hash)=(c.source,c.session,c.hash) AND r.at BETWEEN c.at-2000 AND c.at+2000)`)
+    for (const row of rules.all(...args))
+      this.saveRules(
+        session,
+        Number(row.at),
+        JSON.parse(String(row.rules)) as Constraint[],
+      )
+    const offers = this.db
+      .prepare(
+        'SELECT tool,question FROM pref_offers WHERE source=? AND session=?',
+      )
+      .all(...args)
+    for (const row of offers)
+      this.restoreDirectSelection(
+        { ...session, toolUseId: String(row.tool) },
+        String(row.question),
+      )
+    for (const row of this.db
+      .prepare(
+        'SELECT DISTINCT hash FROM pref_typed_candidates WHERE source=? AND session=?',
+      )
+      .all(...args))
+      this.reconcileTyped(session, String(row.hash), 0)
+    for (const row of this.db
+      .prepare(
+        'SELECT tool FROM pref_human_grants WHERE source=? AND session=?',
+      )
+      .all(...args))
+      this.reconcileGstack({ ...session, toolUseId: String(row.tool) })
+    this.db.exec(dirty)
+  }
+
+  private noteShape(values: readonly FactValue[]): void {
+    const key = values.slice(0, 4)
+    const previous = this.db
+      .prepare(
+        'SELECT options,repo,kind,signature FROM pref_offers WHERE source=? AND session=? AND tool=? AND question=?',
+      )
+      .get(...key)
+    if (
+      previous &&
+      ['options', 'repo', 'kind', 'signature'].some(
+        (field, index) => previous[field] !== values[index + 4],
+      )
+    )
+      this.db
+        .prepare('INSERT OR IGNORE INTO pref_shape_conflicts VALUES(?,?,?,?)')
+        .run(...key)
   }
 
   /** Save independently confirmed human effort even when the card has no learned decision type.
@@ -378,9 +719,13 @@ export class EvidenceDatabase {
           .prepare('INSERT OR REPLACE INTO pref_lost_typed VALUES(?,?,?,?)')
           .run(origin.source, origin.sessionId, legacy, Date.now())
     }
-    this.db
-      .prepare('INSERT OR IGNORE INTO pref_responses VALUES(?,?,?,?,?)')
-      .run(origin.source, origin.sessionId, responseId, origin.toolUseId, at)
+    this.insertPrimary('pref_responses', origin, [
+      origin.source,
+      origin.sessionId,
+      responseId,
+      origin.toolUseId,
+      at,
+    ])
   }
 
   /** Read recent local response identities so the activity supervisor can deduplicate import and live events.
@@ -444,11 +789,13 @@ export class EvidenceDatabase {
       .get(...fields(origin))
   }
 
-  /** Keep the source cursor and its observations consistent when a batch fails or the process restarts.
+  /** Keep the source cursor, its provenance, and its observations consistent when a batch fails or the process restarts.
    * @example evidence.transaction(() => evidence.exclude(origin))
    */
-  transaction<T>(work: () => T): T {
+  transaction<T>(work: () => T, owner = this.owner): T {
+    const previous = this.owner
     this.db.exec('SAVEPOINT pref_batch')
+    this.owner = owner
     try {
       const result = work()
       this.db.exec('RELEASE pref_batch')
@@ -456,6 +803,8 @@ export class EvidenceDatabase {
     } catch (error) {
       this.db.exec('ROLLBACK TO pref_batch; RELEASE pref_batch')
       throw error
+    } finally {
+      this.owner = previous
     }
   }
 
@@ -481,6 +830,15 @@ export class EvidenceDatabase {
       )
       .get(...args)
     const options = JSON.stringify(choices)
+    const values = [
+      ...args,
+      options,
+      input.repo,
+      kind,
+      signature,
+      input.askedAt,
+    ]
+    this.primary('pref_offers', input, values)
     if (saved) {
       // Two conflicting originals for one call cannot establish what options were actually offered.
       if (
@@ -489,6 +847,7 @@ export class EvidenceDatabase {
         saved.kind !== kind ||
         saved.options !== options
       ) {
+        this.noteShape(values)
         this.db
           .prepare(
             'UPDATE pref_offers SET conflict=1 WHERE source=? AND session=? AND tool=? AND question=?',
@@ -526,7 +885,6 @@ export class EvidenceDatabase {
       .get(...args) as unknown as Offer | undefined
     if (
       !offer ||
-      offer.conflict ||
       answeredAt < offer.asked ||
       this.isPermanentlyExcluded(origin)
     )
@@ -543,6 +901,11 @@ export class EvidenceDatabase {
         : undefined
     if (!selected && !explicitOther) return false
     const meaning = selected?.meaning ?? otherResponse
+    if (!this.deriving) {
+      const values = [...args, meaning, answeredAt]
+      this.insertPrimary('pref_primary_choices', origin, values)
+    }
+    if (offer.conflict) return false
     if (offer.selected === meaning) {
       // A direct result may later establish an earlier response time than the copy's capture timestamp.
       if (answeredAt < offer.answered!) {
@@ -668,17 +1031,14 @@ export class EvidenceDatabase {
     at: number,
     rules: readonly Constraint[],
   ): void {
-    const insert = this.db.prepare(
-      'INSERT OR IGNORE INTO pref_constraints VALUES(?,?,?,?,?)',
-    )
     for (const rule of rules) {
-      const write = insert.run(
+      const write = this.insertPrimary('pref_constraints', session, [
         session.source,
         session.sessionId,
         at,
         rule.kind,
         rule.required,
-      )
+      ])
       // A late import can add an instruction that was in force when a scored historical card was asked.
       if (
         write.changes &&
@@ -707,17 +1067,19 @@ export class EvidenceDatabase {
         : instructionConstraints(text, explicit)
     if (!rules.length) return
     const hash = digest(text.trim())
-    this.db
-      .prepare(
-        'INSERT OR IGNORE INTO pref_instruction_candidates VALUES(?,?,?,?,?)',
-      )
-      .run(session.source, session.sessionId, hash, at, JSON.stringify(rules))
+    this.insertPrimary('pref_instruction_candidates', session, [
+      session.source,
+      session.sessionId,
+      hash,
+      at,
+      JSON.stringify(rules),
+    ])
     const receipt = this.db
       .prepare(
         'SELECT 1 FROM pref_typed_receipts WHERE source=? AND session=? AND hash=? AND at BETWEEN ? AND ?',
       )
       .get(session.source, session.sessionId, hash, at - 2000, at + 2000)
-    if (receipt) this.saveRules(session, at, rules)
+    if (receipt) this.derived(() => this.saveRules(session, at, rules))
   }
 
   /** Remove a role-only instruction after the native mirror identifies it as an answer to a specific question.
@@ -730,6 +1092,8 @@ export class EvidenceDatabase {
       )
       .get(session.source, session.sessionId, digest(text.trim()), at)
     if (!row) return
+    const values = [session.source, session.sessionId, digest(text.trim()), at]
+    this.insertPrimary('pref_cancelled_instructions', session, values)
     for (const rule of JSON.parse(String(row.rules)) as Constraint[]) {
       const removed = this.db
         .prepare(
@@ -768,9 +1132,11 @@ export class EvidenceDatabase {
       label.length > 160
     )
       return false
-    this.db
-      .prepare('INSERT OR IGNORE INTO pref_gstack_selections VALUES(?,?,?,?,?)')
-      .run(session, tool, cleanQuestion(question), label, at)
+    this.insertPrimary(
+      'pref_gstack_selections',
+      { source: 'claude', sessionId: session },
+      [session, tool, cleanQuestion(question), label, at],
+    )
     return this.reconcileGstack({
       source: 'claude',
       sessionId: session,
@@ -783,13 +1149,12 @@ export class EvidenceDatabase {
    */
   humanGrant(origin: Origin, at: number): void {
     if (!time(at)) return
-    this.db
-      .prepare('INSERT OR IGNORE INTO pref_human_grants VALUES(?,?,?,?)')
-      .run(...fields(origin), at)
+    this.insertPrimary('pref_human_grants', origin, [...fields(origin), at])
     this.reconcileGstack(origin)
   }
 
   private reconcileGstack(origin: Origin): boolean {
+    if (!this.deriving) return this.derived(() => this.reconcileGstack(origin))
     const grant = this.db
       .prepare(
         'SELECT at FROM pref_human_grants WHERE source=? AND session=? AND tool=?',
@@ -843,18 +1208,14 @@ export class EvidenceDatabase {
     responseId: string,
   ): boolean {
     const hash = digest(typed.trim())
-    this.db
-      .prepare(
-        'INSERT OR IGNORE INTO pref_typed_candidates VALUES(?,?,?,?,?,?,?,?)',
-      )
-      .run(
-        ...fields(origin),
-        cleanQuestion(question),
-        hash,
-        label,
-        at,
-        responseId,
-      )
+    this.insertPrimary('pref_typed_candidates', origin, [
+      ...fields(origin),
+      cleanQuestion(question),
+      hash,
+      label,
+      at,
+      responseId,
+    ])
     this.reconcileTyped(origin, hash, at)
     return !!this.db
       .prepare(
@@ -864,32 +1225,29 @@ export class EvidenceDatabase {
   }
 
   private reconcileTyped(session: Session, hash: string, at: number): void {
-    const query = [
-      session.source,
-      session.sessionId,
-      hash,
-      at - 4 * receiptWindow,
-      at + 4 * receiptWindow,
-    ] as const
+    if (!this.deriving)
+      return this.derived(() => this.reconcileTyped(session, hash, at))
+    const query = [session.source, session.sessionId, hash] as const
     const candidates = this.db
       .prepare(
-        `SELECT c.tool,c.question,c.label,c.at,c.response_id, EXISTS(SELECT 1 FROM pref_misdirected_typed x WHERE (x.source,x.session,x.tool,x.question,x.hash,x.at)=(c.source,c.session,c.tool,c.question,c.hash,c.at)) AS misdirected
-         FROM pref_typed_candidates c WHERE c.source=? AND c.session=? AND c.hash=? AND c.at BETWEEN ? AND ?`,
+        `SELECT c.tool,c.question,c.label,c.at,c.response_id, EXISTS(SELECT 1 FROM pref_misdirected_typed x WHERE (x.source,x.session,x.tool,x.question,x.hash,x.at)=(c.source,c.session,c.tool,c.question,c.hash,c.at)) AS misdirected,
+         EXISTS(SELECT 1 FROM pref_fallback_links f WHERE (f.source,f.session,f.tool,f.question,f.at)=(c.source,c.session,c.tool,c.question,c.at)) AS linked
+         FROM pref_typed_candidates c WHERE c.source=? AND c.session=? AND c.hash=?`,
       )
-      .all(...query) as unknown as (TypedCandidate & { misdirected: number })[]
+      .all(...query) as unknown as (TypedCandidate & {
+      misdirected: number
+      linked: number
+    })[]
     const receipts = this.db
       .prepare(
-        'SELECT at,submission FROM pref_submissions WHERE source=? AND session=? AND hash=? AND at BETWEEN ? AND ?',
+        'SELECT at,submission FROM pref_submissions WHERE source=? AND session=? AND hash=?',
       )
       .all(...query) as unknown as TypedReceipt[]
     const matches = uniqueTypedMatches(candidates, receipts)
     // A native correction disqualifies that inferred target. Its receipt still cannot verify another nearby ambiguous candidate.
     for (const c of candidates) if (c.misdirected) matches.delete(c)
-    const affected = candidates.filter(
-      (c) => Math.abs(c.at - at) <= 2 * receiptWindow,
-    )
-    for (const c of affected) {
-      if (matches.has(c)) continue
+    for (const c of candidates) {
+      if (!c.linked || matches.has(c)) continue
       const origin = { ...session, toolUseId: c.tool }
       const previous = this.db
         .prepare(
@@ -920,8 +1278,8 @@ export class EvidenceDatabase {
       }
     }
     // Release new unambiguous pairs only after obsolete matches have freed their canonical response identities.
-    for (const c of affected) {
-      if (!matches.has(c)) continue
+    for (const c of candidates) {
+      if (c.linked || !matches.has(c)) continue
       const origin = { ...session, toolUseId: c.tool }
       const added = this.db
         .prepare('INSERT OR IGNORE INTO pref_fallback_links VALUES(?,?,?,?,?)')
@@ -932,15 +1290,72 @@ export class EvidenceDatabase {
     }
   }
 
-  private restoreDirectSelection(origin: Origin, question: string): void {
-    const withdrawn = this.db
+  /** Reassess a disputed offer from remaining direct choices and receipt matches when an attribution is lost.
+   * @example this.restoreDirectSelection(origin, question)
+   */
+  private restoreDirectSelection(
+    origin: Origin,
+    question: string,
+    includeFallback = true,
+  ): void {
+    const key = [...fields(origin), question] as const
+    const offer = this.db
       .prepare(
-        `UPDATE pref_offers AS o SET (selected,answered)=
-      (SELECT d.selected,d.at FROM pref_direct_answers d WHERE (d.source,d.session,d.tool,d.question,d.selected)=(o.source,o.session,o.tool,o.question,o.selected))
-      WHERE o.source=? AND o.session=? AND o.tool=? AND o.question=? AND o.answered IS NOT NULL`,
+        'SELECT options,asked FROM pref_offers WHERE source=? AND session=? AND tool=? AND question=?',
       )
-      .run(...fields(origin), question)
-    if (withdrawn.changes) this.db.exec(dirty)
+      .get(...key)
+    if (!offer) return
+    const verified = this.db
+      .prepare(
+        `SELECT selected,at FROM pref_primary_choices WHERE source=? AND session=? AND tool=? AND question=? AND at>=?
+      UNION ALL SELECT selected,at FROM pref_direct_answers WHERE source=? AND session=? AND tool=? AND question=? AND at>=?`,
+      )
+      .all(...key, offer.asked!, ...key, offer.asked!)
+    const fallback = !includeFallback
+      ? []
+      : this.db
+          .prepare(
+            `SELECT c.label,c.at FROM pref_fallback_links f JOIN pref_typed_candidates c USING(source,session,tool,question,at)
+        WHERE f.source=? AND f.session=? AND f.tool=? AND f.question=? AND c.at>=?`,
+          )
+          .all(...key, offer.asked!)
+    const options = JSON.parse(String(offer.options)) as {
+      label: string
+      meaning: string
+    }[]
+    const surviving = [
+      ...verified.map((row) => ({
+        meaning: String(row.selected),
+        at: Number(row.at),
+      })),
+      ...fallback.map((row) => ({
+        meaning:
+          options.find(
+            (option) =>
+              normalizeLabel(option.label) ===
+              normalizeLabel(String(row.label)),
+          )?.meaning ?? otherResponse,
+        at: Number(row.at),
+      })),
+    ].sort((a, b) => a.at - b.at)
+    const conflict = this.db
+      .prepare(
+        'SELECT 1 FROM pref_shape_conflicts WHERE source=? AND session=? AND tool=? AND question=?',
+      )
+      .get(...key)
+    this.db
+      .prepare(
+        'UPDATE pref_offers SET selected=?,answered=?,conflict=? WHERE source=? AND session=? AND tool=? AND question=?',
+      )
+      .run(
+        surviving[0]?.meaning ?? null,
+        surviving[0]?.at ?? null,
+        Number(
+          !!conflict || new Set(surviving.map((row) => row.meaning)).size > 1,
+        ),
+        ...key,
+      )
+    this.db.exec(dirty)
   }
 
   /** Withdraw a role-only pairing when the native user event identifies a different target or submission.
@@ -958,7 +1373,15 @@ export class EvidenceDatabase {
         'INSERT OR IGNORE INTO pref_misdirected_typed SELECT source,session,tool,question,hash,at FROM pref_typed_candidates WHERE source=? AND session=? AND tool=? AND question=? AND hash=? AND at=?',
       )
       .run(...fields(origin), cleanQuestion(question), hash, at)
-    if (rejected.changes) this.reconcileTyped(origin, hash, at)
+    if (rejected.changes) {
+      this.primary('pref_misdirected_typed', origin, [
+        ...fields(origin),
+        cleanQuestion(question),
+        hash,
+        at,
+      ])
+      this.reconcileTyped(origin, hash, at)
+    }
   }
 
   /** Preserve an independently human-authored text reply when a separate role-only mirror later becomes ambiguous.
@@ -971,9 +1394,10 @@ export class EvidenceDatabase {
     label: string,
     at: number,
   ): void {
-    this.db
-      .prepare('INSERT OR IGNORE INTO pref_direct_text VALUES(?,?,?,?)')
-      .run(...fields(origin), responseId)
+    this.insertPrimary('pref_direct_text', origin, [
+      ...fields(origin),
+      responseId,
+    ])
     this.humanResponse(origin, responseId, at)
     if (this.answer(origin, question, label, at, true)) {
       // A validated direct answer has its own chronology even if an earlier fallback currently owns the observation.
@@ -1017,9 +1441,13 @@ export class EvidenceDatabase {
     if (!validId(session.sessionId) || !time(at) || !typed) return
     const hash = digest(typed.trim())
     const submission = nativeId && validId(nativeId) ? 'prompt:' + nativeId : ''
-    this.db
-      .prepare('INSERT OR IGNORE INTO pref_submissions VALUES(?,?,?,?,?)')
-      .run(session.source, session.sessionId, hash, at, submission)
+    this.insertPrimary('pref_submissions', session, [
+      session.source,
+      session.sessionId,
+      hash,
+      at,
+      submission,
+    ])
     this.db
       .prepare('INSERT OR IGNORE INTO pref_typed_receipts VALUES(?,?,?,?)')
       .run(session.source, session.sessionId, hash, at)
@@ -1029,10 +1457,12 @@ export class EvidenceDatabase {
       )
       .all(session.source, session.sessionId, hash, at - 2000, at + 2000)
     for (const item of instructions)
-      this.saveRules(
-        session,
-        Number(item.at),
-        JSON.parse(String(item.rules)) as Constraint[],
+      this.derived(() =>
+        this.saveRules(
+          session,
+          Number(item.at),
+          JSON.parse(String(item.rules)) as Constraint[],
+        ),
       )
     this.reconcileTyped(session, hash, at)
   }

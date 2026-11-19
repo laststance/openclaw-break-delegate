@@ -40,8 +40,9 @@ enum SurfaceChecks {
         let category = offer.kind.category
         func select(_ surface: Surface, _ action: String, at date: Date = start) -> Selection? {
             let request = surface.notification
-            return surface.selection(NativeChoice(request: request.identifier, category: request.content.categoryIdentifier,
-                                                  action: action, subject: request.content.userInfo["subject"] as? String), now: date)
+            guard let choice = surface.notificationChoice(request: request.identifier, category: request.content.categoryIdentifier,
+                                                          action: action, subject: request.content.userInfo["subject"] as? String) else { return nil }
+            return surface.selection(choice, now: date)
         }
 
         // Assert — consent requires a current explicit action, including after a gateway restart.
@@ -61,6 +62,25 @@ enum SurfaceChecks {
         precondition(select(active, Button.back.actionID, at: Date(timeIntervalSince1970: 1_900)) == nil)
         precondition(select(digest, UNNotificationDefaultActionIdentifier) == .readReview)
         precondition(select(digest, Button.review.actionID) == .readReview)
+        let restoredDigest = Surface(command: .init(request: 7, kind: .summary, id: "break-one", endsAt: nil, review: review), profile: profile)!
+        let otherDigest = Surface(command: .init(request: 8, kind: .summary, id: "break-two", endsAt: nil, review: review), profile: profile)!
+        precondition(restoredDigest.notification.identifier == digest.notification.identifier)
+        precondition(restoredDigest.requestID != digest.requestID)
+        precondition(otherDigest.notification.identifier != digest.notification.identifier)
+        precondition(profile.owns(digest.notificationID) && !secondProfile.owns(digest.notificationID))
+        precondition(profile.isSummary(digest.notificationID) && !profile.isSummary(offer.notificationID))
+        precondition(!secondProfile.isSummary(digest.notificationID))
+        let receiptsDirectory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: receiptsDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: receiptsDirectory) }
+        let receipts = SummaryBannerReceipts(directory: receiptsDirectory)
+        precondition(!receipts.contains(digest.notificationID))
+        receipts.accept(digest.notificationID)
+        let restarted = SummaryBannerReceipts(directory: receiptsDirectory)
+        precondition(restarted.contains(restoredDigest.notificationID) && !restarted.contains(otherDigest.notificationID))
+        let recoveredSnapshot = SummaryBannerReceipts(directory: nil)
+        recoveredSnapshot.observe([digest.notificationID])
+        precondition(recoveredSnapshot.contains(restoredDigest.notificationID))
         precondition(digest.notification.content.body == "2 answered · 6 held. Open the review to read them.")
         precondition(digest.notification.content.userInfo.count == 1)
         precondition(digest.notification.content.userInfo["subject"] as? String == "break-one")
@@ -119,6 +139,11 @@ enum SurfaceChecks {
         let cli = "/tmp/node_modules/@anthropic-ai/claude-code/cli.js"
         precondition(classifyClaudeArguments(arguments("/usr/local/bin/node", ["node", cli, "Explain how -p works"])) == .interactive)
         precondition(classifyClaudeArguments(arguments("/usr/local/bin/node", ["node", cli, "--output-format=json"])) == .headless)
+        precondition(classifyClaudeArguments(arguments("/usr/local/bin/node", ["custom-label", "--no-warnings", cli])) == .interactive)
+        precondition(classifyClaudeArguments(arguments("/usr/local/bin/node", ["node", "-r", "/tmp/loader", "--", cli, "--print"])) == .headless)
+        precondition(classifyClaudeArguments(arguments("/usr/local/bin/node", ["node", "--require=" + cli, "/tmp/other.js"])) == .unrelated)
+        precondition(classifyClaudeArguments(arguments("/usr/local/bin/node", ["node", "--require", cli, "/tmp/other.js"])) == .unrelated)
+        precondition(classifyClaudeArguments(arguments("/usr/local/bin/node", ["node", "--eval=x", cli])) == .unrelated)
         precondition(classifyClaudeArguments(arguments("/usr/local/bin/node", ["node", "/tmp/tool.js", cli, "--print"])) == .unrelated)
         precondition(classifyClaudeArguments([2, 0, 0, 0]) == .unknown)
 

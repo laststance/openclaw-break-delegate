@@ -10,6 +10,8 @@ Open **Options** on an invitation to delegate for 15 minutes, snooze once, or di
 
 The gateway starts the signed executable inside its application bundle. A private inherited pipe carries commands and replies. Each presentation has a profile-scoped request identifier. All profiles register the same invitation, break and review actions. The app validates those identifiers, the subject and the active deadline before writing a response. The gateway checks the persisted consent again. Closing the gateway pipe retires the menu and its notification. When the helper alone restarts, the adapter restores the current surface. A gateway restart invalidates the old helper's callbacks.
 
+The Gateway retries the initial return review until the helper acknowledges it. A profile-scoped banner identifier lets the helper recover after a restart without posting another banner for the same break.
+
 ## Build and release
 
 Run `pnpm run build:native` in the repository root on a Mac with Xcode Command Line Tools. This builds an ad-hoc signed, hardened-runtime app at `native/generated/BreakDelegate.app`. Local builds verify the code signature, bundle ID, version and both CPU architectures.

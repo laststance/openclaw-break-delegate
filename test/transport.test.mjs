@@ -1,7 +1,6 @@
 import test from 'node:test'
-import childProcess, { execFile } from 'node:child_process'
+import { execFile } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
-import { writeFileSync } from 'node:fs'
 import { once } from 'node:events'
 import { createConnection } from 'node:net'
 import { syncBuiltinESMExports } from 'node:module'
@@ -28,14 +27,6 @@ import {
   listenGateway,
   requestGateway,
 } from '../dist/ipc.js'
-import { nativeHelperExecutable } from '../dist/native/index.js'
-
-const exchangeHelper = process.env.BREAK_DELEGATE_NATIVE_OUTPUT
-  ? join(
-      process.env.BREAK_DELEGATE_NATIVE_OUTPUT,
-      'BreakDelegate.app/Contents/MacOS/BreakDelegate',
-    )
-  : nativeHelperExecutable
 
 test('reinstalling and removing Claude hooks preserves unrelated settings and commands', async (t) => {
   // Arrange
@@ -388,11 +379,6 @@ test('a competing settings save remains active and its displaced revision is rec
   const before = '{"theme":"dark"}'
   const competing = '{"theme":"light","language":"ja"}'
   await writeFile(file, before)
-  // This path exercises the portable exchange fallback even when a signed macOS helper is installed.
-  const native = t.mock.method(childProcess, 'spawnSync', () => ({
-    status: 0,
-    stdout: 'unsupported\n',
-  }))
   const originalRename = fs.rename
   let injected = false
   const writer = t.mock.method(fs, 'rename', async (from, to) => {
@@ -411,7 +397,6 @@ test('a competing settings save remains active and its displaced revision is rec
       /preserved revision/,
     )
   } finally {
-    native.mock.restore()
     writer.mock.restore()
     syncBuiltinESMExports()
   }
@@ -436,98 +421,89 @@ test('a competing settings save remains active and its displaced revision is rec
   assert.equal((await lstat(backupDir)).mode & 0o777, 0o700)
 })
 
-test(
-  'macOS settings conflicts retain the exact displaced edit and leave subsequent saves in place',
-  {
-    skip: process.platform !== 'darwin',
-    timeout: 90_000,
-  },
-  async (t) => {
-    // Arrange
-    const root = await mkdtemp(join(tmpdir(), 'bd-settings-exchange-'))
-    t.after(() => rm(root, { recursive: true, force: true }))
-    const file = join(root, 'settings.json')
-    const backupDir = file + '.break-delegate-backups'
-    const second = join(root, 'second.json')
-    const competing = '{"theme":"light","language":"ja"}'
-    const newest = '{"theme":"system","language":"en"}'
-    await writeFile(file, '{"theme":"dark"}')
-    await writeFile(second, '{"theme":"dark"}')
-    let exchanges = 0
-    const run = childProcess.spawnSync
-    let candidate = exchangeHelper
-    // An older checkout helper ignores unfamiliar commands. Build current source in isolation for this test.
-    if (run(candidate, ['--exchange-settings']).status !== 64) {
-      const output = join(root, 'helper')
-      const build = run(
-        '/bin/bash',
-        [fileURLToPath(new URL('../native/build-helper.sh', import.meta.url))],
-        {
-          encoding: 'utf8',
-          timeout: 70_000,
-          env: {
-            ...process.env,
-            BREAK_DELEGATE_NATIVE_OUTPUT: output,
-            BREAK_DELEGATE_SIGN_IDENTITY: '-',
-            BREAK_DELEGATE_REUSE_STAPLED: '0',
-          },
-        },
-      )
-      assert.equal(build.status, 0, build.stderr)
-      candidate = join(output, 'BreakDelegate.app/Contents/MacOS/BreakDelegate')
-    }
-    const writer = t.mock.method(
-      childProcess,
-      'spawnSync',
-      (path, args, options) => {
-        assert.equal(path, nativeHelperExecutable)
-        assert.equal(args[0], '--exchange-settings')
-        exchanges++
-        // Both editors save before publication. The second editor also saves again immediately afterwards.
-        writeFileSync(args[1], competing)
-        const result = run(candidate, args, options)
-        if (args[1].endsWith('/second.json')) writeFileSync(args[1], newest)
-        return result
-      },
+test('an editor save after settings capture stays active while both displaced and proposed revisions remain available', async (t) => {
+  // Arrange
+  const directory = await mkdtemp(join(tmpdir(), 'bd-settings-publish-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const file = join(await realpath(directory), 'settings.json')
+  const recovery = file + '.break-delegate-backups'
+  const competing = '{"theme":"light","language":"ja"}'
+  const newest = '{"theme":"system","language":"en"}'
+  await writeFile(file, '{"theme":"dark"}')
+  const renameFile = fs.rename
+  const writer = t.mock.method(fs, 'rename', async (from, to) => {
+    if (from !== file) return renameFile(from, to)
+    await writeFile(file, competing)
+    await renameFile(from, to)
+    await writeFile(file, newest, { mode: 0o640 })
+  })
+  syncBuiltinESMExports()
+
+  // Act
+  try {
+    await assert.rejects(
+      configureHooks('install', directory, file),
+      /preserved revision/,
     )
+  } finally {
+    writer.mock.restore()
     syncBuiltinESMExports()
+  }
+  const copies = await Promise.all(
+    (await readdir(recovery)).map((name) =>
+      readFile(join(recovery, name), 'utf8'),
+    ),
+  )
+  const active = await readFile(file, 'utf8')
+  const retry = await configureHooks('install', directory, file)
 
-    // Act
-    try {
-      await assert.rejects(
-        configureHooks('install', root, file),
-        /preserved revision/,
-      )
-      await assert.rejects(
-        configureHooks('install', root, second),
-        /preserved revision/,
-      )
-    } finally {
-      writer.mock.restore()
-      syncBuiltinESMExports()
-    }
-    const snapshots = await Promise.all(
-      (await readdir(backupDir)).map(async (name) =>
-        JSON.parse(await readFile(join(backupDir, name), 'utf8')),
-      ),
-    )
+  // Assert
+  assert.equal(active, newest)
+  assert.ok(copies.includes(competing))
+  assert.ok(copies.some((text) => JSON.parse(text).hooks?.SessionStart))
+  assert.equal(retry.changed, true)
+  assert.equal(JSON.parse(await readFile(file, 'utf8')).theme, 'system')
+})
 
-    // Assert
-    assert.equal(exchanges, 2)
+test('setup resumes an interrupted settings handoff through a symlink and preserves a newer active save', async (t) => {
+  // Arrange
+  const directory = await mkdtemp(join(tmpdir(), 'bd-settings-resume-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const older = '{"language":"ja"}'
+  const newer = '{"language":"en"}'
+  const missing = join(directory, 'missing.json')
+  const active = join(directory, 'active.json')
+  for (const file of [missing, active]) {
+    const recovery = file + '.break-delegate-backups'
+    await mkdir(recovery, { mode: 0o700 })
+    await writeFile(join(recovery, 'pending-original.json'), older)
+    await chmod(join(recovery, 'pending-original.json'), 0o640)
+  }
+  const alias = join(directory, 'settings.json')
+  await symlink(missing, alias)
+  await writeFile(active, newer)
+
+  // Act
+  await configureHooks('install', directory, alias)
+  await configureHooks('install', directory, active)
+
+  // Assert
+  assert.equal((await lstat(alias)).isSymbolicLink(), true)
+  assert.equal(JSON.parse(await readFile(alias, 'utf8')).language, 'ja')
+  assert.equal((await lstat(missing)).mode & 0o777, 0o640)
+  assert.equal(JSON.parse(await readFile(active, 'utf8')).language, 'en')
+  for (const file of [missing, active]) {
+    const recovery = file + '.break-delegate-backups'
     assert.equal(
-      JSON.parse(await readFile(file, 'utf8')).hooks.UserPromptSubmit.length,
-      1,
+      (await readdir(recovery)).includes('pending-original.json'),
+      false,
     )
-    assert.equal(await readFile(second, 'utf8'), newest)
-    assert.deepEqual(snapshots, [{ theme: 'light', language: 'ja' }])
-    const secondBackups = second + '.break-delegate-backups'
-    const [displaced] = await readdir(secondBackups)
-    assert.equal(
-      await readFile(join(secondBackups, displaced), 'utf8'),
-      competing,
+    const name = (await readdir(recovery)).find((entry) =>
+      entry.startsWith('recovered-'),
     )
-  },
-)
+    assert.equal(await readFile(join(recovery, name), 'utf8'), older)
+  }
+})
 
 test('large Gateway status reports whole session rows and the omitted count within one UTF-8 frame', async (t) => {
   // Arrange

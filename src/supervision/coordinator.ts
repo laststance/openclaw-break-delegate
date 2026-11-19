@@ -121,6 +121,8 @@ CREATE TABLE IF NOT EXISTS sv_questions(
   kind TEXT NOT NULL, live INTEGER NOT NULL, candidate TEXT, disposition TEXT NOT NULL,
   PRIMARY KEY(sessionId,questionId)
 );
+CREATE TEMP TABLE IF NOT EXISTS sv_early_completions(sessionId TEXT NOT NULL,incarnation TEXT NOT NULL,toolId TEXT NOT NULL,toolName TEXT NOT NULL,at INTEGER NOT NULL,PRIMARY KEY(sessionId,incarnation,toolId,toolName));
+CREATE INDEX IF NOT EXISTS temp.sv_early_completion_time ON sv_early_completions(at);
 CREATE TABLE IF NOT EXISTS sv_question_origins(sessionId TEXT NOT NULL,questionId TEXT NOT NULL,incarnation TEXT NOT NULL,openedAt INTEGER NOT NULL,PRIMARY KEY(sessionId,questionId));
 CREATE TABLE IF NOT EXISTS sv_reviews(
   breakId TEXT NOT NULL, sessionId TEXT NOT NULL, questionId TEXT NOT NULL, question TEXT NOT NULL,
@@ -302,6 +304,9 @@ export class Supervision {
           'UPDATE sv_question_origins SET openedAt=openedAt+? WHERE EXISTS (SELECT 1 FROM sv_questions q WHERE q.sessionId=sv_question_origins.sessionId AND q.questionId=sv_question_origins.questionId AND q.live=1)',
         )
         .run(now - this.#lastAt)
+      this.#db
+        .prepare('UPDATE sv_early_completions SET at=at+?')
+        .run(now - this.#lastAt)
       this.#work.resetClock(now)
       this.#coverage.clear()
       this.#db
@@ -326,6 +331,9 @@ export class Supervision {
           .all(active.id))
           confirmed.add(String(generation))
       this.#work.detach(new Set(this.#approvals.prune(now, confirmed)))
+      this.#db
+        .prepare('DELETE FROM sv_early_completions WHERE at<?')
+        .run(now - 60 * minute)
       this.#nextTrackingSweep = now + minute
     }
     this.#db
@@ -696,6 +704,42 @@ export class Supervision {
       )
       const isOpening =
         input.event === 'PreToolUse' || input.event === 'PermissionRequest'
+      if (
+        isOpening &&
+        input.toolUseId &&
+        this.#db
+          .prepare(
+            'SELECT 1 FROM sv_early_completions WHERE sessionId=? AND incarnation=? AND toolId=? AND toolName=? AND at>=?',
+          )
+          .get(
+            input.sessionId,
+            input.incarnation,
+            input.toolUseId,
+            input.toolName,
+            now - 60 * minute,
+          )
+      )
+        return false
+      if (
+        !currentTerminal &&
+        !isOpening &&
+        input.toolUseId &&
+        at >= now - 60 * minute
+      ) {
+        // A known provider completion rules out a later permission with this exact identity. It supplies no activity sample.
+        this.#db
+          .prepare(
+            'INSERT INTO sv_early_completions VALUES(?,?,?,?,?) ON CONFLICT(sessionId,incarnation,toolId,toolName) DO UPDATE SET at=MAX(at,excluded.at)',
+          )
+          .run(
+            input.sessionId,
+            input.incarnation,
+            input.toolUseId,
+            input.toolName,
+            at,
+          )
+        return false
+      }
       if (!currentTerminal && isOpening) {
         this.observe({ ...base, status: 'running' })
         currentTerminal = this.#work.claude(

@@ -1,4 +1,5 @@
 import test from 'node:test'
+import { createHash } from 'node:crypto'
 import assert from 'node:assert/strict'
 import {
   mkdtempSync,
@@ -529,6 +530,7 @@ test('questions about tests, documentation and approval leave later decisions el
     'Approval was already recorded.',
     'Did you remember to ask me for approval?',
     'Can you explain why I need you to get my approval?',
+    'Can you explain the results?',
     'The guide says to make sure you get my approval.',
   ])
     store.recordInstruction('claude', 'normal', note, base + 500)
@@ -554,6 +556,7 @@ test('questions about tests, documentation and approval leave later decisions el
     ['remember', 'Remember to ask me for approval.'],
     ['ensure', 'Make sure you get my approval first.'],
     ['need', 'I need you to get my approval.'],
+    ['compound', 'Can you explain the results, and ask for my approval?'],
   ])
     store.recordInstruction('claude', session, text, base + 500)
 
@@ -565,6 +568,7 @@ test('questions about tests, documentation and approval leave later decisions el
   assert.equal(decision('remember').reason, 'current-instructions')
   assert.equal(decision('ensure').reason, 'current-instructions')
   assert.equal(decision('need').reason, 'current-instructions')
+  assert.equal(decision('compound').reason, 'current-instructions')
 })
 
 test('withdrawn fallback evidence keeps only an independently validated selection at its actual response time', async (t) => {
@@ -883,6 +887,27 @@ test('absolute SCP paths share an SSH repository across clones and home-relative
   assert.notEqual(absolute, key('git@git.example:/srv/git/project'))
   assert.notEqual(alice, key('alice@git.example:team/project'))
   assert.notEqual(alice, bob)
+  const space = key('git@git.example:/srv/my repo.git')
+  const percent = key('git@git.example:/srv/my%20repo.git')
+  assert.match(space, /^remote:/u)
+  assert.equal(space, key('ssh://git@git.example/srv/my%20repo.git'))
+  assert.equal(percent, key('ssh://git@git.example/srv/my%2520repo.git'))
+  assert.notEqual(space, percent)
+  const ambiguousLegacy =
+    'remote:' +
+    createHash('sha256')
+      .update(
+        JSON.stringify([
+          'ssh-literal-path',
+          'git.example',
+          'git',
+          'absolute',
+          'srv/my%20repo.git',
+        ]),
+      )
+      .digest('hex')
+  assert.notEqual(space, ambiguousLegacy)
+  assert.notEqual(percent, ambiguousLegacy)
   assert.notEqual(alice, key('alice@git.example:/team/project.git'))
   assert.equal(key('alice@git.example:~/team/project.git'), null)
   assert.equal(key('ssh://alice@git.example/~alice/team/project.git'), null)
@@ -1177,6 +1202,7 @@ test('corrected middle rows with identical size and endpoint anchors retract ear
     ['tool:corrected'],
   )
   assert.equal(again.bytesRead, 0)
+  assert.equal(again.verificationBytesRead, 0)
 })
 
 test('a gateway task can run during validation of an append-only multi-megabyte prefix and a concurrent rewrite invalidates that validation', async (t) => {
@@ -1239,6 +1265,7 @@ test('a gateway task can run during validation of an append-only multi-megabyte 
     'last segment',
   ])
   assert.equal(resumed.bytesRead, Buffer.byteLength('{"type":"append"}\n'))
+  assert.ok(resumed.verificationBytesRead >= committedBytes)
   assert.equal(revised.observations, 0)
   assert.deepEqual(
     store.excludedResponsesSince(0).map((r) => r.responseId),
@@ -1575,4 +1602,329 @@ test('a history rewrite during synchronous decoding rolls back the obsolete inst
     0,
   )
   assert.equal(again.bytesRead, 0)
+})
+
+test('withdrawal of a conflicting inferred selection restores the independent direct choice while conflicting direct selections still hold', async (t) => {
+  // Arrange
+  const { store, repo, codex, file } = fixture(t)
+  const proof = { prompt_source: 'typed' }
+  append(join(codex, 'history.jsonl'), [{ ...receipt(500), text: 'B' }])
+  append(file, [
+    question('actual', 100),
+    typed('direct-A', 'A', 300, proof),
+    question('actual', 100),
+    typed(undefined, 'B', 500),
+    question('direct-disagreement', 5000),
+    typed('direct-B1', 'A', 5100, proof),
+    question('direct-disagreement', 5000),
+    typed('direct-B2', 'B', 5200, proof),
+  ])
+  const conflicting = await store.importHistory({ codex })
+  append(file, [question('ambiguous', 520), typed(undefined, 'B', 530)])
+
+  // Act
+  const withdrawn = await store.importHistory({ codex })
+
+  // Assert
+  assert.equal(conflicting.observations, 0)
+  assert.equal(withdrawn.observations, 1)
+  assert.deepEqual(store.evaluate(card, { cwd: repo }).summary.choices, [
+    { meaning: 'current-change', current: 1, other: 0 },
+    { meaning: 'separate-issue', current: 0, other: 0 },
+  ])
+  assert.deepEqual(
+    store.humanResponsesSince(0).map((r) => r.responseId),
+    ['prompt:direct-A', 'prompt:direct-B1', 'prompt:direct-B2'],
+  )
+})
+
+test('a six-second-late exact native submission takes its receipt back from an earlier time-only answer', async (t) => {
+  // Arrange
+  const { store, codex, file } = fixture(t)
+  append(join(codex, 'history.jsonl'), [receipt(200, 'actual-client')])
+  append(file, [question('weak', 100), typed(undefined, 'A', 200)])
+  const before = await store.importHistory({ codex })
+  const oldId = typedResponseId('A', base + 200, undefined, 'weak')
+  assert.deepEqual(
+    store.humanResponsesSince(0).map((r) => r.responseId),
+    [oldId],
+  )
+  append(file, [question('real', 6100), typed('actual-client', 'A', 6200)])
+
+  // Act
+  const corrected = await store.importHistory({ codex })
+
+  // Assert
+  assert.equal(before.observations, 1)
+  assert.equal(corrected.observations, 1)
+  assert.deepEqual(
+    store.humanResponsesSince(0).map((r) => r.responseId),
+    ['prompt:actual-client'],
+  )
+  assert.deepEqual(
+    store.unmatchedTypedResponsesSince(0).map((r) => r.responseId),
+    [oldId],
+  )
+})
+
+test('a standalone native Codex reply credits its referenced earlier question and ignores an unresolved explicit target', async (t) => {
+  // Arrange
+  const { store, codex, file, repo, db } = fixture(t)
+  const older = brief.replace(
+    'A) Fix in this PR\nB) Open a separate issue',
+    'A) Open a separate issue\nB) Fix in this PR',
+  )
+  const answer = (id, ref, text, at) =>
+    native(
+      {
+        type: 'UserMessage',
+        id,
+        client_id: id,
+        reply_to: ref,
+        content: [{ type: 'text', text }],
+      },
+      at,
+    )
+  append(file, [
+    question('older', 100, older),
+    question('latest', 200),
+    answer('only', 'older', 'A', 300),
+    question('open', 400),
+    answer('unresolved', 'unknown', 'Always ask for my approval', 500),
+  ])
+
+  // Act
+  const report = await store.importHistory({ codex })
+
+  // Assert
+  assert.equal(report.observations, 1)
+  assert.deepEqual(
+    db
+      .prepare(
+        "SELECT kind FROM pref_constraints WHERE source='codex' AND session='root'",
+      )
+      .all(),
+    [],
+  )
+  assert.deepEqual(
+    store.humanResponsesSince(0).map((r) => r.responseId),
+    ['prompt:only'],
+  )
+  assert.deepEqual(store.evaluate(card, { cwd: repo }).summary.choices, [
+    { meaning: 'current-change', current: 0, other: 0 },
+    { meaning: 'separate-issue', current: 1, other: 0 },
+  ])
+})
+
+test('a rewritten transcript withdraws its unsupported observations and workload while independent transcript and live copies retain their own evidence', async (t) => {
+  // Arrange
+  const { store, db, codex, file, repo } = fixture(t)
+  const meta = readFileSync(file, 'utf8')
+  const copy = join(dirname(file), 'rollout-independent.jsonl')
+  writeFileSync(copy, meta)
+  append(file, [
+    ask('removed'),
+    reply('removed'),
+    ask('copied'),
+    reply('copied'),
+    ask('also-live'),
+    reply('also-live'),
+    ask('automated'),
+    reply('automated', { timed_out: true }),
+  ])
+  append(copy, [ask('copied'), reply('copied')])
+  const before = await store.importHistory({ codex })
+  store.recordHumanSelection({
+    source: 'codex',
+    sessionId: 'root',
+    toolUseId: 'also-live',
+    cwd: repo,
+    card,
+    label: 'Fix in this PR',
+    askedAt: base + 10,
+    answeredAt: base + 20,
+  })
+  writeFileSync(file, '')
+  const reopened = new PreferenceStore(db)
+
+  // Act
+  const revised = await reopened.importHistory({ codex })
+  const unchanged = await reopened.importHistory({ codex })
+  writeFileSync(copy, meta)
+  const lastCopyGone = await reopened.importHistory({ codex })
+
+  // Assert
+  assert.equal(before.observations, 3)
+  assert.equal(revised.observations, 2)
+  assert.equal(unchanged.bytesRead, 0)
+  assert.equal(lastCopyGone.observations, 1)
+  assert.deepEqual(
+    reopened.humanResponsesSince(0).map((r) => r.responseId),
+    ['tool:also-live'],
+  )
+  assert.deepEqual(
+    reopened
+      .unmatchedTypedResponsesSince(0)
+      .map((r) => r.responseId)
+      .sort(),
+    ['tool:copied', 'tool:removed'],
+  )
+  assert.deepEqual(
+    reopened.excludedResponsesSince(0).map((r) => r.responseId),
+    ['tool:automated'],
+  )
+})
+
+test('rewriting a typed receipt file retracts the dependent inferred answer while a direct human submission in the same session survives', async (t) => {
+  // Arrange
+  const { store, codex, file } = fixture(t)
+  const input = join(codex, 'history.jsonl')
+  append(input, [receipt(200)])
+  append(file, [
+    question('weak', 100),
+    typed(undefined, 'A', 200),
+    question('real', 4000),
+    typed('human', 'B', 4200, { prompt_source: 'typed' }),
+  ])
+  const matched = await store.importHistory({ codex })
+  writeFileSync(input, '')
+
+  // Act
+  const revised = await store.importHistory({ codex })
+
+  // Assert
+  assert.equal(matched.observations, 2)
+  assert.equal(revised.observations, 1)
+  assert.deepEqual(
+    store.humanResponsesSince(0).map((r) => r.responseId),
+    ['prompt:human'],
+  )
+  assert.deepEqual(
+    store.unmatchedTypedResponsesSince(0).map((r) => r.responseId),
+    [typedResponseId('A', base + 200, undefined, 'weak')],
+  )
+})
+
+test('a verified native free-form Codex question credits one human submission and never stores its text as a preference', async (t) => {
+  // Arrange
+  const { store, db, codex, file } = fixture(t)
+  const free = (id, options) =>
+    ask(id, {
+      questions: [
+        { id: 'field', question: 'What is the desired title?', options },
+      ],
+    })
+  const result = (id, values, extra = {}) =>
+    reply(id, { answers: { field: { answers: values } }, ...extra })
+  append(file, [
+    free('omitted'),
+    result('omitted', ['private fixture title']),
+    free('null', null),
+    result('null', ['another private title']),
+    free('ambiguous', null),
+    result('ambiguous', ['two', 'answers']),
+    free('empty'),
+    result('empty', [' ']),
+    free('skipped'),
+    result('skipped', ['__skipped__']),
+    ask('partial-form', {
+      questions: [
+        { id: 'field', question: 'Title?' },
+        { id: 'scope', ...card },
+      ],
+    }),
+    result('partial-form', ['form contents']),
+    ask('unoffered-form', {
+      questions: [
+        { id: 'field', question: 'Title?' },
+        { id: 'scope', ...card },
+      ],
+    }),
+    reply('unoffered-form', {
+      answers: {
+        field: { answers: ['form contents'] },
+        scope: { answers: ['unexpected selection'] },
+      },
+    }),
+    free('machine'),
+    result('machine', ['text'], { automated: true }),
+  ])
+
+  // Act
+  const report = await store.importHistory({ codex })
+
+  // Assert
+  assert.equal(report.observations, 0)
+  assert.deepEqual(
+    store
+      .humanResponsesSince(0)
+      .map((r) => r.responseId)
+      .sort(),
+    ['tool:null', 'tool:omitted'],
+  )
+  assert.deepEqual(
+    store.excludedResponsesSince(0).map((r) => r.responseId),
+    ['tool:machine'],
+  )
+  assert.equal(
+    db
+      .prepare(
+        "SELECT 1 FROM pref_source_facts WHERE row_data LIKE '%private%title%'",
+      )
+      .get(),
+    undefined,
+  )
+})
+
+test('upgrading unowned history rereads its checkpoint and preserves an independently witnessed live answer when the old file dropped its call', async (t) => {
+  // Arrange
+  const { store, db, repo, codex, file } = fixture(t)
+  const meta = readFileSync(file, 'utf8')
+  append(file, [
+    ask('removed'),
+    reply('removed'),
+    ask('surviving'),
+    reply('surviving'),
+  ])
+  await store.importHistory({ codex })
+  store.recordHumanSelection({
+    source: 'codex',
+    sessionId: 'root',
+    toolUseId: 'direct-hook',
+    cwd: repo,
+    card,
+    label: 'Fix in this PR',
+    askedAt: base + 10,
+    answeredAt: base + 20,
+  })
+  db.exec(
+    "DELETE FROM pref_source_facts; DELETE FROM pref_primary_choices; DELETE FROM pref_decoder_versions WHERE version='history-source-ownership-v1'",
+  )
+  writeFileSync(file, meta)
+  append(file, [ask('surviving'), reply('surviving')])
+
+  // Act
+  const upgraded = new PreferenceStore(db)
+  const before = upgraded.humanResponsesSince(0)
+  const fresh = await upgraded.importHistory({ codex })
+  const immediatelyAgain = await upgraded.importHistory({ codex })
+
+  // Assert
+  assert.deepEqual(
+    before.map((r) => r.responseId),
+    ['tool:direct-hook'],
+  )
+  assert.equal(fresh.observations, 2)
+  assert.equal(immediatelyAgain.bytesRead, 0)
+  assert.deepEqual(
+    upgraded
+      .humanResponsesSince(0)
+      .map((r) => r.responseId)
+      .sort(),
+    ['tool:direct-hook', 'tool:surviving'],
+  )
+  assert.deepEqual(
+    upgraded.unmatchedTypedResponsesSince(0).map((r) => r.responseId),
+    ['tool:removed'],
+  )
 })

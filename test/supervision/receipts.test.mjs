@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { DatabaseSync } from 'node:sqlite'
 import test from 'node:test'
+import { ExecutionApprovals } from '../../dist/supervision/execution.js'
 import {
   Supervision,
   toolInputFingerprint,
@@ -571,4 +572,53 @@ test('resolving an old held question refreshes only its retained break review an
   assert.equal(s.review(old)[0].outcome, 'resolved')
   s.resolveQuestion(context.sessionId, 'held')
   assert.deepEqual(s.takeEffects(), [])
+})
+
+test('a busy terminal preserves recent completed IDs and retries exactly the permission whose transaction failed', () => {
+  // Arrange
+  const tracker = new ExecutionApprovals()
+  const observe = (event, id, at) =>
+    tracker.observe(
+      'generation',
+      {
+        sessionId: 's',
+        incarnation: 'p',
+        toolName: 'Bash',
+        toolUseId: id,
+        event,
+      },
+      at,
+    )
+  for (let i = 0; i < 4000; i++) {
+    tracker.transaction(() => observe('PreToolUse', 'completed-' + i, i * 2))
+    tracker.transaction(() =>
+      observe('PostToolUse', 'completed-' + i, i * 2 + 1),
+    )
+  }
+  tracker.transaction(() => observe('PermissionRequest', 'pending', 8001))
+  // Act
+  assert.throws(
+    () =>
+      tracker.transaction(() => {
+        observe('PostToolUse', 'pending', 8002)
+        observe('PermissionRequest', 'undone', 8003)
+        throw Error('persist failed')
+      }),
+    /persist failed/,
+  )
+  tracker.prune(30 * 60000, new Set(['generation']))
+  // Assert
+  assert.deepEqual(observe('PermissionRequest', 'completed-0', 30 * 60000), {
+    completed: [],
+  })
+  assert.deepEqual(observe('PostToolUse', 'pending', 30 * 60000 + 1), {
+    completed: ['approval:pending'],
+  })
+  assert.deepEqual(observe('PostToolUse', 'pending', 30 * 60000 + 2), {
+    completed: [],
+  })
+  assert.deepEqual(observe('PermissionRequest', 'undone', 30 * 60000 + 3), {
+    registered: 'approval:undone',
+    completed: [],
+  })
 })

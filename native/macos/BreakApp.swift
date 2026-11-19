@@ -12,6 +12,9 @@ struct NotificationStatus {
 final class BreakApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     private let center = UNUserNotificationCenter.current()
     private let profile: NotificationProfile
+    private let summaryReceipts: SummaryBannerReceipts
+    private var summaryCallbacks: [String: [(NotificationStatus) -> Void]] = [:]
+    private var recoveredSummaries = Set<String>()
     private var current: Surface?
     private var latestReview: ReturnedReview?
     private var statusItem: NSStatusItem?
@@ -20,7 +23,10 @@ final class BreakApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
     private var expiry: Timer?
     private var permission = NotificationStatus("not-determined")
 
-    init(profile: NotificationProfile) { self.profile = profile }
+    init(profile: NotificationProfile, directory: URL?) {
+        self.profile = profile
+        self.summaryReceipts = SummaryBannerReceipts(directory: directory)
+    }
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         center.delegate = self
@@ -33,16 +39,21 @@ final class BreakApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
             self.center.getDeliveredNotifications { notifications in
                 let snapshot = requests.map(\.identifier) + notifications.map(\.request.identifier)
                 DispatchQueue.main.async {
-                    let ids = self.profile.orphanedIDs(in: snapshot, keeping: self.current?.requestID)
+                    // A prior helper may have submitted its banner just before it lost the acknowledgment pipe.
+                    self.recoveredSummaries = Set(snapshot.filter(self.profile.isSummary))
+                    self.summaryReceipts.observe(Array(self.recoveredSummaries))
+                    // An already scheduled return banner must be allowed to deliver during reconnection.
+                    let ids = self.profile.orphanedIDs(in: snapshot, keeping: self.current?.notificationID)
+                        .filter { !self.recoveredSummaries.contains($0) }
                     if !ids.isEmpty {
                         // A request can move from pending to delivered between the two snapshots.
                         self.center.removePendingNotificationRequests(withIdentifiers: ids)
                         self.center.removeDeliveredNotifications(withIdentifiers: ids)
                     }
+                    self.readGatewayCommands()
                 }
             }
         }
-        readGatewayCommands()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -83,6 +94,7 @@ final class BreakApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
         case .authorize:
             authorize { self.reply(command.request, $0) }
         case .clear:
+            reconcileRecoveredSummaries(keeping: nil)
             removeCurrent()
             latestReview = nil
             windowReviewID = nil
@@ -103,7 +115,8 @@ final class BreakApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
                 reply(command.request, NotificationStatus("unavailable", "Invalid native presentation."))
                 return
             }
-            removeCurrent()
+            reconcileRecoveredSummaries(keeping: surface.notificationID)
+            removeCurrent(keeping: surface.notificationID)
             current = surface
             if case .summary(let review) = surface.content { latestReview = ReturnedReview(id: surface.subject, review: review) }
             if case .active(let end) = surface.content {
@@ -173,11 +186,26 @@ final class BreakApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
 
     private func post(_ surface: Surface, permission: NotificationStatus, done: @escaping (NotificationStatus) -> Void) {
         guard let current, current.requestID == surface.requestID, permission.code == "authorized" else { done(permission); return }
+        let id = surface.notificationID
+        if surface.kind == .summary {
+            if summaryReceipts.contains(id) {
+                // Notification Center can recover a submission from a helper that exited before saving its receipt.
+                summaryReceipts.accept(id)
+                done(permission)
+                return
+            }
+            if summaryCallbacks[id] != nil { summaryCallbacks[id]?.append(done); return }
+            summaryCallbacks[id] = [done]
+        }
         center.add(current.notification) { error in
             DispatchQueue.main.async {
                 // An authorization check or delivery may finish after return or replacement.
-                if self.current?.requestID != surface.requestID { self.removeNotification(surface) }
-                done(error == nil ? permission : NotificationStatus("unavailable", "macOS could not schedule this notification."))
+                if self.current?.notificationID != id { self.removeNotification(surface) }
+                let status = error == nil ? permission : NotificationStatus("unavailable", "macOS could not schedule this notification.")
+                if surface.kind == .summary {
+                    if error == nil, self.latestReview?.id == surface.subject { self.summaryReceipts.accept(id) }
+                    self.summaryCallbacks.removeValue(forKey: id)?.forEach { $0(status) }
+                } else { done(status) }
             }
         }
     }
@@ -189,14 +217,23 @@ final class BreakApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
     }
 
     private func removeNotification(_ surface: Surface) {
-        center.removePendingNotificationRequests(withIdentifiers: [surface.requestID])
-        center.removeDeliveredNotifications(withIdentifiers: [surface.requestID])
+        center.removePendingNotificationRequests(withIdentifiers: [surface.notificationID])
+        center.removeDeliveredNotifications(withIdentifiers: [surface.notificationID])
     }
 
-    private func removeCurrent() {
+    private func reconcileRecoveredSummaries(keeping id: String?) {
+        let obsolete = recoveredSummaries.filter { $0 != id }
+        recoveredSummaries.removeAll()
+        if !obsolete.isEmpty {
+            center.removePendingNotificationRequests(withIdentifiers: Array(obsolete))
+            center.removeDeliveredNotifications(withIdentifiers: Array(obsolete))
+        }
+    }
+
+    private func removeCurrent(keeping notificationID: String? = nil) {
         expiry?.invalidate()
         expiry = nil
-        if let current { removeNotification(current) }
+        if let current, current.notificationID != notificationID { removeNotification(current) }
         current = nil
     }
 
@@ -204,7 +241,7 @@ final class BreakApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
                                 withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
         DispatchQueue.main.async {
             let id = notification.request.identifier
-            let stale = self.profile.owns(id) && self.current?.requestID != id
+            let stale = self.profile.owns(id) && self.current?.notificationID != id && !self.recoveredSummaries.contains(id)
             completionHandler(stale ? [] : [.banner, .list])
         }
     }
@@ -214,9 +251,10 @@ final class BreakApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
         let request = response.notification.request
         DispatchQueue.main.async {
             defer { completionHandler() }
-            let choice = NativeChoice(request: request.identifier, category: request.content.categoryIdentifier,
-                                      action: response.actionIdentifier, subject: request.content.userInfo["subject"] as? String)
-            guard let selected = self.current?.selection(choice, now: Date()) else { return }
+            guard let current = self.current,
+                  let choice = current.notificationChoice(request: request.identifier, category: request.content.categoryIdentifier,
+                                                          action: response.actionIdentifier, subject: request.content.userInfo["subject"] as? String),
+                  let selected = current.selection(choice, now: Date()) else { return }
             self.perform(selected)
         }
     }

@@ -783,6 +783,7 @@ test(
     const secondInvitation = Promise.withResolvers()
     const summary = Promise.withResolvers()
     const settled = Promise.withResolvers()
+    const expiryRefresh = Promise.withResolvers()
     const invitations = []
     const authorized = async () => ({ status: 'authorized' })
     let act,
@@ -825,7 +826,11 @@ test(
             return authorized()
           },
           async refreshSummary(id, review) {
-            settled.resolve({ id, review })
+            if (review.answered.length) settled.resolve({ id, review })
+            if (
+              review.held.some((r) => r.reason === 'Delivery was not confirmed')
+            )
+              expiryRefresh.resolve({ id, review })
           },
         }
       },
@@ -874,7 +879,7 @@ test(
     await rpc({ op: 'ack', receipt: accepted.receipt })
     await rpc({ op: 'return' })
     const firstReview = await summary.promise
-    now += 10
+    now += 16_000
     observed.observe(live)
     observed.humanReply({
       provider: 'claude',
@@ -883,6 +888,7 @@ test(
     })
     await hook('UserPromptSubmit', undefined, { prompt: 'Continue the work.' })
     const next = await secondInvitation.promise
+    const expired = await expiryRefresh.promise
     await hook('PostToolUse', 'delivered', { answers })
     const refreshed = await settled.promise
     const status = await rpc({ op: 'status' })
@@ -891,6 +897,14 @@ test(
     assert.equal(permittedBeforeCancellation, true)
     assert.equal(permittedAfterCancellation, false)
     assert.equal(firstReview.review.answered.length, 0)
+    assert.equal(expired.id, firstReview.id)
+    assert.ok(
+      expired.review.held.some(
+        (r) =>
+          r.question === card.question &&
+          r.reason === 'Delivery was not confirmed',
+      ),
+    )
     assert.equal(refreshed.id, firstReview.id)
     assert.deepEqual(refreshed.review.answered, [
       { question: card.question, answer: 'Fix in this PR' },

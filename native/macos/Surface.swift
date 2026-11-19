@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import UserNotifications
 
 enum CommandKind: String, Decodable {
@@ -50,13 +51,49 @@ struct NotificationProfile {
 
     func identifier(for token: UUID) -> String { prefix + token.uuidString }
 
-    func owns(_ id: String) -> Bool {
-        id.hasPrefix(prefix) && UUID(uuidString: String(id.dropFirst(prefix.count))) != nil
+    func summaryIdentifier(_ subject: String) -> String {
+        prefix + "summary." + SHA256.hash(data: Data(subject.utf8)).map { String(format: "%02x", $0) }.joined()
     }
+
+    func owns(_ id: String) -> Bool {
+        guard id.hasPrefix(prefix) else { return false }
+        let suffix = id.dropFirst(prefix.count)
+        if suffix.hasPrefix("summary.") {
+            let hash = suffix.dropFirst("summary.".count)
+            return hash.utf8.count == 64 && hash.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
+        }
+        return UUID(uuidString: String(suffix)) != nil
+    }
+
+    func isSummary(_ id: String) -> Bool { id.hasPrefix(prefix + "summary.") && owns(id) }
 
     /// Select only this profile's obsolete requests, even if a new surface appeared during enumeration.
     func orphanedIDs(in ids: [String], keeping current: String?) -> [String] {
         ids.filter { $0 != current && owns($0) }
+    }
+}
+
+/// Remember the latest accepted banner across helper restarts, even when its pipe receipt was lost.
+final class SummaryBannerReceipts {
+    private let file: URL?
+    private var observed = Set<String>()
+
+    init(directory: URL?) {
+        file = directory?.appendingPathComponent("last-summary-banner")
+        if let file, let handle = try? FileHandle(forReadingFrom: file) {
+            defer { try? handle.close() }
+            if let data = try? handle.read(upToCount: 256), data.count < 256, let previous = String(data: data, encoding: .utf8) {
+                observed.insert(previous)
+            }
+        }
+    }
+
+    func observe(_ snapshot: [String]) { observed.formUnion(snapshot) }
+    func contains(_ id: String) -> Bool { observed.contains(id) }
+
+    func accept(_ id: String) {
+        observed = [id]
+        if let file { try? Data(id.utf8).write(to: file, options: .atomic) }
     }
 }
 
@@ -125,12 +162,14 @@ struct Surface {
     let subject: String
     private(set) var content: Content
     let requestID: String
+    let notificationID: String
 
     init?(command: GatewayCommand, profile: NotificationProfile) {
         guard let id = command.id, !id.isEmpty, id.utf8.count <= 128,
               id.rangeOfCharacter(from: .controlCharacters) == nil else { return nil }
         subject = id
         requestID = profile.identifier(for: UUID())
+        notificationID = command.kind == .summary ? profile.summaryIdentifier(id) : requestID
         switch command.kind {
         case .invite: content = .invitation
         case .active:
@@ -155,6 +194,12 @@ struct Surface {
         NativeChoice(request: requestID, category: kind.id, action: button.actionID, subject: subject)
     }
 
+    /// Match the operating-system request before checking the current subject and its allowed actions.
+    func notificationChoice(request: String, category: String, action: String, subject: String?) -> NativeChoice? {
+        guard request == notificationID else { return nil }
+        return NativeChoice(request: requestID, category: category, action: action, subject: subject)
+    }
+
     mutating func refresh(_ returned: ReturnedReview) {
         if kind == .summary, subject == returned.id { content = .summary(returned.review) }
     }
@@ -176,7 +221,7 @@ struct Surface {
             message.title = "Your break review is ready"
             message.body = "\(review.answeredTotal) answered · \(review.heldTotal) held. Open the review to read them."
         }
-        return UNNotificationRequest(identifier: requestID, content: message, trigger: nil)
+        return UNNotificationRequest(identifier: notificationID, content: message, trigger: nil)
     }
 
     /// Checks the envelope and action before forwarding a banner or status-menu response.

@@ -24,9 +24,10 @@ test('an offline status command reports failure when its state directory is name
   const result = spawnSync(
     process.execPath,
     [cli, 'status', '--state-dir', 'hook'],
-    { cwd: directory, encoding: 'utf8' },
+    { cwd: directory, encoding: 'utf8', timeout: 10000, killSignal: 'SIGKILL' },
   )
   // Assert
+  assert.ifError(result.error)
   assert.equal(result.status, 1)
   assert.match(result.stderr, /offline|unavailable|no such file|ENOENT/i)
 })
@@ -67,6 +68,46 @@ test('a suspended Claude hook leaves the original choice untouched after the bre
   // Assert
   assert.deepEqual(written, [])
   assert.deepEqual(operations, ['hook', 'can-deliver', 'undelivered'])
+})
+
+test('Claude leaves the original question open when consent expires during the delivery check', async (t) => {
+  // Arrange
+  const directory = await mkdtemp(join(tmpdir(), 'bd-midcheck-expiry-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const opensAt = Date.now()
+  let now = opensAt
+  t.mock.method(Date, 'now', () => now)
+  const requests = [],
+    written = []
+  const close = await listenGateway(directory, async (request) => {
+    requests.push(request.op)
+    if (request.op === 'hook')
+      return {
+        answers: { [card.question]: 'Fix in this PR' },
+        receipt: 'private-receipt',
+        deliverBefore: opensAt + 100,
+      }
+    if (request.op === 'can-deliver') now = opensAt + 101
+    return true
+  })
+  t.after(close)
+  // Act
+  await runHook(
+    directory,
+    {
+      hook_event_name: 'PreToolUse',
+      session_id: 'a',
+      cwd: directory,
+      tool_use_id: 'midcheck',
+      tool_name: 'AskUserQuestion',
+      tool_input: { questions: [card] },
+    },
+    async (value) => written.push(value),
+    'pty',
+  )
+  // Assert
+  assert.deepEqual(requests, ['hook', 'can-deliver', 'undelivered'])
+  assert.deepEqual(written, [])
 })
 
 test('Claude conveys an incomplete instruction and a qualified answer without copying the private note', async (t) => {

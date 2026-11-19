@@ -481,15 +481,16 @@ export function instructionConstraints(
   const text = questionText(value)
   if (!text) return []
   // Remove a directive lead-in only at a sentence boundary so factual mentions and questions keep their original meaning.
-  const approvalText = text.replace(
-    /(^|[.!?。！？]\s*)(?:(?:can|could|would|will) you\s+)?(?:please\s+)?(?:(?:remember|be sure|make sure) to|(?:be sure|make sure) (?:that )?you|i (?:want|need) you to|you (?:must|should|need to))\s+/gu,
-    '$1',
-  )
-  const approvalInstruction =
-    /(?:^|[.!?。！？]\s*)(?:(?:can|could|would|will) you\s+)?(?:please\s+)?(?:(?:ask|consult|check with)\s+(?:me|the (?:user|owner))\s+(?:for (?:approval|permission|confirmation)|before\b|first\b)|(?:ask for|obtain|get|require|wait for) (?:my|the (?:user's|owner's)) (?:approval|permission|confirmation))|(?:承認|許可|確認)を(?:取って|求めて|得て|待って|取ること|求めること)|(?:私|本人|ユーザー)に(?:必ず)?確認して/u.test(
+  const asksForApproval = (clause: string) => {
+    const approvalText = clause.replace(
+      /(^|[.!?。！？]\s*)(?:(?:can|could|would|will) you\s+)?(?:please\s+)?(?:(?:remember|be sure|make sure) to|(?:be sure|make sure) (?:that )?you|i (?:want|need) you to|you (?:must|should|need to))\s+/gu,
+      '$1',
+    )
+    return /(?:^|[.!?。！？]\s*)(?:(?:can|could|would|will) you\s+)?(?:please\s+)?(?:(?:ask|consult|check with)\s+(?:me|the (?:user|owner))\s+(?:for (?:approval|permission|confirmation)|before\b|first\b)|(?:ask for|obtain|get|require|wait for) (?:my|the (?:user's|owner's)) (?:approval|permission|confirmation))|(?:承認|許可|確認)を(?:取って|求めて|得て|待って|取ること|求めること)|(?:私|本人|ユーザー)に(?:必ず)?確認して/u.test(
       approvalText,
     )
-  if (approvalInstruction) return [{ kind: '*', required: '*' }]
+  }
+  if (asksForApproval(text)) return [{ kind: '*', required: '*' }]
   // A question asking for information does not impose a standing constraint. Polite requests can still contain an explicit limit.
   if (
     !explicit &&
@@ -501,7 +502,8 @@ export function instructionConstraints(
     const clauses = text
       .split(/\b(?:and|but)\s+|[,;、]|ただし\s*/u)
       .slice(1)
-      .filter((clause) => restriction.test(clause))
+      .map((clause) => clause.trim())
+      .filter((clause) => restriction.test(clause) || asksForApproval(clause))
     return clauses.flatMap((clause) =>
       instructionConstraints(clause.replace(/[?？]$/u, ''), true),
     )

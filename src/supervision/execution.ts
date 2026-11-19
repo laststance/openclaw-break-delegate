@@ -53,31 +53,62 @@ interface Matches {
  * @example tracker.observe(generation, observation, Date.now())
  */
 export class ExecutionApprovals {
-  #groups = new Map<string, Group>()
+  readonly #groups = new Map<string, Group>()
+  #undo: Array<() => void> | undefined
 
-  /** Roll back the copy-on-write tracker if a card update or its SQLite commit fails.
+  /** Journal only keys changed by a hook until the related SQLite transaction commits.
    * @example tracker.transaction(() => persistCards())
    */
   transaction<T>(write: () => T): T {
-    const previous = this.#groups
-    this.#groups = new Map(previous)
+    if (this.#undo) return write()
+    const undo: Array<() => void> = []
+    this.#undo = undo
     try {
       return write()
     } catch (error) {
-      this.#groups = previous
+      for (let i = undo.length - 1; i >= 0; i--) undo[i]()
       throw error
+    } finally {
+      this.#undo = undefined
     }
+  }
+
+  #put<K, V>(map: Map<K, V>, key: K, value: V): void {
+    if (this.#undo) {
+      const previous = map.get(key)
+      this.#undo.push(
+        map.has(key)
+          ? () => {
+              map.set(key, previous!)
+            }
+          : () => {
+              map.delete(key)
+            },
+      )
+    }
+    map.set(key, value)
+  }
+
+  #drop<K, V>(map: Map<K, V>, key: K): boolean {
+    if (!map.has(key)) return false
+    if (this.#undo) {
+      const previous = map.get(key)!
+      this.#undo.push(() => {
+        map.set(key, previous)
+      })
+    }
+    return map.delete(key)
   }
 
   #edit(generation: string, at: number): Group {
     const previous = this.#groups.get(generation)
-    const group = {
-      attempts: new Map(previous?.attempts),
-      approvals: new Map(previous?.approvals),
+    const group: Group = {
+      attempts: previous?.attempts ?? new Map(),
+      approvals: previous?.approvals ?? new Map(),
       lastSeen: Math.max(at, previous?.lastSeen ?? at),
       endedAt: previous?.endedAt ?? -Infinity,
     }
-    this.#groups.set(generation, group)
+    this.#put(this.#groups, generation, group)
     return group
   }
   /** Keep native event ordering comparable after the wall clock moves. */
@@ -87,9 +118,9 @@ export class ExecutionApprovals {
       group.lastSeen += delta
       group.endedAt += delta
       for (const [key, attempt] of group.attempts)
-        group.attempts.set(key, { ...attempt, at: attempt.at + delta })
+        this.#put(group.attempts, key, { ...attempt, at: attempt.at + delta })
       for (const [key, at] of group.approvals)
-        group.approvals.set(key, at + delta)
+        this.#put(group.approvals, key, at + delta)
     }
   }
   /** Remove unconfirmed tracking from the live hook path after one workload window.
@@ -99,9 +130,15 @@ export class ExecutionApprovals {
   prune(now: number, confirmed: ReadonlySet<string>): string[] {
     const evicted: string[] = []
     for (const [id, group] of this.#groups) {
-      if (group.lastSeen >= now - 3_600_000 || confirmed.has(id)) continue
-      this.#groups.delete(id)
-      evicted.push(id)
+      if (group.lastSeen < now - 3_600_000 && !confirmed.has(id)) {
+        this.#drop(this.#groups, id)
+        evicted.push(id)
+        continue
+      }
+      // Expiry maintenance runs on the gateway sweep instead of every new hook.
+      for (const [key, attempt] of group.attempts)
+        if (attempt.completed && attempt.at < now - 3_600_000)
+          this.#drop(group.attempts, key)
     }
     return evicted
   }
@@ -115,9 +152,9 @@ export class ExecutionApprovals {
     if (!approvals.length) return
     const group = this.#edit(generation, now)
     for (const { key, toolName, at } of approvals) {
-      group.approvals.set(key, at)
+      this.#put(group.approvals, key, at)
       if (!key.startsWith('approval:unidentified:'))
-        group.attempts.set(key.slice('approval:'.length), {
+        this.#put(group.attempts, key.slice('approval:'.length), {
           toolName,
           at,
           completed: false,
@@ -127,7 +164,7 @@ export class ExecutionApprovals {
 
   /** Forget the native records once the original terminal closes. */
   close(generation: string): void {
-    this.#groups.delete(generation)
+    this.#drop(this.#groups, generation)
   }
 
   /** Retire only permissions that predate a confirmed end of the main agent response.
@@ -139,12 +176,12 @@ export class ExecutionApprovals {
     const ended: string[] = []
     for (const [key, opened] of group.approvals) {
       if (opened > at) continue
-      group.approvals.delete(key)
+      this.#drop(group.approvals, key)
       ended.push(key)
     }
     for (const [key, attempt] of group.attempts)
       if (!attempt.completed && attempt.at <= at)
-        group.attempts.set(key, { ...attempt, completed: true })
+        this.#put(group.attempts, key, { ...attempt, at, completed: true })
     return ended
   }
   observe(
@@ -155,11 +192,12 @@ export class ExecutionApprovals {
     const group = this.#edit(generation, at)
     const result: Matches = { completed: [] }
     if (at <= group.endedAt) return result
-    for (const [key, attempt] of group.attempts)
-      if (attempt.completed && attempt.at < at - 3_600_000)
-        group.attempts.delete(key)
     const { toolUseId: id, toolName, fingerprint } = input
-    const attempt = id ? group.attempts.get(id) : undefined
+    let attempt = id ? group.attempts.get(id) : undefined
+    if (id && attempt?.completed && attempt.at < at - 3_600_000) {
+      this.#drop(group.attempts, id)
+      attempt = undefined
+    }
     if (
       attempt &&
       (attempt.toolName !== toolName || at < attempt.at || attempt.completed)
@@ -167,12 +205,12 @@ export class ExecutionApprovals {
       return result
     if (input.event === 'PreToolUse') {
       if (id && !attempt)
-        group.attempts.set(id, { toolName, at, completed: false })
+        this.#put(group.attempts, id, { toolName, at, completed: false })
       return result
     }
     if (input.event === 'PermissionRequest') {
       if (id && !attempt)
-        group.attempts.set(id, { toolName, at, completed: false })
+        this.#put(group.attempts, id, { toolName, at, completed: false })
       // Even one identical pre-hook cannot rule out a second tool whose pre-hook was lost.
       const key = id
         ? 'approval:' + id
@@ -181,7 +219,7 @@ export class ExecutionApprovals {
             .update(JSON.stringify([generation, at, toolName, fingerprint]))
             .digest('hex')
       if (!group.approvals.has(key)) {
-        group.approvals.set(key, at)
+        this.#put(group.approvals, key, at)
         result.registered = key
       }
       return result
@@ -190,8 +228,8 @@ export class ExecutionApprovals {
     const key = 'approval:' + id,
       opened = group.approvals.get(key)
     if (opened !== undefined && opened > at) return result
-    group.attempts.set(id, { toolName, at, completed: true })
-    if (group.approvals.delete(key)) result.completed.push(key)
+    this.#put(group.attempts, id, { toolName, at, completed: true })
+    if (this.#drop(group.approvals, key)) result.completed.push(key)
     return result
   }
 }

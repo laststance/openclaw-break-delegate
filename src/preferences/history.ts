@@ -30,6 +30,7 @@ export interface ImportReport {
   files: number
   changedFiles: number
   bytesRead: number
+  verificationBytesRead: number
   malformed: number
   oversized: number
   unreadable: number
@@ -144,16 +145,25 @@ function* discover(
   }
 }
 
-function checkpointHash(fd: number, offset: number): string {
+function checkpointHash(
+  fd: number,
+  offset: number,
+  report: ImportReport,
+): string {
   const size = Math.min(offset, 96)
   const first = Buffer.alloc(size)
   const last = Buffer.alloc(size)
-  readSync(fd, first, 0, size, 0)
-  readSync(fd, last, 0, size, offset - size)
+  report.verificationBytesRead += readSync(fd, first, 0, size, 0)
+  report.verificationBytesRead += readSync(fd, last, 0, size, offset - size)
   return createHash('sha256').update(first).update(last).digest('hex')
 }
 
-function rangeHash(fd: number, start: number, stop: number): string {
+function rangeHash(
+  fd: number,
+  start: number,
+  stop: number,
+  report: ImportReport,
+): string {
   const hash = createHash('sha256')
   const buf = Buffer.allocUnsafe(Math.min(chunkSize, stop - start))
   while (start < stop) {
@@ -165,6 +175,7 @@ function rangeHash(fd: number, start: number, stop: number): string {
       start,
     )
     if (!bytes) break
+    report.verificationBytesRead += bytes
     hash.update(buf.subarray(0, bytes))
     start += bytes
   }
@@ -182,6 +193,7 @@ async function matchesPrefix(
   fd: number,
   key: string,
   stop: number,
+  report: ImportReport,
 ): Promise<boolean> {
   const next = db.db.prepare(
     'SELECT start,stop,hash FROM pref_file_segments WHERE path=? AND start=?',
@@ -207,6 +219,7 @@ async function matchesPrefix(
         cursor,
       )
       if (!n) return false
+      report.verificationBytesRead += n
       hash.update(buffer.subarray(0, n))
       cursor += n
       await yieldToGateway()
@@ -229,21 +242,26 @@ async function importFile(
     const identity = info.dev.toString() + ':' + info.ino.toString()
     const key = digest(file.format + '\0' + file.path)
     const old = db.db.prepare('SELECT * FROM pref_files WHERE path=?').get(key)
+    const owner = key + '/' + identity
     const size = Number(info.size)
+    const version = db.db
+      .prepare('SELECT stamp FROM pref_file_versions WHERE path=?')
+      .get(key)?.stamp
+    const unchanged = version === fileVersion(info)
+    const refresh = !!db.db
+      .prepare('SELECT 1 FROM pref_legacy_refresh WHERE path=?')
+      .get(key)
     let resume =
+      !refresh &&
       old?.identity === identity &&
       Number(old.offset) <= size &&
-      old.anchor === checkpointHash(fd, Number(old.offset))
+      (unchanged ||
+        old.anchor === checkpointHash(fd, Number(old.offset), report))
     const saveVersion = db.db.prepare(
       'INSERT OR REPLACE INTO pref_file_versions VALUES(?,?)',
     )
-    if (
-      resume &&
-      db.db
-        .prepare('SELECT stamp FROM pref_file_versions WHERE path=?')
-        .get(key)?.stamp !== fileVersion(info)
-    ) {
-      resume = await matchesPrefix(db, fd, key, Number(old!.offset))
+    if (resume && !unchanged) {
+      resume = await matchesPrefix(db, fd, key, Number(old!.offset), report)
       if (fileVersion(info) !== fileVersion(fstatSync(fd, { bigint: true }))) {
         if (retries < 2) await importFile(db, file, report, retries + 1)
         else report.unreadable++
@@ -260,13 +278,24 @@ async function importFile(
     const save = db.db.prepare(
       'INSERT OR REPLACE INTO pref_files VALUES(?,?,?,?,?,?)',
     )
-    if (offset >= size) return
+    if (!resume && old) {
+      db.transaction(() => {
+        // In-place edits invalidate this physical generation. A rotation starts a separate historical source.
+        if (old.identity === identity) db.withdrawSource(owner)
+        db.db.prepare('DELETE FROM pref_file_segments WHERE path=?').run(key)
+        db.db.prepare('DELETE FROM pref_files WHERE path=?').run(key)
+        db.db.prepare('DELETE FROM pref_legacy_refresh WHERE path=?').run(key)
+        db.db.prepare('DELETE FROM pref_file_versions WHERE path=?').run(key)
+      })
+    }
+    if (offset >= size) {
+      if (!resume && old) report.changedFiles++
+      return
+    }
     report.changedFiles++
     const addSegment = db.db.prepare(
       'INSERT OR REPLACE INTO pref_file_segments VALUES(?,?,?,?)',
     )
-    if (!resume)
-      db.db.prepare('DELETE FROM pref_file_segments WHERE path=?').run(key)
     let stat = info
     let pending: Buffer[] = []
     let length = 0
@@ -285,11 +314,11 @@ async function importFile(
       const current = fstatSync(fd, { bigint: true })
       if (fileVersion(current) !== fileVersion(stat)) {
         const bytesMatch =
-          rangeHash(fd, offset, offset + received) ===
+          rangeHash(fd, offset, offset + received, report) ===
           createHash('sha256').update(chunk.subarray(0, received)).digest('hex')
         const partialMatches =
           offset === saved ||
-          rangeHash(fd, saved, offset) ===
+          rangeHash(fd, saved, offset, report) ===
             createHash('sha256')
               .update(Buffer.concat(pending, length))
               .digest('hex')
@@ -297,7 +326,7 @@ async function importFile(
           Number(current.size) >= offset + received &&
           bytesMatch &&
           partialMatches &&
-          (await matchesPrefix(db, fd, key, saved)) &&
+          (await matchesPrefix(db, fd, key, saved, report)) &&
           fileVersion(current) === fileVersion(fstatSync(fd, { bigint: true }))
         if (!valid) {
           await retry()
@@ -352,12 +381,17 @@ async function importFile(
             skipAtCommit = false
           }
           if (commit > saved) {
-            addSegment.run(key, saved, commit, rangeHash(fd, saved, commit))
+            addSegment.run(
+              key,
+              saved,
+              commit,
+              rangeHash(fd, saved, commit, report),
+            )
             save.run(
               key,
               identity,
               commit,
-              checkpointHash(fd, commit),
+              checkpointHash(fd, commit, report),
               Number(skipAtCommit),
               JSON.stringify(state),
             )
@@ -369,7 +403,7 @@ async function importFile(
             fileVersion(stat) !== fileVersion(fstatSync(fd, { bigint: true }))
           )
             throw changedDuringParse
-        })
+        }, owner)
       } catch (error) {
         if (error !== changedDuringParse) throw error
         await retry()
@@ -397,6 +431,7 @@ export async function importLocalHistory(
     files: 0,
     changedFiles: 0,
     bytesRead: 0,
+    verificationBytesRead: 0,
     malformed: 0,
     oversized: 0,
     unreadable: 0,

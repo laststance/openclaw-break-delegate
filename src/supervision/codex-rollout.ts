@@ -115,7 +115,7 @@ async function readRolloutHeader(
 interface Request {
   blocking: boolean
   automatic: boolean
-  questions: Map<string, Set<string>>
+  questions: Map<string, Set<string> | null>
 }
 interface Turn {
   state: Activity
@@ -166,7 +166,12 @@ function selectionsMatch(request: Request, payload: Json): boolean {
     if (
       !Array.isArray(selected) ||
       selected.length === 0 ||
-      !selected.every((v) => typeof v === 'string' && choices.has(v))
+      !(choices
+        ? selected.every((v) => typeof v === 'string' && choices.has(v))
+        : selected.length === 1 &&
+          typeof selected[0] === 'string' &&
+          !!selected[0].trim() &&
+          !/^__(?:unknown|skipped|missing)__$/iu.test(selected[0].trim()))
     )
       return false
   }
@@ -174,11 +179,35 @@ function selectionsMatch(request: Request, payload: Json): boolean {
 }
 
 function requestFor(args: Json, ...envelopes: Json[]): Request {
-  const questions = new Map<string, Set<string>>()
+  const questions = new Map<string, Set<string> | null>()
   for (const q of Array.isArray(args.questions) ? args.questions : []) {
     const row = object(q)
-    if (!row || typeof row.id !== 'string' || !Array.isArray(row.options))
+    // An unsupported sibling must not silently turn a partial response into a complete one.
+    if (
+      !row ||
+      typeof row.id !== 'string' ||
+      !row.id ||
+      questions.has(row.id)
+    ) {
+      questions.clear()
+      break
+    }
+    if (
+      row.options == null &&
+      typeof row.question === 'string' &&
+      row.question.trim()
+    ) {
+      questions.set(row.id, null)
       continue
+    }
+    if (
+      !Array.isArray(row.options) ||
+      !row.options.length ||
+      !row.options.every((o) => typeof object(o)?.label === 'string')
+    ) {
+      questions.clear()
+      break
+    }
     questions.set(
       row.id,
       new Set(
@@ -334,7 +363,8 @@ function applyEvent(
       at,
     })
     // A late marked mirror excludes the same call even after its pending request has closed.
-    if (automatic || request?.automatic) record('tool:' + id, true)
+    if (automatic || known === 'marked' || request?.automatic)
+      record('tool:' + id, true)
     else if (complete && request && selectionsMatch(request, output))
       record('tool:' + id)
   }

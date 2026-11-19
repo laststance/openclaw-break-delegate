@@ -19,61 +19,75 @@ export function uniqueTypedMatches(
   candidates: readonly TypedCandidate[],
   rawReceipts: readonly TypedReceipt[],
 ): Set<TypedCandidate> {
-  const near = (a: { at: number }, b: { at: number }) =>
-    Math.abs(a.at - b.at) <= receiptWindow
-  const identified = rawReceipts.filter((r) => r.submission)
-  // One native submission may appear in both the input log and a completed UI event.
-  const copies = new Map<string, TypedReceipt[]>()
-  for (const receipt of rawReceipts) {
-    const key = receipt.submission || 'at:' + receipt.at
-    const existing = copies.get(key) ?? []
-    existing.push(receipt)
-    copies.set(key, existing)
-  }
-  const edges = new Map<TypedCandidate, TypedReceipt[]>()
-  const callers = new Map<TypedReceipt, TypedCandidate[]>()
-  const unique = new Set<TypedCandidate>()
-  const reserved = new Set<string>()
-  for (const id of copies.keys()) {
-    if (!id.startsWith('prompt:')) continue
-    const claimants = candidates.filter(
-      (candidate) => candidate.response_id === id,
-    )
-    if (!claimants.length) continue
-    reserved.add(id)
-    if (claimants.length === 1) unique.add(claimants[0]!)
-  }
-  const available = [...copies]
-    .filter(([id]) => !reserved.has(id))
-    .map(([, group]) => group)
+  const sorted = [...rawReceipts].sort((a, b) => a.at - b.at)
+  const identified = sorted.filter((r) => r.submission)
+  const idOf = (r: TypedReceipt) => r.submission || 'at:' + r.at
+  const firstCopy = new Map<string, TypedReceipt>()
+  for (const receipt of sorted)
+    if (!firstCopy.has(idOf(receipt))) firstCopy.set(idOf(receipt), receipt)
+  const exact = new Map<string, TypedCandidate[]>()
   for (const candidate of candidates) {
+    if (
+      !candidate.response_id.startsWith('prompt:') ||
+      !firstCopy.has(candidate.response_id)
+    )
+      continue
+    const list = exact.get(candidate.response_id) ?? []
+    list.push(candidate)
+    exact.set(candidate.response_id, list)
+  }
+  const matches = new Set<TypedCandidate>()
+  for (const group of exact.values())
+    if (group.length === 1) matches.add(group[0]!)
+  // A native ID can claim a receipt across any clock skew. Anonymous matching still inspects only the two-second neighborhood.
+  const startAt = (records: readonly TypedReceipt[], at: number) => {
+    let low = 0,
+      high = records.length
+    while (low < high) {
+      const mid = Math.floor((low + high) / 2)
+      if (records[mid]!.at < at - receiptWindow) low = mid + 1
+      else high = mid
+    }
+    return low
+  }
+  const edges = new Map<TypedCandidate, Set<TypedReceipt>>()
+  const callers = new Map<TypedReceipt, number>()
+  for (const candidate of candidates) {
+    if (exact.has(candidate.response_id)) continue
     const id = candidate.response_id.startsWith('prompt:')
       ? candidate.response_id
       : ''
-    if (reserved.has(id)) continue
-    const eligible = available
-      .filter((group) =>
-        group.some(
-          (r) =>
-            near(candidate, r) && (!id || !r.submission || r.submission === id),
-        ),
+    const eligible = new Set<TypedReceipt>()
+    for (
+      let i = startAt(sorted, candidate.at);
+      i < sorted.length && sorted[i]!.at <= candidate.at + receiptWindow;
+      i++
+    ) {
+      const receipt = sorted[i]!
+      if (
+        exact.has(receipt.submission) ||
+        (id && receipt.submission && id !== receipt.submission)
       )
-      .map((group) => group[0]!)
-    edges.set(candidate, eligible)
-    for (const receipt of eligible) {
-      const matches = callers.get(receipt) ?? []
-      matches.push(candidate)
-      callers.set(receipt, matches)
+        continue
+      eligible.add(firstCopy.get(idOf(receipt))!)
     }
+    edges.set(candidate, eligible)
+    for (const receipt of eligible)
+      callers.set(receipt, (callers.get(receipt) ?? 0) + 1)
   }
   for (const [candidate, eligible] of edges) {
-    if (eligible.length !== 1) continue
-    const receipt = eligible[0]!
-    // An anonymous timestamp cannot prove a second submission beside a native receipt, nor can it erase that possible ambiguity.
-    if (!receipt.submission && identified.some((other) => near(receipt, other)))
+    if (eligible.size !== 1) continue
+    const receipt = eligible.values().next().value!
+    if (callers.get(receipt) !== 1) continue
+    // A nearby identified event can be a second rendering of this anonymous entry, so it cannot certify another person input.
+    const nearby = identified[startAt(identified, receipt.at)]
+    if (
+      !receipt.submission &&
+      nearby &&
+      nearby.at <= receipt.at + receiptWindow
+    )
       continue
-    const possible = callers.get(receipt)!
-    if (possible.length === 1) unique.add(candidate)
+    matches.add(candidate)
   }
-  return unique
+  return matches
 }

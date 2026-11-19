@@ -236,9 +236,10 @@ export async function startService(
     db.prepare('DELETE FROM bd_hook_times WHERE openedAt<?').run(
       now() - 86400000,
     )
+    let retainedReviewExpired = false
     for (const row of db
       .prepare(
-        'SELECT receipt,sessionId,questionId FROM bd_delivery_receipts WHERE expired=0 AND expires<=?',
+        'SELECT receipt,sessionId,questionId,breakId FROM bd_delivery_receipts WHERE expired=0 AND expires<=?',
       )
       .all(now())) {
       coordinator.settleAnswer(
@@ -249,7 +250,10 @@ export async function startService(
       db.prepare(
         'UPDATE bd_delivery_receipts SET expired=1 WHERE receipt=?',
       ).run(row.receipt)
+      if (row.breakId === retainedDigest) retainedReviewExpired = true
     }
+    if (retainedDigest && retainedReviewExpired)
+      refreshRetainedDigest(retainedDigest)
     void effects()
   }
   async function onHook(r: ObjectValue, ctx: RpcContext): Promise<unknown> {
@@ -265,6 +269,10 @@ export async function startService(
       typeof event !== 'string'
     )
       return null
+    const observedAt =
+      typeof r.at === 'number' && Number.isFinite(r.at)
+        ? Math.min(r.at, now())
+        : now()
     const base = {
       provider: 'claude' as const,
       sessionId,
@@ -277,7 +285,12 @@ export async function startService(
         ? r.questionId
         : undefined
     if (event === 'SessionStart') {
-      coordinator.observe({ ...base, status: 'idle', newSession: true })
+      coordinator.observe({
+        ...base,
+        status: 'idle',
+        newSession: true,
+        at: observedAt,
+      })
       return null
     }
     if (event === 'SessionEnd') {
@@ -289,10 +302,7 @@ export async function startService(
         ...base,
         status: 'idle',
         turnEnded: true,
-        at:
-          typeof r.at === 'number' && Number.isFinite(r.at)
-            ? Math.min(r.at, now())
-            : now(),
+        at: observedAt,
       })
       return null
     }
@@ -312,10 +322,7 @@ export async function startService(
         toolUseId: questionId,
         fingerprint:
           typeof r.fingerprint === 'string' ? r.fingerprint : undefined,
-        at:
-          typeof r.at === 'number' && Number.isFinite(r.at)
-            ? Math.min(r.at, now())
-            : now(),
+        at: observedAt,
       })
       return null
     }

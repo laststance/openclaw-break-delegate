@@ -12,18 +12,7 @@ export function claudeTerminal(): string | undefined {
     try {
       const fields = execFileSync(
         '/bin/ps',
-        [
-          '-p',
-          String(pid),
-          '-o',
-          'ppid=',
-          '-o',
-          'tty=',
-          '-o',
-          'lstart=',
-          '-o',
-          'comm=',
-        ],
+        ['-p', String(pid), '-o', 'ppid=', '-o', 'tty=', '-o', 'lstart='],
         {
           env: { TZ: 'UTC0', LC_ALL: 'C' },
           encoding: 'utf8',
@@ -32,28 +21,26 @@ export function claudeTerminal(): string | undefined {
         },
       ).trim()
       const match = fields.match(
-        /^(\d+)\s+(\S+)\s+(\S+\s+\S+\s+\d+\s+\S+\s+\d{4})\s+(.+)$/,
+        /^(\d+)\s+(\S+)\s+(\S+\s+\S+\s+\d+\s+\S+\s+\d{4})$/,
       )
       if (!match) return
-      const [, parent, tty, started, command] = match
-      if (/(?:^|\/)(?:claude(?:-code)?|node|versions\/[^/]+)$/.test(command)) {
-        // Darwin validates the actual versioned executable, including prerelease suffixes, and its argv.
-        const mode = execFileSync(
-          nativeHelperExecutable,
-          ['--classify-claude-process', String(pid)],
-          {
-            encoding: 'utf8',
-            timeout: 1000,
-            maxBuffer: 100,
-            stdio: ['ignore', 'pipe', 'ignore'],
-          },
-        ).trim()
-        if (mode === 'headless') return
-        if (mode === 'interactive') {
-          const startedAt = Date.parse(started + ' GMT')
-          if (tty === '??' || tty === '?' || !Number.isFinite(startedAt)) return
-          return pid + ':' + Math.floor(startedAt / 1000)
-        }
+      const [, parent, tty, started] = match
+      // Darwin validates the actual versioned executable, including prerelease suffixes, and its argv.
+      const mode = execFileSync(
+        nativeHelperExecutable,
+        ['--classify-claude-process', String(pid)],
+        {
+          encoding: 'utf8',
+          timeout: 1000,
+          maxBuffer: 100,
+          stdio: ['ignore', 'pipe', 'ignore'],
+        },
+      ).trim()
+      if (mode === 'headless') return
+      if (mode === 'interactive') {
+        const startedAt = Date.parse(started + ' GMT')
+        if (tty === '??' || tty === '?' || !Number.isFinite(startedAt)) return
+        return pid + ':' + Math.floor(startedAt / 1000)
       }
       pid = Number(parent)
     } catch {

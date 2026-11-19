@@ -54,7 +54,11 @@ type LaunchOptions = {
   timeoutMs?: number
   retryMs?: number
 }
-type Pending = { finish: (status: NativeStatus) => void; timer: NodeJS.Timeout }
+type Pending = {
+  finish: (status: NativeStatus) => void
+  timer: NodeJS.Timeout
+  initialSummary?: string
+}
 type SurfaceUpdate = Exclude<Command, StatusCommand>
 type QueuedUpdate = {
   command: SurfaceUpdate
@@ -84,9 +88,9 @@ const statuses = new Set([
  * The helper only receives the user/locale environment required by macOS.
  *
  * @example
- * const child = launchHelper(profileKey);
+ * const child = launchHelper(profileKey, profileDirectory);
  */
-function launchHelper(profileKey: string): Helper {
+function launchHelper(profileKey: string, profileDirectory: string): Helper {
   if (process.platform !== 'darwin')
     throw new Error('Native notifications require a macOS desktop session.')
   try {
@@ -96,7 +100,10 @@ function launchHelper(profileKey: string): Helper {
       'The signed Break Delegate app is missing or cannot be executed. Install a package containing the native helper.',
     )
   }
-  const env: NodeJS.ProcessEnv = { PATH: '/usr/bin:/bin' }
+  const env: NodeJS.ProcessEnv = {
+    PATH: '/usr/bin:/bin',
+    BREAK_DELEGATE_PROFILE_DIRECTORY: profileDirectory,
+  }
   for (const key of [
     'HOME',
     'USER',
@@ -187,9 +194,8 @@ export function createNativeBreakUi(
   let pendingClear: Promise<NativeStatus> | undefined
   const timeoutMs = options.timeoutMs ?? 8_000
   // Match the gateway's normalized profile path without exposing a folder name on a banner or in argv.
-  const profileKey = createHash('sha256')
-    .update(resolve(options.profileDirectory ?? dataDirectory()))
-    .digest('hex')
+  const profileDirectory = resolve(options.profileDirectory ?? dataDirectory())
+  const profileKey = createHash('sha256').update(profileDirectory).digest('hex')
 
   function retire(instance: Helper): void {
     instance.stdin.end()
@@ -258,12 +264,32 @@ export function createNativeBreakUi(
       if (!receipt) return
       pending.delete(frame.request)
       clearTimeout(receipt.timer)
-      failures = 0
       const result: NativeStatus = {
         status: frame.status as NativeStatus['status'],
       }
       if (typeof frame.detail === 'string')
         result.detail = frame.detail.slice(0, 300)
+      if (result.status !== 'unavailable') failures = 0
+      if (
+        receipt.initialSummary &&
+        latestReview?.id === receipt.initialSummary
+      ) {
+        if (result.status === 'unavailable') {
+          if (
+            desired?.kind === 'summary' &&
+            desired.id === receipt.initialSummary
+          )
+            scheduleRetry()
+        } else {
+          // Only an actual helper acknowledgment converts the first banner into a silent restoration.
+          latestReview = { ...latestReview, silent: true }
+          if (
+            desired?.kind === 'summary' &&
+            desired.id === receipt.initialSummary
+          )
+            desired = latestReview
+        }
+      }
       receipt.finish(result)
       flushQueued(instance)
       return
@@ -305,7 +331,9 @@ export function createNativeBreakUi(
     if (child) return child
     if (retry) clearTimeout(retry)
     retry = undefined
-    const instance = (options.launch ?? launchHelper)(profileKey)
+    const instance = options.launch
+      ? options.launch(profileKey)
+      : launchHelper(profileKey, profileDirectory)
     child = instance
     let buffer = ''
     const fail = () =>
@@ -423,7 +451,14 @@ export function createNativeBreakUi(
         retire(instance)
       }, delay)
       timer.unref()
-      pending.set(request, { finish, timer })
+      pending.set(request, {
+        finish,
+        timer,
+        initialSummary:
+          command.kind === 'summary' && !command.silent
+            ? command.id
+            : undefined,
+      })
       instance.stdin.write(JSON.stringify({ request, ...command }) + '\n')
     })
     if (command.kind === 'clear') {
@@ -451,7 +486,7 @@ export function createNativeBreakUi(
         desired?.kind !== 'summary' &&
         command.kind !== 'summary'
       ) {
-        void write(instance, latestReview)
+        void write(instance, { ...latestReview, silent: true })
       }
       // A status query can reconnect before the scheduled retry. Restore its outstanding surface first.
       if (fresh && desired && command !== desired) void write(instance, desired)
@@ -508,13 +543,12 @@ export function createNativeBreakUi(
         kind: 'summary',
         id,
         review: previewReview(review),
+        ...(latestReview?.id === id && latestReview.silent
+          ? { silent: true }
+          : {}),
       }
       const result = present(first)
-      if (desired === first) {
-        // Only the original summary posts a banner. Restoring the menu is silent.
-        latestReview = { ...first, silent: true }
-        desired = latestReview
-      }
+      if (desired === first) latestReview = first
       return result
     },
     async refreshSummary(id, review) {

@@ -754,13 +754,21 @@ test('an old complete roster cannot revive a later withdrawal and only a newer o
   })
   // Act
   advance(10000)
-  s.snapshot('claude-agents', [], {
-    at: hookAt - 10000,
-    status: 'available',
-    detail: 'Late older roster',
-  })
+  s.snapshot(
+    'claude-agents',
+    [{ provider: 'claude', sessionId: 'a', status: 'running' }],
+    {
+      at: hookAt - 10000,
+      status: 'available',
+      detail: 'Late older roster',
+    },
+  )
   // Assert
   assert.equal(s.status().sessions[0].status, 'unknown')
+  assert.equal(
+    s.status().coverage.find((c) => c.source === 'claude-agents').at,
+    hookAt + 10000,
+  )
   assert.equal(s.status().score, 0.166667)
   observe('a')
   assert.equal(s.status().sessions[0].status, 'running')
@@ -795,4 +803,113 @@ test('a dated idle snapshot ends running credit at observation even after a chec
   advance(10000)
   s.tick()
   assert.equal(s.status().score, 0.166667)
+})
+
+test('a tool completion received before its original terminal is known prevents a reordered permission from creating a wait', (t) => {
+  // Arrange
+  const { supervisor: s, observe, clock, advance } = setup(t)
+  const hook = (incarnation, event, toolUseId) =>
+    s.observeExecution({
+      sessionId: 'original',
+      incarnation,
+      event,
+      toolUseId,
+      toolName: 'Bash',
+      at: clock(),
+    })
+  // Act
+  assert.equal(hook('one', 'PostToolUse', 'finished'), false)
+  assert.equal(s.status().sessions.length, 0)
+  advance(10)
+  observe('original', 'running', { incarnation: 'one', newSession: true })
+  // Assert
+  assert.equal(hook('one', 'PreToolUse', 'finished'), false)
+  assert.equal(hook('one', 'PermissionRequest', 'finished'), false)
+  assert.equal(s.status().sessions[0].status, 'running')
+  assert.equal(hook('one', 'PermissionRequest', 'current'), true)
+  advance(10)
+  observe('original', 'running', { incarnation: 'two', newSession: true })
+  assert.equal(hook('two', 'PermissionRequest', 'finished'), true)
+})
+
+test('a delayed SessionStart cannot replace a resumed terminal or retire its original live card', (t) => {
+  // Arrange
+  const { supervisor: s, observe, clock, advance } = setup(t, { threshold: 4 })
+  observe('a', 'idle', { incarnation: 'A', newSession: true, at: clock() })
+  advance(100)
+  const lateA = clock()
+  advance(100)
+  const startB = clock()
+  observe('a', 'idle', { incarnation: 'B', newSession: true, at: startB })
+  observe('a', 'running', { incarnation: 'B', at: startB })
+  const id = invite(s),
+    generation = s.status().sessions[0].generation
+  s.question({
+    sessionId: 'a',
+    incarnation: 'B',
+    questionId: 'open',
+    question: 'Which?',
+  })
+  // Act
+  advance(50)
+  observe('a', 'idle', { incarnation: 'A', newSession: true, at: lateA })
+  observe('a', 'idle', { incarnation: 'A', newSession: true, at: startB })
+  // Assert
+  assert.equal(s.status().sessions[0].generation, generation)
+  assert.equal(s.review(id)[0].outcome, 'held')
+  assert.equal(
+    s.commitAnswer(
+      {
+        sessionId: 'a',
+        incarnation: 'B',
+        questionId: 'open',
+        breakId: id,
+        answer: 'First',
+      },
+      () => true,
+    ),
+    true,
+  )
+  advance(50)
+  observe('a', 'idle', { incarnation: 'C', newSession: true, at: clock() })
+  assert.notEqual(s.status().sessions[0].generation, generation)
+})
+
+test('after a wall-clock rollback the default review chooses the latest created break while explicit IDs and continuation cursors retain the original break', (t) => {
+  // Arrange
+  const { supervisor: s, observe, advance } = setup(t, { threshold: 4 })
+  observe('a')
+  const first = invite(s)
+  for (let i = 0; i < 42; i++)
+    s.question({
+      sessionId: 'a',
+      questionId: 'first-' + i,
+      question: 'Previous question?',
+    })
+  const pinned = s.reviewPage()
+  assert.ok(pinned.nextCursor)
+  s.action(first, 'return')
+  advance(-60 * minute)
+  s.tick()
+  observe('a')
+  s.humanReply({
+    provider: 'claude',
+    sessionId: 'a',
+    responseId: 'prompt:after-reset',
+  })
+  const inviteId = s.status().invitationId
+  assert.equal(s.action(inviteId, 'accept'), true)
+  const second = s.status().break.id
+  s.question({
+    sessionId: 'a',
+    questionId: 'second',
+    question: 'Current question?',
+  })
+  // Act
+  const current = s.reviewPage()
+  // Assert
+  assert.equal(current.breakId, second)
+  assert.ok(s.review().some((row) => row.questionId === 'second'))
+  assert.equal(s.reviewPage({ breakId: first }).breakId, first)
+  assert.equal(s.reviewPage({ cursor: pinned.nextCursor }).breakId, first)
 })

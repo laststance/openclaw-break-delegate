@@ -544,7 +544,9 @@ test('the Codex Unix WebSocket uses metadata-only methods, pages loaded IDs, and
     file,
     jsonl(session('desktop', 'vscode', 'Codex Desktop'), event('task_started')),
   )
-  const socket = join(home, 'observer.sock'),
+  const socketDirectory = await mkdtemp('/tmp/bd-observer-')
+  t.after(() => rm(socketDirectory, { recursive: true, force: true }))
+  const socket = join(socketDirectory, 'observer.sock'),
     server = createServer(),
     websocket = new WebSocketServer({ server })
   const requests = []
@@ -1107,4 +1109,198 @@ test('a late unmarked Codex offer cannot reopen a known completed call while a s
     done.excludedReplies.map((r) => r.responseId),
     ['tool:finished'],
   )
+})
+
+test('a verified native free-form answer counts once without storing its text while empty, skipped, unknown and automatic results earn nothing', async (t) => {
+  // Arrange
+  const { home, file } = await isolated(t)
+  const db = new DatabaseSync(':memory:')
+  t.after(() => db.close())
+  const s = new Supervision(db, { now: () => now })
+  const probe = new LocalActivityProbe({
+    codexHome: home,
+    now: () => now,
+    readClaude: empty,
+    readCodex: empty,
+    readWriters: async () => [file],
+  })
+  const ask = (id, options) =>
+    input(id, {
+      questions: [
+        {
+          id: 'description',
+          header: 'Details',
+          question: 'What would you like to add?',
+          options,
+        },
+      ],
+    })
+  const result = (id, text, extra = {}, key = 'description') =>
+    item('function_call_output', {
+      call_id: id,
+      output: JSON.stringify({
+        answers: { [key]: { answers: [text] } },
+        ...extra,
+      }),
+    })
+  await writeFile(file, jsonl(session('cli'), event('task_started')))
+  await probe.poll(s)
+  // Act
+  await appendFile(
+    file,
+    jsonl(
+      ask('empty'),
+      result('empty', '  '),
+      ask('skipped'),
+      result('skipped', '__skipped__'),
+      ask('wrong'),
+      result('wrong', 'Human text', {}, 'unoffered'),
+      ask('auto'),
+      result('auto', 'Machine text', { autoResolved: true }),
+      ask('invalid', 1),
+      result('invalid', 'Not a supported request'),
+      ask('filtered', []),
+      result('filtered', 'Empty option array'),
+    ),
+  )
+  await probe.poll(s)
+  // Assert
+  assert.equal(s.status().score, 0)
+  await appendFile(
+    file,
+    jsonl(ask('human', null), result('human', 'Verified free-form answer.')),
+  )
+  await probe.poll(s)
+  assert.equal(s.status().score, 4)
+  assert.equal(
+    s.humanReply({
+      provider: 'codex',
+      sessionId: 'cli',
+      responseId: 'tool:human',
+    }),
+    false,
+  )
+  const row = db.prepare('SELECT id FROM sv_replies WHERE credited=1').get()
+  assert.match(row.id, /^[a-f0-9]{64}$/u)
+  await appendFile(
+    file,
+    jsonl(
+      ask('human-omitted'),
+      result('human-omitted', 'Another verified answer.'),
+    ),
+  )
+  await probe.poll(s)
+  assert.equal(s.status().score, 8)
+  const preferences = new PreferenceStore(db)
+  await preferences.importHistory({ codex: home })
+  const replies = preferences.humanResponsesSince(0)
+  assert.deepEqual(replies.map((r) => r.responseId).sort(), [
+    'tool:human',
+    'tool:human-omitted',
+  ])
+  for (const reply of replies)
+    assert.equal(
+      s.humanReply({
+        provider: reply.source,
+        sessionId: reply.sessionId,
+        responseId: reply.responseId,
+        at: reply.at,
+      }),
+      false,
+    )
+})
+
+test('a clean named completion after an unnamed automatic answer cannot erase its exclusion before the late offer arrives', async (t) => {
+  // Arrange
+  const { home, file } = await isolated(t)
+  const db = new DatabaseSync(':memory:')
+  t.after(() => db.close())
+  const s = new Supervision(db, { now: () => now })
+  const probe = new LocalActivityProbe({
+    codexHome: home,
+    now: () => now,
+    readClaude: empty,
+    readCodex: empty,
+    readWriters: async () => [file],
+  })
+  await writeFile(
+    file,
+    jsonl(session('cli'), answer('reordered', { autoResolved: true })),
+  )
+  await probe.poll(s)
+  s.humanReply({
+    provider: 'codex',
+    sessionId: 'cli',
+    responseId: 'tool:reordered',
+  })
+  assert.equal(s.status().score, 4)
+  // Act
+  await appendFile(
+    file,
+    jsonl(
+      event('item_completed', {
+        thread_id: 'cli',
+        item: {
+          type: 'FunctionCallOutput',
+          id: 'reordered',
+          name: 'request_user_input',
+          output: answer('reordered').payload.output,
+        },
+      }),
+    ),
+  )
+  await probe.poll(s)
+  await appendFile(file, jsonl(input('reordered'), answer('reordered')))
+  await probe.poll(s)
+  // Assert
+  assert.equal(s.status().score, 0)
+  assert.equal(
+    s.humanReply({
+      provider: 'codex',
+      sessionId: 'cli',
+      responseId: 'tool:reordered',
+    }),
+    false,
+  )
+})
+
+test('a failed provider read reports unavailable and cannot renew the last positively observed running interval', async (t) => {
+  // Arrange
+  const db = new DatabaseSync(':memory:')
+  t.after(() => db.close())
+  let clock = now,
+    failing = false
+  const s = new Supervision(db, { now: () => clock, observationTtlMs: 60000 })
+  const probe = new LocalActivityProbe({
+    now: () => clock,
+    readClaude: empty,
+    readWriters: async () => [],
+    readCodex: async () => {
+      if (failing) throw Error('socket unavailable')
+      return {
+        observations: [
+          { provider: 'codex', sessionId: 'live', status: 'running' },
+        ],
+        detail: 'Live provider',
+      }
+    },
+  })
+  await probe.poll(s)
+  // Act
+  failing = true
+  clock += 20000
+  await probe.poll(s)
+  // Assert
+  assert.equal(
+    s.status().coverage.find((row) => row.source === 'codex-app-server').status,
+    'unavailable',
+  )
+  assert.equal(s.status().sessions[0].status, 'running')
+  clock += 40000
+  await probe.poll(s)
+  assert.equal(s.status().sessions[0].status, 'unknown')
+  assert.equal(s.status().score, 1)
+  clock += 60000
+  await probe.poll(s)
+  assert.equal(s.status().score, 1)
 })

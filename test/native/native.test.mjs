@@ -25,47 +25,77 @@ const repo = fileURLToPath(new URL('../../', import.meta.url))
 test(
   'the packaged process classifier reads exact argv boundaries from live Darwin Node launchers',
   {
-    skip: process.platform !== 'darwin' || !existsSync(nativeHelperExecutable),
-    timeout: 10_000,
+    skip: process.platform !== 'darwin',
+    timeout: 90_000,
   },
   async (t) => {
     // Arrange
     const directory = mkdtempSync(join(tmpdir(), 'break-delegate-argv-'))
     t.after(() => rmSync(directory, { recursive: true, force: true }))
+    const build = spawnSync(
+      '/bin/bash',
+      [join(repo, 'native/build-helper.sh')],
+      {
+        encoding: 'utf8',
+        timeout: 70_000,
+        killSignal: 'SIGKILL',
+        env: {
+          ...process.env,
+          BREAK_DELEGATE_NATIVE_OUTPUT: directory,
+          BREAK_DELEGATE_SIGN_IDENTITY: '-',
+          BREAK_DELEGATE_REUSE_STAPLED: '0',
+        },
+      },
+    )
+    assert.ifError(build.error)
+    assert.equal(build.status, 0, build.stderr)
+    const packaged = join(
+      directory,
+      'BreakDelegate.app/Contents/MacOS/BreakDelegate',
+    )
     const install = join(directory, 'node_modules/@anthropic-ai/claude-code')
     mkdirSync(install, { recursive: true })
     const cli = join(install, 'cli.js')
     writeFileSync(cli, 'process.on("message",()=>{});process.send("ready")')
-    const launch = (arg) => {
-      const child = spawn(process.execPath, [cli, arg], {
+    const launch = (args, argv0) => {
+      const child = spawn(process.execPath, args, {
+        argv0,
         stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
       })
       t.after(() => child.kill())
       return child
     }
-    const interactive = launch('Explain how --print works')
-    const headless = launch('--print')
-    await Promise.all([once(interactive, 'message'), once(headless, 'message')])
+    const interactive = launch([cli, 'Explain how --print works'])
+    const headless = launch(['--no-warnings', '--', cli, '--print'])
+    const preload = join(directory, 'preload.cjs')
+    writeFileSync(preload, '')
+    const renamed = launch(
+      ['--require', preload, '--no-warnings', cli],
+      'claude-work',
+    )
+    const processes = [interactive, headless, renamed]
+    await Promise.all(processes.map((child) => once(child, 'message')))
 
     // Act
     const classify = (pid) =>
-      spawnSync(
-        nativeHelperExecutable,
-        ['--classify-claude-process', String(pid)],
-        { encoding: 'utf8' },
-      )
+      spawnSync(packaged, ['--classify-claude-process', String(pid)], {
+        encoding: 'utf8',
+        timeout: 2000,
+        killSignal: 'SIGKILL',
+      })
     const actual = [
-      classify(interactive.pid),
-      classify(headless.pid),
+      ...processes.map((child) => classify(child.pid)),
       classify(-1),
     ]
 
     // Assert
+    for (const result of actual) assert.ifError(result.error)
     assert.deepEqual(
       actual.map((r) => [r.status, r.stdout, r.stderr]),
       [
         [0, 'interactive\n', ''],
         [0, 'headless\n', ''],
+        [0, 'interactive\n', ''],
         [0, 'unknown\n', ''],
       ],
     )
@@ -187,6 +217,77 @@ function gateway(t, { onChoice, beforeLaunch, ...options } = {}) {
   t.after(() => ui.close())
   return { children, commands, actions, events, ui, profileKeys }
 }
+
+test(
+  'a failed first summary launch retries its banner and acknowledged reconnects are silent',
+  { timeout: 5000 },
+  async (t) => {
+    // Arrange
+    const { ui, children, events } = gateway(t, {
+      retryMs: 10,
+      beforeLaunch(attempt) {
+        if (attempt === 1) throw new Error('Temporary launch failure.')
+      },
+    })
+    const presented = once(events, 'command')
+
+    // Act
+    const first = await ui.summary('returned', { answered: [], held: [] })
+    const [banner] = await presented
+    await Promise.all([once(events, 'command'), ui.status()])
+    const restored = once(events, 'command')
+    children[0].kill('SIGKILL')
+    const [menu] = await restored
+
+    // Assert
+    assert.equal(first.status, 'unavailable')
+    assert.deepEqual(
+      [banner.kind, banner.id, banner.silent],
+      ['summary', 'returned', undefined],
+    )
+    assert.deepEqual(
+      [menu.kind, menu.id, menu.silent],
+      ['summary', 'returned', true],
+    )
+  },
+)
+
+test(
+  'a lost initial summary acknowledgment retries the same break until an actual result arrives',
+  { timeout: 5000 },
+  async (t) => {
+    // Arrange
+    const { ui, children, events } = gateway(t, { retryMs: 10 })
+    const received = once(events, 'command')
+    const pending = ui.summary('no-response', { answered: [], held: [] })
+    const [original] = await received
+    const resent = once(events, 'command')
+
+    // Act
+    children[0].kill('SIGKILL')
+    const [retry] = await resent
+    children[1].send({
+      frames: [
+        { type: 'result', request: retry.request, status: 'authorized' },
+      ],
+    })
+    await Promise.all([once(events, 'command'), ui.status()])
+    const restored = once(events, 'command')
+    children[1].kill('SIGKILL')
+    const [silent] = await restored
+
+    // Assert
+    assert.equal((await pending).status, 'unavailable')
+    assert.deepEqual(
+      [original.id, retry.id, silent.id],
+      ['no-response', 'no-response', 'no-response'],
+    )
+    assert.deepEqual(
+      [original.silent, retry.silent, silent.silent],
+      [undefined, undefined, true],
+    )
+  },
+)
 
 test(
   'an outstanding invitation reconnects after a failed relaunch without another Gateway request',
@@ -417,7 +518,7 @@ test(
   },
 )
 
-test('the hook recognizes a prerelease Claude terminal after native mode and TTY checks', (t) => {
+test('the hook identifies Claude through the native executable identity independent of its command label', (t) => {
   // Arrange
   let mode = 'interactive'
   let tty = 'ttys001'
@@ -428,11 +529,8 @@ test('the hook recognizes a prerelease Claude terminal after native mode and TTY
     (path, args, options) => {
       if (path === '/bin/ps') {
         assert.deepEqual(options.env, { TZ: 'UTC0', LC_ALL: 'C' })
-        return (
-          '1 ' +
-          tty +
-          ' Fri Nov 20 14:12:00 2026 /Users/example/.local/share/claude/versions/2.1.328-beta.1'
-        )
+        assert.equal(args.includes('comm='), false)
+        return '1 ' + tty + ' Fri Nov 20 14:12:00 2026'
       }
       assert.equal(path, nativeHelperExecutable)
       checks.push(args)
@@ -685,15 +783,19 @@ test(
         '-o',
         check,
       ],
-      { cwd: repo, encoding: 'utf8' },
+      { cwd: repo, encoding: 'utf8', timeout: 45_000, killSignal: 'SIGKILL' },
     )
+    assert.ifError(build.error)
     assert.equal(build.status, 0, build.stderr)
     const result = spawnSync(check, [], {
       encoding: 'utf8',
+      timeout: 8_000,
+      killSignal: 'SIGKILL',
       env: { ...process.env, CFFIXED_USER_HOME: directory },
     })
 
     // Assert
+    assert.ifError(result.error)
     assert.equal(result.status, 0, result.stderr)
     assert.match(
       result.stdout,
@@ -722,10 +824,11 @@ test(
     const result = spawnSync(
       '/usr/bin/sandbox-exec',
       ['-p', noDesktop, executable, '--bridge', 'a'.repeat(64)],
-      { encoding: 'utf8', timeout: 5000 },
+      { encoding: 'utf8', timeout: 5000, killSignal: 'SIGKILL' },
     )
 
     // Assert
+    assert.ifError(result.error)
     assert.equal(result.status, 69, result.stderr)
     assert.deepEqual(JSON.parse(result.stdout), {
       type: 'offline',

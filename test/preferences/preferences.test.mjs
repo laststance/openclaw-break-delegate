@@ -518,7 +518,16 @@ test('linked worktrees and HTTPS/SSH clones of the same origin share evidence wh
   assert.equal(local, linkedLocal)
   assert.equal(clone, worktree)
   assert.notEqual(clone, independent)
-  assert.equal(canonicalRepository(root), null)
+  const isolated = join(root, 'empty-parent', 'non-repository')
+  mkdirSync(isolated, { recursive: true })
+  const oldCeiling = process.env.GIT_CEILING_DIRECTORIES
+  try {
+    process.env.GIT_CEILING_DIRECTORIES = dirname(isolated)
+    assert.equal(canonicalRepository(isolated), null)
+  } finally {
+    if (oldCeiling === undefined) delete process.env.GIT_CEILING_DIRECTORIES
+    else process.env.GIT_CEILING_DIRECTORIES = oldCeiling
+  }
 })
 
 test('Claude and gstack copies count once, an opaque human result can be completed by gstack, and automated or unknown results stay excluded', async (t) => {

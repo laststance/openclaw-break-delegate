@@ -1,6 +1,6 @@
 # Break Delegate for OpenClaw
 
-Break Delegate offers a macOS break when supervising coding agents has taken sustained attention. Choose **Take a 15-minute break** and OpenClaw can answer familiar work-planning questions in the Claude Code terminals already open. When you return, review which answers it sent and which questions still need you.
+Break Delegate offers a macOS break when supervising coding agents has taken sustained attention. Choose **Take a 15-minute break and delegate** and OpenClaw can answer familiar work-planning questions in the Claude Code terminals already open. When you return, review which answers it sent and which questions still need you.
 
 ## Install the release candidate
 
@@ -25,7 +25,9 @@ openclaw break-delegate status
 
 `setup` registers the hook executable from this installation. Run it again after moving or updating the package. Use `setup --settings /absolute/path/to/settings.json` for a custom Claude settings file. Installing against that file hands its Break Delegate hooks to the selected profile. Removal affects hooks owned by that profile.
 
-On macOS, the packaged helper can atomically exchange an existing settings file and preserve the exact previous file. If setup detects a competing edit, it reports the conflict and keeps recovery copies in the private `settings.json.break-delegate-backups/` directory beside the settings file. Start an interactive Claude session to establish an identifiable terminal instance. Notification permission can also be granted from the Break Delegate menu.
+When updating an existing settings file, setup moves the original into a private recovery directory and installs its update only while the settings path is free. A concurrent editor save keeps that path. If setup reports a conflict, its message identifies the preserved revision in `settings.json.break-delegate-backups/` beside the settings file. If setup is interrupted while the settings path is empty, rerun the same command to recover the previous file before continuing.
+
+Start an interactive Claude session to establish an identifiable terminal instance. Notification permission can also be granted from the Break Delegate menu.
 
 ## Take a break
 

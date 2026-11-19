@@ -371,7 +371,7 @@ export class LocalActivityProbe {
           at,
           status: 'unavailable',
           detail:
-            'Local read unavailable. This observer cannot confirm activity.',
+            'Local read unavailable. Earlier confirmed activity expires at its original observation deadline.',
         })
         continue
       }

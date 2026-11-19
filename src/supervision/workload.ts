@@ -323,6 +323,18 @@ export class Workload {
       this.#account(session, now)
       if (at < (session.samples.get(source)?.at ?? -Infinity)) return
       if (source === 'hook' && at < session.lastHook) return
+      // The clocks cannot order two starts of different incarnations in the same millisecond.
+      if (
+        source === 'hook' &&
+        event.newSession &&
+        event.at !== undefined &&
+        at === session.lastHook &&
+        !session.closed &&
+        session.incarnation &&
+        event.incarnation &&
+        event.incarnation !== session.incarnation
+      )
+        return
       // A late event from a former terminal cannot supersede the current incarnation.
       if (
         event.incarnation &&

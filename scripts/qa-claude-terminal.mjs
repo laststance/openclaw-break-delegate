@@ -101,59 +101,6 @@ let onAction,
   breakId,
   scored = false
 const pass = async () => ({ status: 'authorized' })
-const stop = await startService({
-  directory,
-  roots: {},
-  tickMs: 150,
-  log: (message) => console.error(message),
-  nativeFactory(handler) {
-    onAction = handler
-    return {
-      status: pass,
-      authorize: pass,
-      clear: pass,
-      summary: pass,
-      close() {},
-      invite: async (id) => {
-        setImmediate(() => {
-          void onAction({ kind: 'start', id })
-        })
-        return pass()
-      },
-      active: async (id) => {
-        breakId = id
-        return pass()
-      },
-    }
-  },
-  poll: async (coordinator) => {
-    const session = coordinator
-      .status()
-      .sessions.find(
-        (row) =>
-          row.sessionId === sessionId &&
-          row.canDelegate &&
-          row.status === 'running',
-      )
-    if (!session || scored) return
-    scored = true
-    evidence.capturedTerminal = true
-    evidence.gatewayGeneration = session.generation
-    // Exercise a real hook-discovered terminal with a synthetic load high enough to invite a break.
-    for (let i = 0; i < 12; i++)
-      coordinator.humanReply({
-        provider: 'claude',
-        sessionId,
-        responseId: 'synthetic-work-' + i,
-      })
-  },
-  judge: async (cards) => {
-    assert.equal(cards[0].candidate, selected)
-    evidence.judged = true
-    return true
-  },
-})
-
 function reply(response, body, block) {
   const reason = block.type === 'tool_use' ? 'tool_use' : 'end_turn'
   const message = {
@@ -281,24 +228,79 @@ const server = createServer(async (req, res) => {
 server.on('connect', (_req, socket) =>
   socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n'),
 )
-server.listen(0, '127.0.0.1')
-await once(server, 'listening')
-const address = 'http://127.0.0.1:' + server.address().port
-const driver = fileURLToPath(new URL('./qa-claude-pty.py', import.meta.url))
-const terminal = spawn(
-  '/usr/bin/python3',
-  [driver, run, claude, sessionId, address, fakeKey],
-  { stdio: ['ignore', 'ignore', 'inherit'] },
-)
-// Observe startup errors immediately. ChildProcess emits close even when its executable cannot launch.
-let launchError
-terminal.once('error', (error) => {
-  launchError = error
+let terminal,
+  terminalEnded,
+  launchError,
+  acceptanceFailed = false
+const stop = await startService({
+  directory,
+  roots: {},
+  tickMs: 150,
+  log: (message) => console.error(message),
+  nativeFactory(handler) {
+    onAction = handler
+    return {
+      status: pass,
+      authorize: pass,
+      clear: pass,
+      summary: pass,
+      close() {},
+      invite: async (id) => {
+        setImmediate(() => {
+          void onAction({ kind: 'start', id })
+        })
+        return pass()
+      },
+      active: async (id) => {
+        breakId = id
+        return pass()
+      },
+    }
+  },
+  poll: async (coordinator) => {
+    const session = coordinator
+      .status()
+      .sessions.find(
+        (row) =>
+          row.sessionId === sessionId &&
+          row.canDelegate &&
+          row.status === 'running',
+      )
+    if (!session || scored) return
+    scored = true
+    evidence.capturedTerminal = true
+    evidence.gatewayGeneration = session.generation
+    // Exercise a real hook-discovered terminal with a synthetic load high enough to invite a break.
+    for (let i = 0; i < 12; i++)
+      coordinator.humanReply({
+        provider: 'claude',
+        sessionId,
+        responseId: 'synthetic-work-' + i,
+      })
+  },
+  judge: async (cards) => {
+    assert.equal(cards[0].candidate, selected)
+    evidence.judged = true
+    return true
+  },
 })
-const terminalEnded = new Promise((done) =>
-  terminal.once('close', (...result) => done(result)),
-)
 try {
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  const address = 'http://127.0.0.1:' + server.address().port
+  const driver = fileURLToPath(new URL('./qa-claude-pty.py', import.meta.url))
+  terminal = spawn(
+    '/usr/bin/python3',
+    [driver, run, claude, sessionId, address, fakeKey],
+    { stdio: ['ignore', 'ignore', 'inherit'] },
+  )
+  // Observe startup errors immediately. ChildProcess emits close even when its executable cannot launch.
+  terminal.once('error', (error) => {
+    launchError = error
+  })
+  terminalEnded = new Promise((done) =>
+    terminal.once('close', (...result) => done(result)),
+  )
   await once(terminal, 'spawn')
   const transcriptFolder = join(config, 'projects')
   const until = Date.now() + 55_000
@@ -378,15 +380,27 @@ try {
     ),
   )
   console.log('Real Claude session completed with the delegated answer.')
+} catch (error) {
+  acceptanceFailed = true
+  throw error
 } finally {
-  try {
-    await writeFile(
+  const cleanupErrors = []
+  const clean = async (action) => {
+    try {
+      await action()
+    } catch (error) {
+      cleanupErrors.push(error)
+    }
+  }
+  await clean(() =>
+    writeFile(
       join(run, 'evidence.json'),
       JSON.stringify(evidence, null, 2) + '\n',
       { mode: 0o600 },
-    )
-  } finally {
-    try {
+    ),
+  )
+  if (terminal)
+    await clean(async () => {
       await writeFile(join(run, 'stop'), '').catch(() =>
         terminal.kill('SIGTERM'),
       )
@@ -403,14 +417,21 @@ try {
       }
       if (!launchError)
         assert.equal(exited?.[0], 0, 'The isolated PTY did not exit cleanly.')
-    } finally {
-      try {
-        const closed = new Promise((done) => server.close(done))
-        server.closeAllConnections()
-        await closed
-      } finally {
-        await stop()
-      }
-    }
+    })
+  if (server.listening)
+    await clean(async () => {
+      const closed = new Promise((done, reject) =>
+        server.close((err) => (err ? reject(err) : done())),
+      )
+      server.closeAllConnections()
+      await closed
+    })
+  await clean(stop)
+  if (cleanupErrors.length) {
+    // A second cleanup error must not erase the original failed acceptance assertion.
+    if (acceptanceFailed)
+      for (const error of cleanupErrors)
+        console.error('Acceptance cleanup:', error.message ?? error)
+    else throw new AggregateError(cleanupErrors, 'Acceptance cleanup failed.')
   }
 }

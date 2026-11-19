@@ -53,11 +53,7 @@ export function readReviewPage(
   const breakId =
     cursor?.breakId ??
     query.breakId ??
-    db
-      .prepare(
-        'SELECT id FROM sv_breaks ORDER BY startedAt DESC,rowid DESC LIMIT 1',
-      )
-      .get()?.id
+    db.prepare('SELECT id FROM sv_breaks ORDER BY rowid DESC LIMIT 1').get()?.id
   if (typeof breakId !== 'string')
     return { breakId: null, rows: [], nextCursor: null }
   const upper =

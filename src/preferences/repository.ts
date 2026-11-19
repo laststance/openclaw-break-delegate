@@ -13,6 +13,7 @@ export function digest(value: string): string {
 function remoteIdentity(value: string): string | null {
   let remote: URL
   let relativeSsh = false
+  let scpPath: string | undefined
   try {
     const scp =
       !value.includes('://') &&
@@ -21,13 +22,8 @@ function remoteIdentity(value: string): string | null {
       const path = scp[3]!
       if (path.startsWith('~')) return null
       relativeSsh = !path.startsWith('/')
-      remote = new URL(
-        'ssh://' +
-          (scp[1] ? scp[1] + '@' : '') +
-          scp[2] +
-          (relativeSsh ? '/' : '') +
-          path,
-      )
+      scpPath = path
+      remote = new URL('ssh://' + (scp[1] ? scp[1] + '@' : '') + scp[2])
     } else remote = new URL(value)
   } catch {
     return null
@@ -40,9 +36,17 @@ function remoteIdentity(value: string): string | null {
   )
     return null
   const host = remote.hostname.toLowerCase()
-  if (remote.protocol === 'ssh:' && remote.pathname.startsWith('/~'))
-    return null
-  const literalPath = remote.pathname.replace(/^\/+|\/+$/gu, '')
+  // SCP passes a literal server path. Only URI syntax interprets percent escapes.
+  let serverPath = scpPath ?? remote.pathname
+  if (remote.protocol === 'ssh:' && scpPath === undefined) {
+    try {
+      serverPath = decodeURIComponent(serverPath)
+    } catch {
+      return null
+    }
+  }
+  if (remote.protocol === 'ssh:' && serverPath.startsWith('/~')) return null
+  const literalPath = serverPath.replace(/^\/+|\/+$/gu, '')
   const path =
     host === 'github.com' ? literalPath.replace(/\.git$/iu, '') : literalPath
   if (!path || !path.includes('/')) return null
@@ -53,7 +57,8 @@ function remoteIdentity(value: string): string | null {
       'remote:' +
       digest(
         JSON.stringify([
-          'ssh-literal-path',
+          // Old URI normalization collapsed paths with spaces and literal escapes; neither may inherit that ambiguous key.
+          /[%\s]/u.test(path) ? 'ssh-verbatim-path' : 'ssh-literal-path',
           remote.host.toLowerCase(),
           remote.username,
           relativeSsh ? 'home' : 'absolute',
