@@ -69,6 +69,10 @@ openclaw plugins disable break-delegate
 
 `pnpm validate` builds and checks the plugin. On macOS, `pnpm run pack:release` builds and verifies the native helper, runs the tests, and writes the npm-compatible archive under `release/`. `pnpm run smoke:install` installs that archive into a disposable OpenClaw profile and exercises its command surface. The native build accepts `BREAK_DELEGATE_SIGN_IDENTITY` for a Developer ID Application identity. The default local build uses an ad-hoc signature.
 
+The release uses OpenClaw’s regular package installer. It keeps the signed Mac application and the Claude hook executable at stable paths inside the installed package.
+
+To verify the original Claude session on a Mac with Claude Code installed, run `node scripts/qa-claude-terminal.mjs "$(mktemp -d)" "$(command -v claude)"` after building. The interactive CLI talks to an isolated loopback model. The runner supplies synthetic human history and native consent, and verifies the model’s next request, the terminal’s completion message, and the Gateway’s delivery record.
+
 Preview the ClawHub release from the repository root with this read-only publication command. A maintainer can use the same archive for the eventual release.
 
 ```sh

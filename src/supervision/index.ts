@@ -1,4 +1,4 @@
-export { Supervision } from "./coordinator.js";
+export { Supervision } from './coordinator.js'
 export type {
   Coverage,
   Gate,
@@ -8,12 +8,12 @@ export type {
   QuestionInput,
   ReviewReceipt,
   SupervisionOptions,
-} from "./coordinator.js";
-export { LocalActivityProbe } from "./activity.js";
-export type { LocalActivityOptions } from "./activity.js";
+} from './coordinator.js'
+export { LocalActivityProbe } from './activity.js'
+export type { LocalActivityOptions } from './activity.js'
 export type {
   Activity,
   Observation,
   Provider,
   SessionView,
-} from "./workload.js";
+} from './workload.js'

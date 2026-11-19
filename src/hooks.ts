@@ -3,7 +3,10 @@ import { homedir } from 'node:os'
 import { join, relative, isAbsolute } from 'node:path'
 import { isObject, requestGateway, type ObjectValue } from './ipc.js'
 import { claudeTerminal } from './terminal.js'
-import { normalizeQuestionCard, type QuestionCard } from './preferences/index.js'
+import {
+  normalizeQuestionCard,
+  type QuestionCard,
+} from './preferences/index.js'
 
 const limit = 128 * 1024
 /** Preserve supported display content for policy and model review. Reject the whole prompt if a card cannot be interpreted.
@@ -67,7 +70,12 @@ function previousQuestion(
   for (const row of [...rows].reverse()) {
     if (row.sessionId !== sessionId || !isObject(row.message)) continue
     // Some Claude builds persist this submission before running UserPromptSubmit.
-    if (row.type === 'user' && typeof submittedId === 'string' && (row.uuid === submittedId || row.promptId === submittedId)) continue
+    if (
+      row.type === 'user' &&
+      typeof submittedId === 'string' &&
+      (row.uuid === submittedId || row.promptId === submittedId)
+    )
+      continue
     if (row.type === 'user') return
     if (row.type !== 'assistant' || !Array.isArray(row.message.content))
       continue
@@ -152,9 +160,18 @@ export async function runHook(
       const cards = decodeCards(body.tool_input.questions)
       // Unsupported cards must still pause the workload clock and appear in the local return review.
       const fallback = Array.isArray(body.tool_input.questions)
-        ? body.tool_input.questions.slice(0, 8).filter(isObject).map(c => typeof c.question === 'string' ? c.question.slice(0, 1000) : '').filter(Boolean).join('\n')
+        ? body.tool_input.questions
+            .slice(0, 8)
+            .filter(isObject)
+            .map((c) =>
+              typeof c.question === 'string' ? c.question.slice(0, 1000) : '',
+            )
+            .filter(Boolean)
+            .join('\n')
         : ''
-      const surface = cards ? { cards } : { unsupported: true, question: fallback || 'Claude Code question' }
+      const surface = cards
+        ? { cards }
+        : { unsupported: true, question: fallback || 'Claude Code question' }
       if (body.hook_event_name === 'PostToolUse') {
         const result = isObject(body.tool_response) ? body.tool_response : {}
         const rows = await recentTranscript(body.transcript_path)
@@ -178,7 +195,10 @@ export async function runHook(
           questionId,
           ...surface,
           answers: cards ? result.answers : undefined,
-          selected: !cards && isObject(result.answers) && Object.keys(result.answers).length > 0,
+          selected:
+            !cards &&
+            isObject(result.answers) &&
+            Object.keys(result.answers).length > 0,
           human: witnessed,
         })
         return
@@ -188,7 +208,12 @@ export async function runHook(
         { ...common, questionId, ...surface },
         12000,
       )
-      if (!cards || !isObject(v) || !isObject(v.answers) || typeof v.receipt !== 'string')
+      if (
+        !cards ||
+        !isObject(v) ||
+        !isObject(v.answers) ||
+        typeof v.receipt !== 'string'
+      )
         return
       const answers = v.answers
       if (

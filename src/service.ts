@@ -14,7 +14,11 @@ import {
   typedResponseId,
   type HistoryRoots,
 } from './preferences/index.js'
-import { LocalActivityProbe, Supervision, type SupervisionOptions } from './supervision/index.js'
+import {
+  LocalActivityProbe,
+  Supervision,
+  type SupervisionOptions,
+} from './supervision/index.js'
 import { createNativeBreakUi } from './native/index.js'
 import type { Judge, JudgeCard } from './model.js'
 
@@ -24,7 +28,13 @@ interface ServiceOptions {
   directory: string
   judge: Judge
   log: (message: string) => void
-  workload?: Pick<SupervisionOptions, 'threshold' | 'activePointsPerMinute' | 'additionalPointsPerMinute' | 'humanReplyPoints'>
+  workload?: Pick<
+    SupervisionOptions,
+    | 'threshold'
+    | 'activePointsPerMinute'
+    | 'additionalPointsPerMinute'
+    | 'humanReplyPoints'
+  >
   roots?: HistoryRoots
   nativeFactory?: UiFactory
   poll?: (coordinator: Supervision) => Promise<void>
@@ -297,7 +307,11 @@ export async function startService(
       sessionId,
       questionId,
       incarnation,
-      question: cards?.map((c) => c.question).join('\n') ?? (typeof r.question === 'string' ? r.question.slice(0, 8000) : 'Claude Code question'),
+      question:
+        cards?.map((c) => c.question).join('\n') ??
+        (typeof r.question === 'string'
+          ? r.question.slice(0, 8000)
+          : 'Claude Code question'),
       openedAt: typeof r.at === 'number' ? Math.min(r.at, now()) : now(),
       kind: 'choice',
     })
@@ -325,7 +339,7 @@ export async function startService(
         }
         payload.push({
           question: card.question,
-          ...(card.header ? {header: card.header} : {}),
+          ...(card.header ? { header: card.header } : {}),
           options: card.options,
           candidate: decision.eligibleLabel,
           summary: decision.summary,

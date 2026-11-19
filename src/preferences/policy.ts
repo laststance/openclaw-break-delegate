@@ -175,7 +175,7 @@ const decisionTypes: readonly DecisionType[] = [
 const operation =
   /\b(?:approv\w*|allow\w*|authori[sz]\w*|permission|consent|confirm\w*|go ahead|go-ahead|may i|can i|could i|is it (?:ok|okay)|deploy\w*|production|prod|publish\w*|push\w*|merge\w*|release\w*|delet\w*|remov\w*|destroy\w*|drop|wipe|reset|overwrite|secret\w*|credential\w*|password\w*|token|payment|purchase|charge|billing|send|email|upload|execute|sudo|install|ssh|curl|ignore|bypass|skip|never|not|except|unless)\b|承認|許可|同意|よろしい|いいですか|してよい|してもよい|してもいい|本番|デプロイ|リリース|公開|プッシュ|マージ|削除|消去|上書き|認証|秘密|課金|送信|アップロード|しない|せず|禁止|無視|[\x00-\x08\x0b-\x1f\x7f]/iu
 const restriction =
-  /\b(?:only|always|never|must|shall|no|not|don't|don't|do not|avoid|exclude|except|unless|instead|restrict\w*|limit\w*|wait|hold|pause|stop|until|before|without|forbid\w*|read[- ]only|out of scope|prefer|require\w*|audit|inspect|research only)\b|だけ|のみ|限[る定り]|しない|禁止|するな|する前|以外|必ず|絶対|控え|待[つっ]|止め|やめ|不要|優先|見送|せず|まだ|まで|読み取[りる]|調査だけ/iu
+  /\b(?:only|always|never|must|shall|no|not|don['’]t|do not|avoid|exclude|except|unless|instead|restrict\w*|limit\w*|wait|hold|pause|stop|until|before|without|forbid\w*|read[- ]only|out of scope|prefer|require\w*|audit|inspect|research only)\b|だけ|のみ|限[る定り]|しない|禁止|するな|する前|以外|必ず|絶対|控え|待[つっ]|止め|やめ|不要|優先|見送|せず|まだ|まで|読み取[りる]|調査だけ/iu
 const annotation = /\s*[（(](?:recommended|推奨|おすすめ)[）)]\s*$/iu
 
 /** Strip display-only recommendations and list bullets before comparing the person's exact selection.
@@ -319,7 +319,7 @@ export type PolicyResult =
   | { reason: 'operational-or-mixed' | 'unrecognized-question' }
 
 /** Identify a preference only when the entire question and every available option express one known decision.
- * {@link PreferenceStore} uses the same rule during historical replay and delivery.
+ * The gateway applies the same rule during historical replay and delivery.
  * @example classifyCard({question:'Which tests should we run?', options:[{label:'Focused tests'}, {label:'Full suite'}]})
  */
 export function classifyCard(raw: QuestionCard): PolicyResult {

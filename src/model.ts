@@ -1,7 +1,10 @@
 import type { OpenClawPluginApi } from 'openclaw/plugin-sdk/plugin-entry'
 import type { PreferenceSummary, QuestionCard } from './preferences/index.js'
 
-export interface JudgeCard extends Pick<QuestionCard, 'question' | 'header' | 'options'> {
+export interface JudgeCard extends Pick<
+  QuestionCard,
+  'question' | 'header' | 'options'
+> {
   candidate: string
   summary: PreferenceSummary
 }

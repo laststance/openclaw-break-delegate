@@ -464,9 +464,25 @@ function codexRow(
   const payload = record(row.payload)
   if (row.type === 'session_meta') {
     state.session = str(payload.id)
-    state.interactive = ['cli', 'vscode', 'desktop', 'codex_desktop'].includes(
-      str(payload.source),
-    )
+    const threadSource = payload.thread_source ?? payload.threadSource
+    const originator = str(payload.originator).toLowerCase()
+    // Both the desktop app and newer interactive terminals can report "vscode". Automations and custom app-server clients cannot attest to a human selection.
+    state.interactive =
+      ['cli', 'vscode', 'desktop', 'codex_desktop'].includes(
+        str(payload.source),
+      ) &&
+      (threadSource == null || threadSource === 'user') &&
+      (!originator ||
+        [
+          'codex-tui',
+          'codex desktop',
+          'codex-desktop',
+          'codex_vscode',
+          'codex-vscode',
+          'codex_cli_rs',
+          'codex-cli',
+          'codex cli',
+        ].includes(originator))
     delete state.brief
     setCwd(
       state,

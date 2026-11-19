@@ -6,8 +6,13 @@ import { dataDirectory, isObject } from './ipc.js'
 import { createJudge } from './model.js'
 import { startService } from './service.js'
 
-const workloadFields = ['threshold', 'activePointsPerMinute', 'additionalPointsPerMinute', 'humanReplyPoints'] as const
-const scoreWeight = Type.Optional(Type.Number({minimum: 0, maximum: 1000}))
+const workloadFields = [
+  'threshold',
+  'activePointsPerMinute',
+  'additionalPointsPerMinute',
+  'humanReplyPoints',
+] as const
+const scoreWeight = Type.Optional(Type.Number({ minimum: 0, maximum: 1000 }))
 const localRoot = Type.Optional(Type.String({ pattern: '^/' }))
 // The host packer reads the SDK authoring metadata even for service-only plugins.
 const entry = defineToolPlugin({
@@ -24,12 +29,22 @@ const entry = defineToolPlugin({
           description: 'Configured agent for tool-free confirmation.',
         }),
       ),
-      workload: Type.Optional(Type.Object({
-        threshold: Type.Optional(Type.Number({exclusiveMinimum: 0, maximum: 10000})),
-        activePointsPerMinute: scoreWeight,
-        additionalPointsPerMinute: scoreWeight,
-        humanReplyPoints: scoreWeight,
-      }, {additionalProperties: false, description: 'Break invitation score and weights.'})),
+      workload: Type.Optional(
+        Type.Object(
+          {
+            threshold: Type.Optional(
+              Type.Number({ exclusiveMinimum: 0, maximum: 10000 }),
+            ),
+            activePointsPerMinute: scoreWeight,
+            additionalPointsPerMinute: scoreWeight,
+            humanReplyPoints: scoreWeight,
+          },
+          {
+            additionalProperties: false,
+            description: 'Break invitation score and weights.',
+          },
+        ),
+      ),
       historyRoots: Type.Optional(
         Type.Object(
           { claude: localRoot, codex: localRoot, gstack: localRoot },
@@ -68,10 +83,18 @@ entry.register = (api) => {
           )
         : undefined
       const rawWorkload = api.pluginConfig?.workload
-      const workload = isObject(rawWorkload) ? Object.fromEntries(workloadFields.flatMap(field => {
-        const value = rawWorkload[field]
-        return typeof value === 'number' && Number.isFinite(value) && (field === 'threshold' ? value > 0 : value >= 0) ? [[field, value]] : []
-      })) : undefined
+      const workload = isObject(rawWorkload)
+        ? Object.fromEntries(
+            workloadFields.flatMap((field) => {
+              const value = rawWorkload[field]
+              return typeof value === 'number' &&
+                Number.isFinite(value) &&
+                (field === 'threshold' ? value > 0 : value >= 0)
+                ? [[field, value]]
+                : []
+            }),
+          )
+        : undefined
       stop = await startService({
         workload,
         directory: dataDirectory(ctx.stateDir),

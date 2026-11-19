@@ -49,7 +49,11 @@ test('an accepted break answers the original Claude card once and keeps its repl
     })
   }
   const replay = training.replay()
-  assert.equal(replay.types.some(row => row.eligible), true, JSON.stringify(replay))
+  assert.equal(
+    replay.types.some((row) => row.eligible),
+    true,
+    JSON.stringify(replay),
+  )
   db.close()
   let onAction, invite, active
   let seeded = false
@@ -135,10 +139,23 @@ test('an accepted break answers the original Claude card once and keeps its repl
     async (value) => sent.push(JSON.parse(value)),
     'instance-A',
   )
-  const unsupported = {...card, options: [
-    {...card.options[0], preview: 'A second, unverified change'}, card.options[1]
-  ]}
-  await runHook(directory, {...hook, tool_use_id: 'preview-card', tool_input: {questions: [unsupported]}}, async value => sent.push(JSON.parse(value)), 'instance-A')
+  const unsupported = {
+    ...card,
+    options: [
+      { ...card.options[0], preview: 'A second, unverified change' },
+      card.options[1],
+    ],
+  }
+  await runHook(
+    directory,
+    {
+      ...hook,
+      tool_use_id: 'preview-card',
+      tool_input: { questions: [unsupported] },
+    },
+    async (value) => sent.push(JSON.parse(value)),
+    'instance-A',
+  )
   const review = await requestGateway(directory, {
     op: 'review',
     breakId: active,
@@ -155,7 +172,10 @@ test('an accepted break answers the original Claude card once and keeps its repl
     review.find((row) => row.questionId === 'live-card')?.outcome,
     'sent',
   )
-  assert.equal(review.find(row => row.questionId === 'preview-card')?.outcome, 'held')
+  assert.equal(
+    review.find((row) => row.questionId === 'preview-card')?.outcome,
+    'held',
+  )
   assert.equal(state.supervision.activeBreakId, null)
   const verify = new DatabaseSync(join(directory, 'state.sqlite'))
   assert.equal(

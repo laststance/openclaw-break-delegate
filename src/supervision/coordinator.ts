@@ -1,82 +1,82 @@
-import { createHash, randomUUID } from "node:crypto";
-import type { DatabaseSync } from "node:sqlite";
+import { createHash, randomUUID } from 'node:crypto'
+import type { DatabaseSync } from 'node:sqlite'
 import {
   Workload,
   minute,
   type Observation,
   type Provider,
-} from "./workload.js";
+} from './workload.js'
 
 export interface SupervisionOptions {
-  now?: () => number;
-  threshold?: number;
-  activePointsPerMinute?: number;
-  additionalPointsPerMinute?: number;
-  humanReplyPoints?: number;
-  breakMs?: number;
-  snoozeMs?: number;
-  invitationMs?: number;
+  now?: () => number
+  threshold?: number
+  activePointsPerMinute?: number
+  additionalPointsPerMinute?: number
+  humanReplyPoints?: number
+  breakMs?: number
+  snoozeMs?: number
+  invitationMs?: number
   /** Maximum interval for which an observer can attest to its last live status. */
-  observationTtlMs?: number;
+  observationTtlMs?: number
 }
 
 export interface QuestionInput {
-  sessionId: string;
-  questionId: string;
-  question: string;
-  kind?: "choice" | "approval";
+  sessionId: string
+  questionId: string
+  question: string
+  kind?: 'choice' | 'approval'
   /** When the original hook began, before any IPC or model latency. */
-  openedAt?: number;
-  incarnation?: string;
+  openedAt?: number
+  incarnation?: string
 }
 export interface Gate {
-  eligible: boolean;
-  breakId?: string;
-  reason?: string;
+  eligible: boolean
+  breakId?: string
+  reason?: string
 }
-export type NativeAction = "accept" | "snooze" | "dismiss" | "return";
+export type NativeAction = 'accept' | 'snooze' | 'dismiss' | 'return'
 export interface NativeEffect {
-  kind: "invitation" | "break" | "digest";
-  id: string;
+  kind: 'invitation' | 'break' | 'digest'
+  id: string
 }
-export type Outcome = "held" | "pending" | "sent" | "ambiguous" | "human";
+export type Outcome = 'held' | 'pending' | 'sent' | 'ambiguous' | 'human'
 export interface ReviewReceipt {
-  sessionId: string;
-  questionId: string;
-  breakId: string;
-  question: string;
-  answer: string | null;
-  outcome: Outcome;
-  reason: string | null;
-  at: number;
+  sessionId: string
+  questionId: string
+  breakId: string
+  question: string
+  answer: string | null
+  outcome: Outcome
+  reason: string | null
+  at: number
 }
 export interface Coverage {
-  source: string;
-  status: "available" | "partial" | "unavailable";
-  detail: string;
-  at: number;
+  source: string
+  status: 'available' | 'partial' | 'unavailable'
+  detail: string
+  at: number
 }
 interface Break {
-  id: string;
-  startedAt: number;
-  expiresAt: number;
+  id: string
+  startedAt: number
+  expiresAt: number
 }
 interface Invitation {
-  id: string;
-  expiresAt: number;
+  id: string
+  expiresAt: number
 }
 interface Control {
-  resetAt: number;
-  armed: number;
-  snoozeAt: number | null;
+  resetAt: number
+  armed: number
+  snoozeAt: number | null
 }
 interface Card {
-  question: string;
-  generation: string;
-  live: number;
-  candidate: string | null;
-  kind: "choice" | "approval";
-  disposition: "open" | "held" | "human" | "pending" | "sent" | "ambiguous";
+  question: string
+  generation: string
+  live: number
+  candidate: string | null
+  kind: 'choice' | 'approval'
+  disposition: 'open' | 'held' | 'human' | 'pending' | 'sent' | 'ambiguous'
 }
 
 const schema = `
@@ -95,6 +95,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS sv_one_invitation ON sv_invitations(state) WHE
 CREATE TABLE IF NOT EXISTS sv_breaks(id TEXT PRIMARY KEY, startedAt INTEGER NOT NULL, expiresAt INTEGER NOT NULL, endedAt INTEGER);
 CREATE UNIQUE INDEX IF NOT EXISTS sv_one_break ON sv_breaks((1)) WHERE endedAt IS NULL;
 CREATE TABLE IF NOT EXISTS sv_members(breakId TEXT NOT NULL, sessionId TEXT NOT NULL, generation TEXT NOT NULL, PRIMARY KEY(breakId,sessionId));
+CREATE TABLE IF NOT EXISTS sv_unidentified_waits(breakId TEXT NOT NULL, sessionId TEXT NOT NULL, generation TEXT NOT NULL, PRIMARY KEY(breakId,sessionId,generation));
 CREATE TABLE IF NOT EXISTS sv_questions(
   sessionId TEXT NOT NULL, questionId TEXT NOT NULL, generation TEXT NOT NULL, question TEXT NOT NULL,
   kind TEXT NOT NULL, live INTEGER NOT NULL, candidate TEXT, disposition TEXT NOT NULL,
@@ -108,7 +109,7 @@ CREATE TABLE IF NOT EXISTS sv_reviews(
 CREATE TABLE IF NOT EXISTS sv_effects(
   seq INTEGER PRIMARY KEY, id TEXT NOT NULL,kind TEXT NOT NULL,claimed INTEGER NOT NULL DEFAULT 0,
   UNIQUE(id,kind)
-);`;
+);`
 
 /**
  * Own confirmed observations, invitations and break consent for one local gateway.
@@ -121,217 +122,240 @@ CREATE TABLE IF NOT EXISTS sv_effects(
  * supervisor.tick()
  */
 export class Supervision {
-  readonly #db: DatabaseSync;
-  readonly #now: () => number;
-  readonly #work: Workload;
-  readonly #threshold: number;
-  readonly #breakMs: number;
-  readonly #snoozeMs: number;
-  readonly #invitationMs: number;
-  readonly #coverage = new Map<string, Coverage>();
-  #lastAt: number;
+  readonly #db: DatabaseSync
+  readonly #now: () => number
+  readonly #work: Workload
+  readonly #threshold: number
+  readonly #breakMs: number
+  readonly #snoozeMs: number
+  readonly #invitationMs: number
+  readonly #coverage = new Map<string, Coverage>()
+  #lastAt: number
 
   constructor(db: DatabaseSync, options: SupervisionOptions = {}) {
-    this.#db = db;
-    this.#now = options.now ?? Date.now;
-    this.#threshold = options.threshold ?? 45;
-    this.#breakMs = options.breakMs ?? 15 * minute;
-    this.#snoozeMs = options.snoozeMs ?? 15 * minute;
-    this.#invitationMs = options.invitationMs ?? 15 * minute;
+    this.#db = db
+    this.#now = options.now ?? Date.now
+    this.#threshold = options.threshold ?? 45
+    this.#breakMs = options.breakMs ?? 15 * minute
+    this.#snoozeMs = options.snoozeMs ?? 15 * minute
+    this.#invitationMs = options.invitationMs ?? 15 * minute
     this.#work = new Workload(db, options.observationTtlMs ?? 90_000, {
       active: options.activePointsPerMinute ?? 1,
       additional: options.additionalPointsPerMinute ?? 0.1,
       reply: options.humanReplyPoints ?? 4,
-    });
-    this.#lastAt = this.#now();
-    db.exec(schema);
+    })
+    this.#lastAt = this.#now()
+    db.exec(schema)
     this.#transaction(() => {
       // A gateway cannot prove that the previous process still owns a waiting hook.
-      db.exec("UPDATE sv_invitations SET state='restart' WHERE state='open'");
+      db.exec("UPDATE sv_invitations SET state='restart' WHERE state='open'")
       db.prepare(
         "UPDATE sv_reviews SET outcome='ambiguous',reason='Gateway restarted before delivery was confirmed',at=? WHERE outcome='pending'",
-      ).run(this.#lastAt);
+      ).run(this.#lastAt)
       db.exec(
         "UPDATE sv_questions SET disposition='ambiguous' WHERE disposition='pending'",
-      );
-      const previous = this.#active();
+      )
+      const previous = this.#active()
       if (previous)
         this.#finish(
           previous,
           Math.min(this.#lastAt, previous.expiresAt),
-          "Gateway restarted",
-        );
-      db.exec("UPDATE sv_questions SET live=0 WHERE live=1");
-    });
+          'Gateway restarted',
+        )
+      db.exec('UPDATE sv_questions SET live=0 WHERE live=1')
+    })
   }
 
   #transaction<T>(apply: () => T): T {
-    this.#db.exec("BEGIN IMMEDIATE");
+    this.#db.exec('BEGIN IMMEDIATE')
     try {
-      const result = apply();
-      this.#db.exec("COMMIT");
-      return result;
+      const result = apply()
+      this.#db.exec('COMMIT')
+      return result
     } catch (error) {
-      this.#db.exec("ROLLBACK");
-      throw error;
+      this.#db.exec('ROLLBACK')
+      throw error
     }
   }
 
   #control(): Control {
     return this.#db
-      .prepare("SELECT resetAt,armed,snoozeAt FROM sv_control")
-      .get() as unknown as Control;
+      .prepare('SELECT resetAt,armed,snoozeAt FROM sv_control')
+      .get() as unknown as Control
   }
   #active(): Break | undefined {
     return this.#db
       .prepare(
-        "SELECT id,startedAt,expiresAt FROM sv_breaks WHERE endedAt IS NULL",
+        'SELECT id,startedAt,expiresAt FROM sv_breaks WHERE endedAt IS NULL',
       )
-      .get() as unknown as Break | undefined;
+      .get() as unknown as Break | undefined
   }
   #invitation(): Invitation | undefined {
     return this.#db
       .prepare("SELECT id,expiresAt FROM sv_invitations WHERE state='open'")
-      .get() as unknown as Invitation | undefined;
+      .get() as unknown as Invitation | undefined
   }
   #card(sessionId: string, questionId: string): Card | undefined {
     return this.#db
       .prepare(
-        "SELECT question,generation,live,candidate,kind,disposition FROM sv_questions WHERE sessionId=? AND questionId=?",
+        'SELECT question,generation,live,candidate,kind,disposition FROM sv_questions WHERE sessionId=? AND questionId=?',
       )
-      .get(sessionId, questionId) as unknown as Card | undefined;
+      .get(sessionId, questionId) as unknown as Card | undefined
   }
-  #effect(kind: NativeEffect["kind"], id: string) {
+  #effect(kind: NativeEffect['kind'], id: string) {
     this.#db
-      .prepare("INSERT OR IGNORE INTO sv_effects(id,kind) VALUES(?,?)")
-      .run(id, kind);
+      .prepare('INSERT OR IGNORE INTO sv_effects(id,kind) VALUES(?,?)')
+      .run(id, kind)
   }
   #member(breakId: string, sessionId: string, generation: string | undefined) {
     return Boolean(
       generation &&
       this.#db
         .prepare(
-          "SELECT 1 FROM sv_members WHERE breakId=? AND sessionId=? AND generation=?",
+          'SELECT 1 FROM sv_members WHERE breakId=? AND sessionId=? AND generation=?',
         )
         .get(breakId, sessionId, generation),
-    );
+    )
   }
 
   #finish(active: Break, end: number, reason: string) {
     this.#db
-      .prepare("UPDATE sv_breaks SET endedAt=? WHERE id=? AND endedAt IS NULL")
-      .run(end, active.id);
+      .prepare('UPDATE sv_breaks SET endedAt=? WHERE id=? AND endedAt IS NULL')
+      .run(end, active.id)
     this.#db
       .prepare(
         "UPDATE sv_questions SET disposition='held' WHERE candidate=? AND disposition='open'",
       )
-      .run(active.id);
+      .run(active.id)
     this.#db
       .prepare(
         "UPDATE sv_reviews SET reason=?,at=? WHERE breakId=? AND outcome='held' AND reason='Awaiting decision'",
       )
-      .run(reason, end, active.id);
+      .run(reason, end, active.id)
     this.#db
-      .prepare("UPDATE sv_control SET resetAt=?,armed=1,snoozeAt=NULL")
-      .run(end);
+      .prepare('UPDATE sv_control SET resetAt=?,armed=1,snoozeAt=NULL')
+      .run(end)
     this.#db
-      .prepare("UPDATE sv_replies SET credited=0 WHERE credited=1 AND at<=?")
-      .run(end);
-    this.#effect("digest", active.id);
+      .prepare('UPDATE sv_replies SET credited=0 WHERE credited=1 AND at<=?')
+      .run(end)
+    this.#effect('digest', active.id)
   }
 
   #advance(now: number) {
     // Clock regression invalidates consent instead of extending its wall-clock lifetime.
     if (now < this.#lastAt) {
-      const old = this.#active();
-      if (old) this.#finish(old, now, "Clock changed");
+      const old = this.#active()
+      if (old) this.#finish(old, now, 'Clock changed')
       this.#db.exec(
         "UPDATE sv_invitations SET state='clock-changed' WHERE state='open'",
-      );
+      )
     }
-    this.#lastAt = now;
-    this.#work.checkpoint(now);
-    const active = this.#active();
+    this.#lastAt = now
+    this.#work.checkpoint(now)
+    const active = this.#active()
     if (active && now >= active.expiresAt)
-      this.#finish(active, active.expiresAt, "Break ended");
+      this.#finish(active, active.expiresAt, 'Break ended')
     this.#db
       .prepare(
         "UPDATE sv_invitations SET state='expired' WHERE state='open' AND expiresAt<=?",
       )
-      .run(now);
+      .run(now)
   }
 
   #supervising(now: number) {
     return this.#work
       .views(now)
-      .some((s) => s.status === "running" || s.status === "waiting");
+      .some((s) => s.status === 'running' || s.status === 'waiting')
   }
 
   #considerInvitation(now: number) {
-    if (this.#active()) return;
-    const control = this.#control();
-    const score = this.#work.score(now, control.resetAt);
+    if (this.#active()) return
+    const control = this.#control()
+    const score = this.#work.score(now, control.resetAt)
     if (score < this.#threshold) {
       this.#db.exec(
         "UPDATE sv_control SET armed=1; UPDATE sv_invitations SET state='below-threshold' WHERE state='open'",
-      );
+      )
       if (control.snoozeAt !== null && now >= control.snoozeAt)
-        this.#db.exec("UPDATE sv_control SET snoozeAt=NULL");
-      return;
+        this.#db.exec('UPDATE sv_control SET snoozeAt=NULL')
+      return
     }
     if (control.snoozeAt !== null) {
-      if (now < control.snoozeAt) return;
+      if (now < control.snoozeAt) return
       // Consume the one requested reminder even if supervision has since stopped.
-      this.#db.exec("UPDATE sv_control SET snoozeAt=NULL,armed=0");
-    } else if (!control.armed) return;
-    if (this.#invitation() || !this.#supervising(now)) return;
-    const id = randomUUID();
+      this.#db.exec('UPDATE sv_control SET snoozeAt=NULL,armed=0')
+    } else if (!control.armed) return
+    if (this.#invitation() || !this.#supervising(now)) return
+    const id = randomUUID()
     this.#db
       .prepare("INSERT INTO sv_invitations VALUES(?,?,'open')")
-      .run(id, now + this.#invitationMs);
-    this.#db.exec("UPDATE sv_control SET armed=0");
-    this.#effect("invitation", id);
+      .run(id, now + this.#invitationMs)
+    this.#db.exec('UPDATE sv_control SET armed=0')
+    this.#effect('invitation', id)
   }
 
   /** Periodic gateway tick evaluates rolling load, expiration, and a due snooze. */
   tick(): void {
     this.#transaction(() => {
-      const now = this.#now();
-      this.#advance(now);
-      this.#considerInvitation(now);
-    });
+      const now = this.#now()
+      this.#advance(now)
+      this.#considerInvitation(now)
+    })
   }
 
   /** Record a lifecycle hook; an ordinary prompt submission supplies no human reply points. */
   observe(observation: Observation): void {
     this.#transaction(() => {
-      const now = this.#now();
-      this.#advance(now);
-      this.#work.observe(observation, now, randomUUID());
-      this.#considerInvitation(now);
-    });
+      const now = this.#now()
+      this.#advance(now)
+      this.#work.observe(observation, now, randomUUID())
+      if (
+        observation.provider === 'claude' &&
+        (observation.source ?? 'hook') === 'hook' &&
+        (observation.status === 'running' || observation.status === 'idle')
+      ) {
+        const active = this.#active()
+        const session = this.#work.claude(
+          observation.sessionId,
+          observation.incarnation,
+          now,
+        )
+        if (
+          active &&
+          session?.status === observation.status &&
+          (observation.at ?? now) > active.startedAt
+        )
+          this.#db
+            .prepare(
+              'DELETE FROM sv_unidentified_waits WHERE breakId=? AND sessionId=? AND generation=?',
+            )
+            .run(active.id, observation.sessionId, session.generation)
+      }
+      this.#considerInvitation(now)
+    })
   }
 
   /** Replace one snapshot without borrowing the authority or extending the freshness of another. */
   snapshot(
     source: string,
     observations: Observation[],
-    coverage: Omit<Coverage, "source">,
+    coverage: Omit<Coverage, 'source'>,
   ): void {
     this.#transaction(() => {
-      const now = this.#now();
-      if ((this.#coverage.get(source)?.at ?? -Infinity) > coverage.at) return;
-      this.#advance(now);
+      const now = this.#now()
+      if ((this.#coverage.get(source)?.at ?? -Infinity) > coverage.at) return
+      this.#advance(now)
       this.#work.replaceSource(
         source,
         observations,
         coverage.at,
         now,
         randomUUID,
-      );
-      this.#coverage.set(source, { source, ...coverage });
-      this.#considerInvitation(now);
-    });
+        coverage.status === 'available',
+      )
+      this.#coverage.set(source, { source, ...coverage })
+      this.#considerInvitation(now)
+    })
   }
 
   /**
@@ -339,121 +363,137 @@ export class Supervision {
    * canonical origin ID for a mirrored event; ordinary new prompts never call this method.
    */
   humanReply(input: {
-    provider: Provider;
-    sessionId: string;
-    responseId: string;
-    questionId?: string;
-    originId?: string;
-    incarnation?: string;
-    at?: number;
+    provider: Provider
+    sessionId: string
+    responseId: string
+    questionId?: string
+    originId?: string
+    incarnation?: string
+    at?: number
   }): boolean {
     return this.#transaction(() => {
       const now = this.#now(),
-        at = input.at ?? now;
-      this.#advance(now);
+        at = input.at ?? now
+      this.#advance(now)
       if (
         !input.responseId ||
         !Number.isFinite(at) ||
         at > now ||
         at <= now - 60 * minute
       )
-        return false;
+        return false
       if (
         input.incarnation &&
-        input.provider === "claude" &&
+        input.provider === 'claude' &&
         !this.#work.claude(input.sessionId, input.incarnation, now)
       )
-        return false;
+        return false
+      const questionId =
+        input.questionId ??
+        (input.provider === 'claude' && input.responseId.startsWith('tool:')
+          ? input.responseId.slice(5)
+          : undefined)
       const card =
-        input.provider === "claude" && input.questionId
-          ? this.#card(input.sessionId, input.questionId)
-          : undefined;
+        input.provider === 'claude' && questionId
+          ? this.#card(input.sessionId, questionId)
+          : undefined
       if (
         card &&
-        ["pending", "sent", "ambiguous", "human"].includes(card.disposition)
+        ['pending', 'sent', 'ambiguous', 'human'].includes(card.disposition)
       )
-        return false;
-      const responseId = input.questionId
-        ? "tool:" + input.questionId
-        : input.responseId;
-      const key = createHash("sha256")
+        return false
+      const responseId = questionId ? 'tool:' + questionId : input.responseId
+      const key = createHash('sha256')
         .update(
           input.originId ??
-            [input.provider, input.sessionId, responseId].join(":"),
+            [input.provider, input.sessionId, responseId].join(':'),
         )
-        .digest("hex");
+        .digest('hex')
       const added = this.#db
-        .prepare("INSERT OR IGNORE INTO sv_replies VALUES(?,?,?)")
-        .run(key, at, this.#active() || at < this.#control().resetAt ? 0 : 1);
-      if (input.provider === "claude" && input.questionId)
+        .prepare('INSERT OR IGNORE INTO sv_replies VALUES(?,?,?)')
+        .run(key, at, this.#active() || at < this.#control().resetAt ? 0 : 1)
+      if (input.provider === 'claude' && questionId)
         this.#db
-          .prepare("INSERT OR IGNORE INTO sv_resolved VALUES(?,?)")
-          .run(input.sessionId, input.questionId);
-      if (card && input.questionId) {
+          .prepare('INSERT OR IGNORE INTO sv_resolved VALUES(?,?)')
+          .run(input.sessionId, questionId)
+      if (card && questionId) {
         this.#db
           .prepare(
             "UPDATE sv_questions SET disposition='human',live=0 WHERE sessionId=? AND questionId=?",
           )
-          .run(input.sessionId, input.questionId);
+          .run(input.sessionId, questionId)
         this.#db
           .prepare(
             "UPDATE sv_reviews SET outcome='human',reason='Answered by the person',at=? WHERE sessionId=? AND questionId=? AND outcome='held' AND breakId IN (SELECT id FROM sv_breaks WHERE endedAt IS NULL)",
           )
-          .run(now, input.sessionId, input.questionId);
-        this.#work.setWaiting(input.sessionId, input.questionId, false, now);
+          .run(now, input.sessionId, questionId)
+        this.#work.setWaiting(input.sessionId, questionId, false, now)
       }
-      this.#considerInvitation(now);
-      return added.changes === 1;
-    });
+      this.#considerInvitation(now)
+      return added.changes === 1
+    })
   }
 
   /** Consume a correlated native action; callbacks from expired invitations or old breaks fail closed. */
   action(id: string, action: NativeAction): boolean {
     return this.#transaction(() => {
-      const now = this.#now();
-      this.#advance(now);
-      if (action === "return") {
-        const active = this.#active();
-        if (!active || active.id !== id) return false;
-        this.#finish(active, now, "Person returned");
-        return true;
+      const now = this.#now()
+      this.#advance(now)
+      if (action === 'return') {
+        const active = this.#active()
+        if (!active || active.id !== id) return false
+        this.#finish(active, now, 'Person returned')
+        return true
       }
-      const invite = this.#invitation();
+      const invite = this.#invitation()
       if (
         !invite ||
         invite.id !== id ||
-        !["dismiss", "snooze", "accept"].includes(action)
+        !['dismiss', 'snooze', 'accept'].includes(action)
       )
-        return false;
+        return false
       if (
-        action === "accept" &&
+        action === 'accept' &&
         (!this.#supervising(now) ||
           this.#work.score(now, this.#control().resetAt) < this.#threshold)
       )
-        return false;
+        return false
       this.#db
-        .prepare("UPDATE sv_invitations SET state=? WHERE id=?")
-        .run(action, id);
-      if (action === "snooze")
+        .prepare('UPDATE sv_invitations SET state=? WHERE id=?')
+        .run(action, id)
+      if (action === 'snooze')
         this.#db
-          .prepare("UPDATE sv_control SET snoozeAt=?")
-          .run(now + this.#snoozeMs);
-      if (action !== "accept") return true;
-      const breakId = randomUUID();
+          .prepare('UPDATE sv_control SET snoozeAt=?')
+          .run(now + this.#snoozeMs)
+      if (action !== 'accept') return true
+      const breakId = randomUUID()
       this.#db
-        .prepare("INSERT INTO sv_breaks VALUES(?,?,?,NULL)")
-        .run(breakId, now, now + this.#breakMs);
+        .prepare('INSERT INTO sv_breaks VALUES(?,?,?,NULL)')
+        .run(breakId, now, now + this.#breakMs)
       for (const s of this.#work.views(now)) {
         if (
-          s.provider !== "claude" ||
+          s.provider !== 'claude' ||
           !s.canDelegate ||
-          s.status === "unknown" ||
-          s.status === "closed"
+          s.status === 'unknown' ||
+          s.status === 'closed'
         )
-          continue;
+          continue
         this.#db
-          .prepare("INSERT INTO sv_members VALUES(?,?,?)")
-          .run(breakId, s.sessionId, s.generation);
+          .prepare('INSERT INTO sv_members VALUES(?,?,?)')
+          .run(breakId, s.sessionId, s.generation)
+        if (
+          s.status === 'waiting' &&
+          !this.#db
+            .prepare(
+              'SELECT 1 FROM sv_questions WHERE sessionId=? AND generation=? AND live=1',
+            )
+            .get(s.sessionId, s.generation)
+        ) {
+          // A provider can report a preexisting prompt whose original hook we never witnessed.
+          this.#db
+            .prepare('INSERT INTO sv_unidentified_waits VALUES(?,?,?)')
+            .run(breakId, s.sessionId, s.generation)
+        }
         // Cards on screen at acceptance remain held across retries and subsequent observations.
         this.#db
           .prepare(
@@ -461,66 +501,70 @@ export class Supervision {
           SELECT ?,sessionId,questionId,question,'held','Already waiting when the break began',? FROM sv_questions
           WHERE sessionId=? AND generation=? AND live=1 AND disposition IN ('open','held')`,
           )
-          .run(breakId, now, s.sessionId, s.generation);
+          .run(breakId, now, s.sessionId, s.generation)
       }
-      this.#effect("break", breakId);
-      return true;
-    });
+      this.#effect('break', breakId)
+      return true
+    })
   }
 
   /** Register the original Claude request before a model call; duplicate hooks may never obtain a fresh ticket. */
   question(input: QuestionInput): Gate {
     return this.#transaction(() => {
-      const now = this.#now();
-      this.#advance(now);
-      const existing = this.#card(input.sessionId, input.questionId);
+      const now = this.#now()
+      this.#advance(now)
+      const existing = this.#card(input.sessionId, input.questionId)
       if (existing)
-        return { eligible: false, reason: "Question was already observed" };
+        return { eligible: false, reason: 'Question was already observed' }
       if (
         this.#db
           .prepare(
-            "SELECT 1 FROM sv_resolved WHERE sessionId=? AND questionId=?",
+            'SELECT 1 FROM sv_resolved WHERE sessionId=? AND questionId=?',
           )
           .get(input.sessionId, input.questionId)
       )
         return {
           eligible: false,
-          reason: "Original request already completed",
-        };
-      const session = this.#work.claude(
-        input.sessionId,
-        input.incarnation,
-        now,
-      );
-      const active = this.#active();
+          reason: 'Original request already completed',
+        }
+      const session = this.#work.claude(input.sessionId, input.incarnation, now)
+      const active = this.#active()
       const member =
         active &&
         session?.canDelegate &&
-        this.#member(active.id, input.sessionId, session.generation);
-      const kind = input.kind ?? "choice";
-      let reason: string | undefined;
-      if (!member) reason = "Outside participating sessions";
-      else if (kind === "approval")
-        reason = "Execution approval requires the person";
+        this.#member(active.id, input.sessionId, session.generation)
+      const kind = input.kind ?? 'choice'
+      let reason: string | undefined
+      if (!member) reason = 'Outside participating sessions'
+      else if (
+        this.#db
+          .prepare(
+            'SELECT 1 FROM sv_unidentified_waits WHERE breakId=? AND sessionId=? AND generation=?',
+          )
+          .get(active.id, input.sessionId, session.generation)
+      )
+        reason = 'Input was already pending in this terminal at acceptance'
+      else if (kind === 'approval')
+        reason = 'Execution approval requires the person'
       else if (
         input.openedAt !== undefined &&
         (!Number.isFinite(input.openedAt) ||
           input.openedAt <= active.startedAt ||
           input.openedAt > now)
       )
-        reason = "Question predates confirmed consent";
-      const eligible = !reason && !!active;
+        reason = 'Question predates confirmed consent'
+      const eligible = !reason && !!active
       this.#db
-        .prepare("INSERT INTO sv_questions VALUES(?,?,?,?,?,1,?,?)")
+        .prepare('INSERT INTO sv_questions VALUES(?,?,?,?,?,1,?,?)')
         .run(
           input.sessionId,
           input.questionId,
-          session?.generation ?? "",
+          session?.generation ?? '',
           input.question,
           kind,
           eligible ? active!.id : null,
-          eligible ? "open" : "held",
-        );
+          eligible ? 'open' : 'held',
+        )
       if (member) {
         this.#db
           .prepare(
@@ -531,55 +575,55 @@ export class Supervision {
             input.sessionId,
             input.questionId,
             input.question,
-            reason ?? "Awaiting decision",
+            reason ?? 'Awaiting decision',
             now,
-          );
+          )
       }
       if (session)
-        this.#work.setWaiting(input.sessionId, input.questionId, true, now);
-      this.#considerInvitation(now);
+        this.#work.setWaiting(input.sessionId, input.questionId, true, now)
+      this.#considerInvitation(now)
       return eligible
         ? { eligible: true, breakId: active!.id }
-        : { eligible: false, reason };
-    });
+        : { eligible: false, reason }
+    })
   }
 
   /** Leave an unanswered card visible in its original terminal and retain the private review reason. */
   hold(sessionId: string, questionId: string, reason: string): void {
     this.#transaction(() =>
       this.#hold(sessionId, questionId, reason, this.#now()),
-    );
+    )
   }
   #hold(sessionId: string, questionId: string, reason: string, now: number) {
-    const card = this.#card(sessionId, questionId);
-    if (card?.disposition !== "open") return;
+    const card = this.#card(sessionId, questionId)
+    if (card?.disposition !== 'open') return
     this.#db
       .prepare(
         "UPDATE sv_questions SET disposition='held' WHERE sessionId=? AND questionId=?",
       )
-      .run(sessionId, questionId);
+      .run(sessionId, questionId)
     this.#db
       .prepare(
         "UPDATE sv_reviews SET reason=?,at=? WHERE breakId=? AND sessionId=? AND questionId=? AND outcome='held'",
       )
-      .run(reason, now, card.candidate, sessionId, questionId);
+      .run(reason, now, card.candidate, sessionId, questionId)
   }
 
   /** A matching post-tool event can prove a card closed even when its answer's author is unknown. */
   resolveQuestion(sessionId: string, questionId: string): void {
     this.#transaction(() => {
-      const now = this.#now();
-      this.#hold(sessionId, questionId, "Original request completed", now);
+      const now = this.#now()
+      this.#hold(sessionId, questionId, 'Original request completed', now)
       this.#db
-        .prepare("INSERT OR IGNORE INTO sv_resolved VALUES(?,?)")
-        .run(sessionId, questionId);
+        .prepare('INSERT OR IGNORE INTO sv_resolved VALUES(?,?)')
+        .run(sessionId, questionId)
       this.#db
         .prepare(
-          "UPDATE sv_questions SET live=0 WHERE sessionId=? AND questionId=?",
+          'UPDATE sv_questions SET live=0 WHERE sessionId=? AND questionId=?',
         )
-        .run(sessionId, questionId);
-      this.#work.setWaiting(sessionId, questionId, false, now);
-    });
+        .run(sessionId, questionId)
+      this.#work.setWaiting(sessionId, questionId, false, now)
+    })
   }
 
   /**
@@ -592,158 +636,180 @@ export class Supervision {
    */
   commitAnswer(
     input: {
-      sessionId: string;
-      questionId: string;
-      breakId: string;
-      answer: string;
-      incarnation?: string;
+      sessionId: string
+      questionId: string
+      breakId: string
+      answer: string
+      incarnation?: string
     },
     originalClientStillWaiting: () => boolean,
     recordProvenance?: () => void,
   ): boolean {
-    return this.#transaction(() => {
-      const now = this.#now();
-      this.#advance(now);
-      const active = this.#active(),
-        card = this.#card(input.sessionId, input.questionId);
-      if (
-        !active ||
-        active.id !== input.breakId ||
-        !card?.live ||
-        card.candidate !== active.id ||
-        card.disposition !== "open" ||
-        card.kind !== "choice" ||
-        !input.answer
-      )
-        return false;
-      const session = this.#work.claude(
+    // Commit measured time separately so an attribution failure can roll back the answer
+    // without reverting SQLite's clock checkpoint behind the in-memory activity cursor.
+    this.tick()
+    const lostOriginal = Symbol()
+    try {
+      return this.#transaction(() => {
+        const now = this.#now()
+        const active = this.#active(),
+          card = this.#card(input.sessionId, input.questionId)
+        if (
+          !active ||
+          active.id !== input.breakId ||
+          now >= active.expiresAt ||
+          now < active.startedAt ||
+          !card?.live ||
+          card.candidate !== active.id ||
+          card.disposition !== 'open' ||
+          card.kind !== 'choice' ||
+          !input.answer
+        )
+          return false
+        const session = this.#work.claude(
+          input.sessionId,
+          input.incarnation,
+          now,
+        )
+        if (
+          !session?.canDelegate ||
+          session.status === 'unknown' ||
+          session.generation !== card.generation ||
+          !this.#member(active.id, input.sessionId, session.generation)
+        ) {
+          this.#hold(
+            input.sessionId,
+            input.questionId,
+            'Original terminal is no longer confirmed',
+            now,
+          )
+          return false
+        }
+        if (!originalClientStillWaiting() || this.#now() >= active.expiresAt) {
+          this.#hold(
+            input.sessionId,
+            input.questionId,
+            'Original request or consent ended',
+            now,
+          )
+          return false
+        }
+        this.#db
+          .prepare(
+            "UPDATE sv_questions SET disposition='pending' WHERE sessionId=? AND questionId=?",
+          )
+          .run(input.sessionId, input.questionId)
+        this.#db
+          .prepare(
+            "UPDATE sv_reviews SET outcome='pending',answer=?,reason=NULL,at=? WHERE breakId=? AND sessionId=? AND questionId=?",
+          )
+          .run(input.answer, now, active.id, input.sessionId, input.questionId)
+        recordProvenance?.()
+        const commitAt = this.#now()
+        if (
+          commitAt < active.startedAt ||
+          commitAt >= active.expiresAt ||
+          !originalClientStillWaiting()
+        )
+          throw lostOriginal
+        return true
+      })
+    } catch (error) {
+      if (error !== lostOriginal) throw error
+      this.hold(
         input.sessionId,
-        input.incarnation,
-        now,
-      );
-      if (
-        !session?.canDelegate ||
-        session.status === "unknown" ||
-        session.generation !== card.generation ||
-        !this.#member(active.id, input.sessionId, session.generation)
-      ) {
-        this.#hold(
-          input.sessionId,
-          input.questionId,
-          "Original terminal is no longer confirmed",
-          now,
-        );
-        return false;
-      }
-      if (!originalClientStillWaiting() || this.#now() >= active.expiresAt) {
-        this.#hold(
-          input.sessionId,
-          input.questionId,
-          "Original request or consent ended",
-          now,
-        );
-        return false;
-      }
-      this.#db
-        .prepare(
-          "UPDATE sv_questions SET disposition='pending' WHERE sessionId=? AND questionId=?",
-        )
-        .run(input.sessionId, input.questionId);
-      this.#db
-        .prepare(
-          "UPDATE sv_reviews SET outcome='pending',answer=?,reason=NULL,at=? WHERE breakId=? AND sessionId=? AND questionId=?",
-        )
-        .run(input.answer, now, active.id, input.sessionId, input.questionId);
-      recordProvenance?.();
-      return true;
-    });
+        input.questionId,
+        'Original request or consent ended during the claim',
+      )
+      return false
+    }
   }
 
   /** Settle only an earlier claim, including when completion arrives just after the break ends. */
   settleAnswer(
     sessionId: string,
     questionId: string,
-    outcome: "sent" | "ambiguous",
+    outcome: 'sent' | 'ambiguous',
   ): void {
     this.#transaction(() => {
       const now = this.#now(),
-        card = this.#card(sessionId, questionId);
-      if (card?.disposition !== "pending") return;
+        card = this.#card(sessionId, questionId)
+      if (card?.disposition !== 'pending') return
       this.#db
         .prepare(
-          "UPDATE sv_questions SET disposition=?,live=? WHERE sessionId=? AND questionId=?",
+          'UPDATE sv_questions SET disposition=?,live=? WHERE sessionId=? AND questionId=?',
         )
-        .run(outcome, outcome === "sent" ? 0 : 1, sessionId, questionId);
+        .run(outcome, outcome === 'sent' ? 0 : 1, sessionId, questionId)
       this.#db
         .prepare(
           "UPDATE sv_reviews SET outcome=?,reason=?,at=? WHERE breakId=? AND sessionId=? AND questionId=? AND outcome='pending'",
         )
         .run(
           outcome,
-          outcome === "sent" ? null : "Delivery was not confirmed",
+          outcome === 'sent' ? null : 'Delivery was not confirmed',
           now,
           card.candidate,
           sessionId,
           questionId,
-        );
-      if (outcome === "sent")
-        this.#work.setWaiting(sessionId, questionId, false, now);
-    });
+        )
+      if (outcome === 'sent')
+        this.#work.setWaiting(sessionId, questionId, false, now)
+    })
   }
 
   /** Claim ready native side effects once across repeated polling, racing actions, and restarts. */
   takeEffects(): NativeEffect[] {
     return this.#transaction(() => {
-      const now = this.#now();
-      this.#advance(now);
+      const now = this.#now()
+      this.#advance(now)
       const ready = this.#db
         .prepare(
-          "SELECT seq,kind,id FROM sv_effects WHERE claimed=0 ORDER BY seq",
+          'SELECT seq,kind,id FROM sv_effects WHERE claimed=0 ORDER BY seq',
         )
-        .all();
+        .all()
       const active = this.#active(),
-        invite = this.#invitation();
-      const effects: NativeEffect[] = [];
+        invite = this.#invitation()
+      const effects: NativeEffect[] = []
       for (const row of ready) {
         this.#db
-          .prepare("UPDATE sv_effects SET claimed=1 WHERE seq=?")
-          .run(row.seq);
-        const id = String(row.id);
+          .prepare('UPDATE sv_effects SET claimed=1 WHERE seq=?')
+          .run(row.seq)
+        const id = String(row.id)
         if (
-          row.kind === "digest" ||
-          (row.kind === "break" && id === active?.id) ||
-          (row.kind === "invitation" && id === invite?.id)
+          row.kind === 'digest' ||
+          (row.kind === 'break' && id === active?.id) ||
+          (row.kind === 'invitation' && id === invite?.id)
         )
-          effects.push({ kind: row.kind, id });
+          effects.push({ kind: row.kind, id })
       }
-      return effects;
-    });
+      return effects
+    })
   }
 
   /** Read private review details for a specific break or the most recently started one. */
   review(breakId?: string): ReviewReceipt[] {
-    this.tick();
+    this.tick()
     const id =
       breakId ??
       this.#db
         .prepare(
-          "SELECT id FROM sv_breaks ORDER BY startedAt DESC,rowid DESC LIMIT 1",
+          'SELECT id FROM sv_breaks ORDER BY startedAt DESC,rowid DESC LIMIT 1',
         )
-        .get()?.id;
-    if (id === undefined) return [];
+        .get()?.id
+    if (id === undefined) return []
     return this.#db
       .prepare(
-        "SELECT breakId,sessionId,questionId,question,answer,outcome,reason,at FROM sv_reviews WHERE breakId=? ORDER BY at,rowid",
+        'SELECT breakId,sessionId,questionId,question,answer,outcome,reason,at FROM sv_reviews WHERE breakId=? ORDER BY at,rowid',
       )
-      .all(id) as unknown as ReviewReceipt[];
+      .all(id) as unknown as ReviewReceipt[]
   }
 
   /** Project current load and detector coverage for the local CLI; question text is available through review. */
   status() {
-    this.tick();
+    this.tick()
     const now = this.#lastAt,
       active = this.#active(),
-      invite = this.#invitation();
+      invite = this.#invitation()
     return {
       score: active ? 0 : this.#work.score(now, this.#control().resetAt),
       threshold: this.#threshold,
@@ -762,7 +828,7 @@ export class Supervision {
             ...active,
             sessionCount: Number(
               this.#db
-                .prepare("SELECT COUNT(*) AS n FROM sv_members WHERE breakId=?")
+                .prepare('SELECT COUNT(*) AS n FROM sv_members WHERE breakId=?')
                 .get(active.id)?.n,
             ),
           }
@@ -771,6 +837,6 @@ export class Supervision {
       snoozeUntil: this.#control().snoozeAt,
       sessions: this.#work.views(now),
       coverage: [...this.#coverage.values()],
-    };
+    }
   }
 }

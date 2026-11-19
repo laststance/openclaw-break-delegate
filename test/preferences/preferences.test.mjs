@@ -925,3 +925,62 @@ test('the Japanese unrelated-bug question can choose the current PR or defer to 
   ])
   assert.equal(store.evaluate(bug, { cwd: repo }).reason, 'no-local-evidence')
 })
+
+test('desktop and terminal Codex root sessions can supply selections while automation, subagents and unfamiliar clients cannot', async (t) => {
+  // Arrange
+  const { root, repo, store } = createFixture(t)
+  const codex = join(root, 'test-codex')
+  const clients = [
+    ['terminal', 'codex-tui', 'user'],
+    ['desktop', 'Codex Desktop', 'user'],
+    ['automated', 'Codex Desktop', 'automation'],
+    ['child', 'codex-tui', 'subagent'],
+    ['custom', 'unverified bridge', 'user'],
+  ]
+  for (const [id, originator, thread_source] of clients) {
+    saveLines(
+      join(codex, 'sessions', '2025', '01', '01', 'rollout-' + id + '.jsonl'),
+      [
+        codexEvent(
+          'session_meta',
+          { id, cwd: repo, source: 'vscode', thread_source, originator },
+          0,
+        ),
+        codexEvent(
+          'response_item',
+          {
+            type: 'function_call',
+            name: 'request_user_input',
+            call_id: 'same',
+            arguments: JSON.stringify({ questions: [{ ...bug, id: 'scope' }] }),
+          },
+          100,
+        ),
+        codexEvent(
+          'response_item',
+          {
+            type: 'function_call_output',
+            call_id: 'same',
+            output: JSON.stringify({
+              answers: { scope: { answers: ['Fix in this PR'] } },
+            }),
+          },
+          200,
+        ),
+      ],
+    )
+  }
+
+  // Act
+  const result = await store.importHistory({ codex })
+
+  // Assert
+  assert.equal(result.observations, 2)
+  assert.deepEqual(
+    store
+      .humanResponsesSince(0)
+      .map((row) => row.sessionId)
+      .sort(),
+    ['desktop', 'terminal'],
+  )
+})
