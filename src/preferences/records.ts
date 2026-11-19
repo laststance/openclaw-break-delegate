@@ -26,6 +26,18 @@ const parseObject = (v: unknown): Row => {
     return {}
   }
 }
+
+/** Detect a qualification attached to this exact Claude question without forwarding the person's note.
+ * The live hook and transcript importer use identical semantics.
+ * @example hasAnswerNotes({Scope:{notes:'Only after review'}}, 'Scope')
+ */
+export function hasAnswerNotes(
+  annotations: unknown,
+  question: string,
+): boolean {
+  const notes = record(record(annotations)[question]).notes
+  return typeof notes === 'string' ? notes.trim().length > 0 : notes != null
+}
 function timestamp(v: unknown): number | null {
   const parsed =
     typeof v === 'string' ? Date.parse(v) : typeof v === 'number' ? v : NaN
@@ -81,6 +93,36 @@ function automated(row: Row): boolean {
     claims.some((v) => v != null && !humanAuthors.has(str(v).toLowerCase())) ||
     machineSources.has(str(row.source).toLowerCase())
   )
+}
+
+function automaticCodexRecord(row: Row): boolean {
+  return (
+    automated(row) ||
+    row.autoResolutionMs != null ||
+    row.auto_resolution_ms != null ||
+    [
+      row.automated,
+      row.timedOut,
+      row.timed_out,
+      row.autoResolved,
+      row.auto_resolved,
+    ].some((flag) => flag != null && flag !== false)
+  )
+}
+
+const codexInputTool = (name: unknown) =>
+  ['request_user_input', 'functions.request_user_input'].includes(str(name))
+
+function codexResult(raw: unknown): Row {
+  // The wire output is a JSON string or a single text content item containing the same JSON.
+  if (Array.isArray(raw)) {
+    const block = record(raw[0])
+    return raw.length === 1 &&
+      ['text', 'input_text', 'output_text', 'Text'].includes(str(block.type))
+      ? parseObject(block.text)
+      : {}
+  }
+  return parseObject(raw)
 }
 
 interface StoredQuestion {
@@ -202,7 +244,7 @@ function answerCall(
       continue
     responded = true
     // A typed condition or multiple selections cannot be converted to a single offered choice.
-    const notes = record(record(raw.annotations)[card.question]).notes
+    const notes = hasAnswerNotes(raw.annotations, card.question)
     if (!card.multiSelect)
       db.answer(
         origin,
@@ -547,8 +589,74 @@ function codexRow(
     sessionId: state.session!,
     toolUseId: id,
   })
+  const nativeCall = (part: Row) =>
+    origin(str(part.call_id) || str(part.callId) || str(part.id))
+  const request = (call: Origin, args: Row, ...envelopes: Row[]) => {
+    delete state.brief
+    if (
+      args.answers !== undefined ||
+      [row, payload, args, ...envelopes].some(automaticCodexRecord)
+    ) {
+      db.exclude(call)
+      counts.unverified++
+      return
+    }
+    rememberCall(db, call, state.repo, readQuestions(args.questions), at)
+  }
+  const result = (call: Origin, raw: unknown, ...envelopes: Row[]) => {
+    const output = codexResult(raw)
+    const answers = Object.values(record(output.answers)).map(record)
+    const content = Array.isArray(raw) ? raw.map(record) : []
+    // A mirror may supply provenance after (or before) the unmarked copy. Tombstone the canonical call before consulting its original offer.
+    if (
+      [
+        row,
+        payload,
+        record(raw),
+        output,
+        ...content,
+        ...envelopes,
+        ...answers,
+      ].some(automaticCodexRecord)
+    ) {
+      db.exclude(call)
+      counts.unverified++
+      return
+    }
+    if (payload.type !== 'item_started')
+      answerCall(db, call, output, at, false, counts)
+  }
   if (row.type === 'event_msg') {
-    if (automated(payload)) {
+    if (payload.thread_id && payload.thread_id !== state.session) return
+    if (payload.type === 'request_user_input') {
+      request(nativeCall(payload), payload)
+      return
+    }
+    if (payload.type === 'item_completed' || payload.type === 'item_started') {
+      const item = record(payload.item)
+      if (
+        item.type === 'FunctionCallOutput' &&
+        codexInputTool(item.name) &&
+        (!item.namespace || item.namespace === 'functions')
+      ) {
+        result(nativeCall(item), item.output, item)
+        return
+      }
+      if (
+        item.type === 'RequestUserInput' ||
+        (item.type === 'FunctionCall' &&
+          codexInputTool(item.name) &&
+          (!item.namespace || item.namespace === 'functions'))
+      ) {
+        request(
+          nativeCall(item),
+          item.questions ? item : parseObject(item.arguments ?? item.input),
+          item,
+        )
+        return
+      }
+    }
+    if (automaticCodexRecord(row) || automaticCodexRecord(payload)) {
       delete state.brief
       return
     }
@@ -584,7 +692,7 @@ function codexRow(
       const item = record(payload.item)
       if (
         (payload.thread_id && payload.thread_id !== state.session) ||
-        automated(item)
+        automaticCodexRecord(item)
       ) {
         delete state.brief
         return
@@ -618,51 +726,24 @@ function codexRow(
         )
       } else if (item.type === 'HookPrompt') delete state.brief
     }
-    if (payload.type === 'request_user_input') {
-      delete state.brief
-      const call = origin(str(payload.call_id))
-      if (payload.autoResolutionMs != null) {
-        db.exclude(call)
-        return
-      }
-      rememberCall(db, call, state.repo, readQuestions(payload.questions), at)
-    }
     if (payload.type === 'turn_aborted') delete state.brief
     return
   }
   if (row.type !== 'response_item') return
-  if (payload.type === 'function_call') {
+  if (payload.type === 'function_call' || payload.type === 'custom_tool_call') {
     delete state.brief
-    if (
-      !['request_user_input', 'functions.request_user_input'].includes(
-        str(payload.name),
-      )
-    )
-      return
+    if (!codexInputTool(payload.name)) return
     if (payload.namespace && payload.namespace !== 'functions') return
-    const args = parseObject(payload.arguments)
-    const call = origin(str(payload.call_id))
-    if (
-      args.autoResolutionMs != null ||
-      args.answers !== undefined ||
-      automated(args)
-    ) {
-      db.exclude(call)
-      return
-    }
-    rememberCall(db, call, state.repo, readQuestions(args.questions), at)
+    request(
+      nativeCall(payload),
+      parseObject(payload.arguments ?? payload.input),
+    )
   }
-  if (payload.type === 'function_call_output') {
-    const call = origin(str(payload.call_id))
-    if (!questionsFor(db, call, at).length) return
-    const output = parseObject(payload.output)
-    if (automated(payload) || automated(output)) {
-      db.exclude(call)
-      counts.unverified++
-      return
-    }
-    // A nonempty native request_user_input response on a known interactive root host is the documented explicit client selection.
-    answerCall(db, call, output, at, false, counts)
+  if (
+    payload.type === 'function_call_output' ||
+    payload.type === 'custom_tool_call_output'
+  ) {
+    result(nativeCall(payload), payload.output)
   }
 }
 

@@ -20,6 +20,7 @@ import { canonicalRepository } from './repository.js'
 export { typedResponseId } from './database.js'
 export { canonicalRepository } from './repository.js'
 export { classifyCard, normalizeQuestionCard } from './policy.js'
+export { hasAnswerNotes } from './records.js'
 export type {
   EvidenceSource,
   HumanResponse,
@@ -42,6 +43,7 @@ export interface HumanSelection extends Origin {
   cwd: string
   card: QuestionCard
   label: string
+  conditional?: boolean
   askedAt: number
   answeredAt: number
   instructions?: readonly string[]
@@ -123,7 +125,7 @@ export class PreferenceStore {
       return this.evidence.answer(
         selection,
         selection.card.question,
-        selection.label,
+        selection.conditional ? '' : selection.label,
         selection.answeredAt,
         true,
       )
@@ -138,8 +140,9 @@ export class PreferenceStore {
     sessionId: string,
     text: string,
     at: number,
+    truncated = false,
   ): void {
-    this.evidence.instruction({ source, sessionId }, text, at)
+    this.evidence.instruction({ source, sessionId }, text, at, false, truncated)
   }
 
   /** Persist a delivery's exclusion atomically with the caller's lease. Re-imports and previously learned copies both obey it.
@@ -171,5 +174,12 @@ export class PreferenceStore {
    */
   humanResponsesSince(since: number): HumanResponse[] {
     return this.evidence.responsesSince(since)
+  }
+
+  /** Return tool responses to withdraw from a prior workload calculation after new provenance is discovered.
+   * @example store.excludedResponsesSince(Date.now() - 3_600_000)
+   */
+  excludedResponsesSince(since: number): HumanResponse[] {
+    return this.evidence.withdrawalsSince(since)
   }
 }

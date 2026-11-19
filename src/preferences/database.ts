@@ -125,6 +125,9 @@ export class EvidenceDatabase {
         answered INTEGER, selected TEXT, conflict INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(source,session,tool,question));
       CREATE INDEX IF NOT EXISTS pref_local ON pref_offers(kind,signature,repo,answered);
       CREATE TABLE IF NOT EXISTS pref_exclusions(source TEXT,session TEXT,tool TEXT,PRIMARY KEY(source,session,tool));
+      CREATE TABLE IF NOT EXISTS pref_withdrawals(source TEXT,session TEXT,tool TEXT,seen INTEGER,PRIMARY KEY(source,session,tool));
+      CREATE INDEX IF NOT EXISTS pref_withdrawal_times ON pref_withdrawals(seen);
+      CREATE TABLE IF NOT EXISTS pref_decoder_versions(version TEXT PRIMARY KEY);
       CREATE TABLE IF NOT EXISTS pref_constraints(source TEXT,session TEXT,at INTEGER,kind TEXT,required TEXT,
         PRIMARY KEY(source,session,at,kind,required));
       CREATE TABLE IF NOT EXISTS pref_predictions(source TEXT,session TEXT,tool TEXT,question TEXT,kind TEXT,answered INTEGER,
@@ -146,6 +149,23 @@ export class EvidenceDatabase {
       CREATE VIEW IF NOT EXISTS pref_observations AS SELECT o.* FROM pref_offers o WHERE o.answered IS NOT NULL AND o.conflict=0
         AND NOT EXISTS(SELECT 1 FROM pref_exclusions x WHERE x.source=o.source AND x.session=o.session AND x.tool=o.tool);
     `)
+    this.transaction(() => {
+      const applied = db
+        .prepare('INSERT OR IGNORE INTO pref_decoder_versions VALUES(?)')
+        .run('codex-explicit-origin-v2')
+      if (!applied.changes) return
+      // Older decoders could import a timed-out choice and checkpoint beyond its provenance. Quarantine just their structured Codex answers until re-read.
+      db.prepare(
+        `INSERT OR IGNORE INTO pref_withdrawals SELECT r.source,r.session,r.tool,? FROM pref_responses r
+        JOIN pref_calls c USING(source,session,tool) WHERE r.source='codex'`,
+      ).run(Date.now())
+      db.exec(`DELETE FROM pref_responses WHERE source='codex' AND EXISTS
+        (SELECT 1 FROM pref_calls c WHERE c.source=pref_responses.source AND c.session=pref_responses.session AND c.tool=pref_responses.tool);
+        UPDATE pref_offers SET selected=NULL,answered=NULL WHERE source='codex' AND selected IS NOT NULL AND EXISTS
+        (SELECT 1 FROM pref_calls c WHERE c.source=pref_offers.source AND c.session=pref_offers.session AND c.tool=pref_offers.tool);
+        DELETE FROM pref_files WHERE json_type(state,'$.interactive') IS NOT NULL;`)
+      db.exec(dirty)
+    })
   }
 
   /** Save independently confirmed human effort even when the card has no learned decision type.
@@ -180,6 +200,25 @@ export class EvidenceDatabase {
       sessionId: String(row.sessionId),
       responseId: String(row.responseId),
       at: Number(row.at),
+    }))
+  }
+
+  /** Expose newly disqualified origins to the workload owner, without returning raw input or removing freshly revalidated replies.
+   * @example evidence.withdrawalsSince(Date.now()-3600000)
+   */
+  withdrawalsSince(since: number): HumanResponse[] {
+    const rows = this.db
+      .prepare(
+        `SELECT w.source,w.session,w.tool,w.seen FROM pref_withdrawals w WHERE w.seen>=?
+      AND (EXISTS(SELECT 1 FROM pref_exclusions x WHERE x.source=w.source AND x.session=w.session AND x.tool=w.tool)
+        OR NOT EXISTS(SELECT 1 FROM pref_responses r WHERE r.source=w.source AND r.session=w.session AND r.tool=w.tool)) ORDER BY w.seen`,
+      )
+      .all(since)
+    return rows.map((row) => ({
+      source: row.source as EvidenceSource,
+      sessionId: String(row.session),
+      responseId: 'tool:' + String(row.tool),
+      at: Number(row.seen),
     }))
   }
 
@@ -329,11 +368,17 @@ export class EvidenceDatabase {
   /** Tombstone the canonical provider/session/call before returning a delegated response or importing an automated decision.
    * @example evidence.exclude({source:'claude', sessionId:'s', toolUseId:'t'})
    */
-  exclude(origin: Origin): void {
+  exclude(origin: Origin, seenAt = Date.now()): void {
     if (!validId(origin.sessionId) || !validId(origin.toolUseId)) return
     const result = this.db
       .prepare('INSERT OR IGNORE INTO pref_exclusions VALUES(?,?,?)')
       .run(...fields(origin))
+    if (result.changes)
+      this.db
+        .prepare(
+          'INSERT INTO pref_withdrawals VALUES(?,?,?,?) ON CONFLICT(source,session,tool) DO UPDATE SET seen=MAX(seen,excluded.seen)',
+        )
+        .run(...fields(origin), seenAt)
     if (
       result.changes &&
       this.db
@@ -353,11 +398,12 @@ export class EvidenceDatabase {
     text: string,
     at: number,
     explicit = false,
+    truncated = false,
   ): void {
     if (!validId(session.sessionId) || !time(at) || typeof text !== 'string')
       return
     const rules =
-      text.length > 16_384
+      truncated || text.length > 16_384
         ? [{ kind: '*', required: '*' }]
         : instructionConstraints(text, explicit)
     this.saveRules(session, at, rules)
