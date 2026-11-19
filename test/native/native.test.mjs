@@ -73,7 +73,8 @@ test(
       ['--require', preload, '--no-warnings', cli],
       'claude-work',
     )
-    const processes = [interactive, headless, renamed]
+    const trace = launch(['--trace-gc', cli])
+    const processes = [interactive, headless, renamed, trace]
     await Promise.all(processes.map((child) => once(child, 'message')))
 
     // Act
@@ -95,6 +96,7 @@ test(
       [
         [0, 'interactive\n', ''],
         [0, 'headless\n', ''],
+        [0, 'interactive\n', ''],
         [0, 'interactive\n', ''],
         [0, 'unknown\n', ''],
       ],

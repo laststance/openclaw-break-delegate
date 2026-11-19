@@ -60,6 +60,7 @@ interface Brief {
   labels: string[]
   messageId?: string
   fingerprint?: string
+  answered?: true
 }
 export interface ParseState {
   session?: string
@@ -72,6 +73,8 @@ export interface ParseState {
     format: 'item' | 'legacy'
     hash: string
     at: number
+    nativeId?: string
+    replyTo?: string | null
     unmatched?: Brief
     inferred?: Brief
   }
@@ -219,7 +222,10 @@ function setCwd(state: ParseState, cwd: string, suppliedRemote?: string): void {
   state.repo = canonicalRepository(cwd, suppliedRemote)
 }
 
-function fromDecisionBrief(
+/** Recognize an offered decision brief in a historical or live assistant message.
+ * @example fromDecisionBrief('D1 — Which tests?\nA) Focused\nB) All', askedAt)
+ */
+export function fromDecisionBrief(
   text: string,
   at: number,
 ): { brief: Brief; card: QuestionCard } | undefined {
@@ -338,6 +344,11 @@ function humanText(
     pending.messageId || pending.fingerprint || pending.tool,
   )
   if (confirmed) {
+    // Later links to this same offer cannot turn a second submission into another solicited answer.
+    const recent = state.recentBriefs?.find(
+      (brief) => brief.tool === pending.tool,
+    )
+    if (recent) recent.answered = true
     db.directText(origin, responseId, pending.question, matching ?? '', at)
     if (!matching && isStandingReplyInstruction(text))
       db.instruction(session, text, at, true)
@@ -498,23 +509,44 @@ function claudeRow(
   )
 }
 
-/** Resolve a native reply against actual recent message IDs before the transcript importer attributes it.
- * @example linkedBrief(state, 'agent-message-id')
+/** Read the native reply link from its supported envelopes. A null result means the supplied IDs conflict or are malformed.
+ * @example codexReplyLink({ reply_to: 'q1' }, { in_reply_to: 'q1' })
  */
-function linkedBrief(
-  state: ParseState,
-  replyTo: string,
-  inferred?: Brief,
-): Brief | undefined {
-  const targets = (state.recentBriefs ?? []).filter(
-    (brief) => brief.messageId === replyTo,
-  )
+export function codexReplyLink(...envelopes: Row[]): string | null | undefined {
+  let reference: string | undefined
+  for (const envelope of envelopes) {
+    for (const id of [envelope.reply_to, envelope.in_reply_to]) {
+      if (id == null) continue
+      if (
+        typeof id !== 'string' ||
+        !pairableId(id) ||
+        (reference !== undefined && reference !== id)
+      )
+        return null
+      reference = id
+    }
+  }
+  return reference
+}
+
+/** Resolve an explicit reply only when both Codex readers can identify a unique, unanswered offer.
+ * @example linkedBrief(recentQuestions, 'agent-message-id')
+ */
+export function linkedBrief<
+  T extends { tool: string; messageId?: string; answered?: true },
+>(
+  recent: readonly T[] | undefined,
+  replyTo: string | null,
+  inferred?: T,
+): T | undefined {
+  if (replyTo === null) return
+  const targets = (recent ?? []).filter((brief) => brief.messageId === replyTo)
   if (
     inferred?.messageId === replyTo &&
     !targets.some((brief) => brief.tool === inferred.tool)
   )
     targets.push(inferred)
-  return targets.length === 1 ? targets[0] : undefined
+  return targets.length === 1 && !targets[0]!.answered ? targets[0] : undefined
 }
 
 function codexText(
@@ -528,23 +560,24 @@ function codexText(
   clientId: string,
   counts: ParseCounts,
   messageId?: string,
-  replyTo?: string,
+  replyTo?: string | null,
 ): void {
   const hash = digest(text)
   const previous = state.lastText
+  const nativeId = speaker === 'user' ? clientId : messageId
   // Some Codex versions fan a completed item out as a legacy event. Never pair that mirror with a later question or treat it as a standing instruction.
   if (
     previous &&
     previous.speaker === speaker &&
     previous.format !== format &&
     previous.hash === hash &&
-    Math.abs(at - previous.at) <= 2000
+    Math.abs(at - previous.at) <= 2000 &&
+    (!previous.nativeId || !nativeId || previous.nativeId === nativeId)
   ) {
     if (
       speaker === 'user' &&
       human &&
-      previous.format === 'legacy' &&
-      replyTo
+      (replyTo !== undefined || previous.replyTo !== undefined)
     ) {
       const session = { source: 'codex' as const, sessionId: state.session! }
       const inferred = previous.inferred ?? previous.unmatched
@@ -556,13 +589,29 @@ function codexText(
           previous.at,
         )
       db.cancelTypedInstruction(session, text, previous.at)
-      // Only a native message ID resolves an explicit link. A nearby offer with a different ID cannot inherit this answer.
-      const target = linkedBrief(state, replyTo, inferred)
+      // An unlinked mirror inherits the explicit reference. Disagreeing explicit references cannot verify each other.
+      const link =
+        replyTo === undefined
+          ? previous.replyTo!
+          : previous.replyTo === undefined || previous.replyTo === replyTo
+            ? replyTo
+            : null
+      const target = linkedBrief(state.recentBriefs, link, inferred)
       delete previous.unmatched
       delete previous.inferred
       if (target) {
         state.brief = target
-        humanText(db, 'codex', state, text, at, true, clientId, counts, replyTo)
+        humanText(
+          db,
+          'codex',
+          state,
+          text,
+          at,
+          true,
+          clientId,
+          counts,
+          link ?? undefined,
+        )
       }
       return
     }
@@ -586,15 +635,7 @@ function codexText(
     }
     return
   }
-  state.lastText = { speaker, format, hash, at }
-  if (
-    speaker === 'user' &&
-    format === 'legacy' &&
-    !human &&
-    !replyTo &&
-    state.brief
-  )
-    state.lastText.inferred = state.brief
+  state.lastText = { speaker, format, hash, at, nativeId, replyTo }
   if (speaker === 'agent') {
     rememberBrief(db, 'codex', state, text, at, messageId)
     if (state.brief)
@@ -605,13 +646,25 @@ function codexText(
         state.brief,
       ].slice(-8)
   } else {
-    if (human && format === 'item' && replyTo) {
-      const target = linkedBrief(state, replyTo, state.brief)
+    if (replyTo !== undefined) {
+      const target = linkedBrief(state.recentBriefs, replyTo, state.brief)
+      delete state.brief
       // Unknown or ambiguous explicit links cannot act as either a reply to the latest brief or a new standing instruction.
       if (!target) return
       state.brief = target
     }
-    humanText(db, 'codex', state, text, at, human, clientId, counts, replyTo)
+    if (!human && state.brief) state.lastText.inferred = state.brief
+    humanText(
+      db,
+      'codex',
+      state,
+      text,
+      at,
+      human,
+      clientId,
+      counts,
+      replyTo ?? undefined,
+    )
   }
 }
 
@@ -794,7 +847,7 @@ function codexRow(
         str(payload.client_id),
         counts,
         undefined,
-        str(payload.reply_to) || str(payload.in_reply_to),
+        codexReplyLink(payload),
       )
     }
     if (payload.type === 'item_completed') {
@@ -833,10 +886,7 @@ function codexRow(
           clientId,
           counts,
           str(item.id),
-          str(item.reply_to) ||
-            str(item.in_reply_to) ||
-            str(payload.reply_to) ||
-            str(payload.in_reply_to),
+          codexReplyLink(item, payload),
         )
       } else if (item.type === 'HookPrompt') delete state.brief
     }

@@ -140,6 +140,10 @@ enum SurfaceChecks {
         precondition(classifyClaudeArguments(arguments("/usr/local/bin/node", ["node", cli, "Explain how -p works"])) == .interactive)
         precondition(classifyClaudeArguments(arguments("/usr/local/bin/node", ["node", cli, "--output-format=json"])) == .headless)
         precondition(classifyClaudeArguments(arguments("/usr/local/bin/node", ["custom-label", "--no-warnings", cli])) == .interactive)
+        for flag in ["--warnings", "--require-module", "--trace-gc", "--trace_gc"] {
+            precondition(classifyClaudeArguments(arguments("/usr/local/bin/node", ["node", flag, cli])) == .interactive)
+            precondition(classifyClaudeArguments(arguments("/usr/local/bin/node", ["node", flag, "/tmp/other.js", cli])) == .unrelated)
+        }
         precondition(classifyClaudeArguments(arguments("/usr/local/bin/node", ["node", "-r", "/tmp/loader", "--", cli, "--print"])) == .headless)
         precondition(classifyClaudeArguments(arguments("/usr/local/bin/node", ["node", "--require=" + cli, "/tmp/other.js"])) == .unrelated)
         precondition(classifyClaudeArguments(arguments("/usr/local/bin/node", ["node", "--require", cli, "/tmp/other.js"])) == .unrelated)

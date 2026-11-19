@@ -557,6 +557,11 @@ test('questions about tests, documentation and approval leave later decisions el
     ['ensure', 'Make sure you get my approval first.'],
     ['need', 'I need you to get my approval.'],
     ['compound', 'Can you explain the results, and ask for my approval?'],
+    [
+      'then-approve',
+      'Can you explain the results and then ask for my approval?',
+    ],
+    ['direct-approve', 'Please explain the results, and ask for my approval.'],
   ])
     store.recordInstruction('claude', session, text, base + 500)
 
@@ -569,6 +574,8 @@ test('questions about tests, documentation and approval leave later decisions el
   assert.equal(decision('ensure').reason, 'current-instructions')
   assert.equal(decision('need').reason, 'current-instructions')
   assert.equal(decision('compound').reason, 'current-instructions')
+  assert.equal(decision('then-approve').reason, 'current-instructions')
+  assert.equal(decision('direct-approve').reason, 'current-instructions')
 })
 
 test('withdrawn fallback evidence keeps only an independently validated selection at its actual response time', async (t) => {
@@ -1074,6 +1081,13 @@ test('a restriction inside an explanation request overrides a learned full-suite
   assert.equal(decision('limited').reason, 'current-instructions')
   assert.equal(decision('unknown').reason, 'current-instructions')
   assert.equal(decision('general').eligibleLabel, 'Full suite')
+  store.recordInstruction(
+    'claude',
+    'qualified',
+    'Run the focused tests for this refactor.',
+    base + 1200,
+  )
+  assert.equal(decision('qualified').reason, 'current-instructions')
 })
 
 test('answer qualifications stay local to the selected option, with a standing rule applied only to an explicitly ongoing instruction', async (t) => {

@@ -209,6 +209,9 @@ export class EvidenceDatabase {
       CREATE TABLE IF NOT EXISTS pref_source_facts(owner TEXT, source TEXT, session TEXT, table_name TEXT, row_data TEXT,
         UNIQUE(owner,source,session,table_name,row_data));
       CREATE INDEX IF NOT EXISTS pref_source_sessions ON pref_source_facts(source,session);
+      CREATE TABLE IF NOT EXISTS pref_structured_witnesses(owner TEXT,source TEXT,session TEXT,tool TEXT,shape TEXT,
+        question TEXT,repo TEXT,selected TEXT,at INTEGER,PRIMARY KEY(owner,source,session,tool,shape,question,repo,selected,at));
+      CREATE INDEX IF NOT EXISTS pref_structured_call ON pref_structured_witnesses(source,session,tool,shape,question,repo,at);
       CREATE TABLE IF NOT EXISTS pref_primary_choices(source TEXT,session TEXT,tool TEXT,question TEXT,selected TEXT,at INTEGER,
         PRIMARY KEY(source,session,tool,question,selected,at));
       CREATE TABLE IF NOT EXISTS pref_shape_conflicts(source TEXT,session TEXT,tool TEXT,question TEXT,PRIMARY KEY(source,session,tool,question));
@@ -412,6 +415,102 @@ export class EvidenceDatabase {
         this.derived(() => this.restoreSession(session))
       }
     })
+    this.transaction(() => {
+      if (
+        !db
+          .prepare('INSERT OR IGNORE INTO pref_decoder_versions VALUES(?)')
+          .run('revalidated-native-links-and-structured-witnesses-v1').changes
+      )
+        return
+      const affected = this.upgradeStructuredWitnesses()
+      // The older decoder could assign an explicitly linked native reply to the adjacent brief or retain its text as a standing rule.
+      const typedFiles = db
+        .prepare(
+          `SELECT path,identity FROM pref_files WHERE json_type(state,'$.interactive') IS NOT NULL AND
+        (json_type(state,'$.lastText') IS NOT NULL OR EXISTS(SELECT 1 FROM pref_source_facts f
+          WHERE f.owner=pref_files.path||'/'||pref_files.identity AND f.table_name IN ('pref_constraints','pref_instruction_candidates','pref_typed_candidates','pref_direct_text')))`,
+        )
+        .all()
+      const legacy = db
+        .prepare(
+          "SELECT DISTINCT source,session FROM pref_source_facts WHERE source='codex' AND owner='legacy-instruction' AND table_name='pref_constraints'",
+        )
+        .all()
+      db.exec(
+        "DELETE FROM pref_source_facts WHERE source='codex' AND owner='legacy-instruction' AND table_name='pref_constraints'",
+      )
+      for (const file of typedFiles) {
+        db.prepare('INSERT OR IGNORE INTO pref_legacy_refresh VALUES(?)').run(
+          file.path,
+        )
+        this.withdrawSource(String(file.path) + '/' + String(file.identity))
+      }
+      this.derived(() => {
+        for (const row of legacy)
+          affected.set(JSON.stringify(['codex', row.session]), {
+            source: 'codex',
+            sessionId: String(row.session),
+          })
+        for (const session of affected.values()) this.restoreSession(session)
+      })
+    })
+  }
+
+  /** Recover original shapes from a pre-fingerprint cache, rereading a split result's own source when the call's old shape cannot be proved.
+   * @example this.upgradeStructuredWitnesses()
+   */
+  private upgradeStructuredWitnesses(): Map<string, Session> {
+    const affected = new Map<string, Session>()
+    const outputs = this.db
+      .prepare(
+        `SELECT rowid,owner,source,session,row_data FROM pref_source_facts WHERE owner<>'live' AND table_name='pref_responses'
+      AND json_extract(row_data,'$[2]')='tool:'||json_extract(row_data,'$[3]')`,
+      )
+      .all()
+    const choices = this.db
+      .prepare(`SELECT rowid,row_data FROM pref_source_facts WHERE owner=? AND source=? AND session=? AND table_name='pref_primary_choices'
+      AND json_extract(row_data,'$[2]')=? AND json_extract(row_data,'$[5]')=?`)
+    const original = this.db
+      .prepare(`SELECT 1 FROM pref_source_facts f JOIN pref_calls c
+      ON c.source=f.source AND c.session=f.session AND c.tool=json_extract(f.row_data,'$[2]') AND c.questions=json_extract(f.row_data,'$[3]')
+      WHERE f.owner=? AND f.source=? AND f.session=? AND f.table_name='pref_calls' AND c.tool=? AND c.asked<=? AND json_extract(f.row_data,'$[4]')<=?`)
+    const refresh = this.db.prepare(
+      "INSERT OR IGNORE INTO pref_legacy_refresh SELECT path FROM pref_files WHERE path||'/'||identity=?",
+    )
+    const retire = this.db.prepare(
+      'DELETE FROM pref_source_facts WHERE rowid=?',
+    )
+    for (const row of outputs) {
+      const session = {
+        source: row.source as EvidenceSource,
+        sessionId: String(row.session),
+      }
+      const owner = String(row.owner)
+      const response = JSON.parse(String(row.row_data)) as FactValue[]
+      const scope = [
+        owner,
+        session.source,
+        session.sessionId,
+        response[3]!,
+        response[4]!,
+      ] as const
+      const selections = choices.all(...scope)
+      // A different physical source might have changed the question since this unlabelled result was first decoded.
+      if (original.get(...scope, response[4]!)) {
+        this.rememberStructured('pref_responses', session, response, owner)
+        for (const choice of selections)
+          this.rememberStructured(
+            'pref_primary_choices',
+            session,
+            JSON.parse(String(choice.row_data)) as FactValue[],
+            owner,
+          )
+      } else refresh.run(owner)
+      retire.run(row.rowid)
+      for (const choice of selections) retire.run(choice.rowid)
+      affected.set(JSON.stringify([session.source, session.sessionId]), session)
+    }
+    return affected
   }
 
   /** Preserve provable live and native replies when {@link EvidenceDatabase} upgrades an unowned history cache.
@@ -491,7 +590,8 @@ export class EvidenceDatabase {
           owner,
         )
     }
-    // Pre-upgrade constraints lack an authoring channel. Retain known restrictions while their source files are revalidated.
+    // Only Claude had an independent live instruction hook. An unowned Codex constraint needs its original transcript.
+    if (session.source !== 'claude') return
     for (const row of this.db
       .prepare(
         'SELECT at,kind,required FROM pref_constraints WHERE source=? AND session=?',
@@ -517,6 +617,134 @@ export class EvidenceDatabase {
     }
   }
 
+  /** Bind an archived output to the exact form it answered so its input file can be re-indexed independently.
+   * Only the form fingerprint, normalized meaning, and source metadata enter this record.
+   * @example this.rememberStructured('pref_responses', session, ['codex','s','tool:t','t',2000], owner)
+   */
+  private rememberStructured(
+    table: PrimaryTable,
+    session: Session,
+    values: readonly FactValue[],
+    owner: string,
+  ): boolean {
+    if (
+      owner === 'live' ||
+      (table !== 'pref_responses' && table !== 'pref_primary_choices')
+    )
+      return false
+    const choice = table === 'pref_primary_choices'
+    const tool = String(values[choice ? 2 : 3])
+    if (!choice && values[2] !== 'tool:' + tool) return false
+    const at = Number(values[choice ? 5 : 4])
+    const key = [session.source, session.sessionId, tool] as const
+    const call = this.db
+      .prepare(
+        'SELECT questions FROM pref_calls WHERE source=? AND session=? AND tool=? AND asked<=?',
+      )
+      .get(...key, at)
+    if (!call) return false
+    const question = choice ? String(values[3]) : ''
+    const repo = choice
+      ? this.db
+          .prepare(
+            'SELECT repo FROM pref_offers WHERE source=? AND session=? AND tool=? AND question=? AND asked<=?',
+          )
+          .get(...key, question, at)?.repo
+      : ''
+    if (typeof repo !== 'string') return false
+    this.db
+      .prepare(
+        'INSERT OR IGNORE INTO pref_structured_witnesses VALUES(?,?,?,?,?,?,?,?,?)',
+      )
+      .run(
+        owner,
+        ...key,
+        digest(String(call.questions)),
+        question,
+        repo,
+        choice ? String(values[4]) : '',
+        at,
+      )
+    return true
+  }
+
+  /** Re-enable a surviving provider result when this exact form and its original chronology are known again.
+   * @example this.restoreStructuredResponse(origin, serializedQuestions, askedAt)
+   */
+  private restoreStructuredResponse(
+    origin: Origin,
+    questions: string,
+    askedAt: number,
+  ): void {
+    const response = this.db
+      .prepare(
+        "SELECT MIN(at) AS at FROM pref_structured_witnesses WHERE source=? AND session=? AND tool=? AND shape=? AND question='' AND at>=?",
+      )
+      .get(...fields(origin), digest(questions), askedAt)
+    if (typeof response?.at === 'number')
+      this.derived(() =>
+        this.humanResponse(
+          origin,
+          'tool:' + origin.toolUseId,
+          Number(response.at),
+        ),
+      )
+  }
+
+  /** Rejoin verified option meanings only after their source question, repo and response order agree.
+   * @example this.restoreStructuredChoices(origin,question,repo)
+   */
+  private restoreStructuredChoices(
+    origin: Origin,
+    question: string,
+    repo: string,
+  ): void {
+    const call = this.db
+      .prepare(
+        'SELECT questions,asked FROM pref_calls WHERE source=? AND session=? AND tool=?',
+      )
+      .get(...fields(origin))
+    if (!call || this.isPermanentlyExcluded(origin)) return
+    const proof = this.db
+      .prepare(
+        'SELECT selected,at FROM pref_structured_witnesses WHERE source=? AND session=? AND tool=? AND shape=? AND question=? AND repo=? AND at>=?',
+      )
+      .all(
+        ...fields(origin),
+        digest(String(call.questions)),
+        question,
+        repo,
+        call.asked!,
+      )
+    if (!proof.length) return
+    const offer = this.db
+      .prepare(
+        'SELECT options FROM pref_offers WHERE source=? AND session=? AND tool=? AND question=? AND repo=?',
+      )
+      .get(...fields(origin), question, repo)
+    if (!offer) return
+    const choices = JSON.parse(String(offer.options)) as {
+      label: string
+      meaning: string
+    }[]
+    this.derived(() => {
+      for (const row of proof) {
+        const label = choices.find(
+          (choice) => choice.meaning === row.selected,
+        )?.label
+        if (!label && row.selected !== otherResponse) continue
+        this.insertPrimary('pref_primary_choices', origin, [
+          ...fields(origin),
+          question,
+          String(row.selected),
+          Number(row.at),
+        ])
+        // Replaying an already verified choice must retain disagreement from any other surviving witness.
+        this.answer(origin, question, label ?? '', Number(row.at), true)
+      }
+    })
+  }
+
   /** Attach an independently decoded record even when another file or live hook has already supplied the same canonical row.
    * @example evidence.primary('pref_calls', origin, ['claude','s','t','[]',1])
    */
@@ -527,6 +755,14 @@ export class EvidenceDatabase {
     owner = this.owner,
   ): void {
     if (this.deriving) return
+    if (this.rememberStructured(table, session, values, owner)) return
+    // The decoder supplies this validated request before writing its materialized row; workload needs no policy-classifiable option.
+    if (table === 'pref_calls')
+      this.restoreStructuredResponse(
+        { ...session, toolUseId: String(values[2]) },
+        String(values[3]),
+        Number(values[4]),
+      )
     this.db
       .prepare('INSERT OR IGNORE INTO pref_source_facts VALUES(?,?,?,?,?)')
       .run(
@@ -565,10 +801,13 @@ export class EvidenceDatabase {
   withdrawSource(owner: string): void {
     const sessions = this.db
       .prepare(
-        'SELECT DISTINCT source,session FROM pref_source_facts WHERE owner=?',
+        'SELECT source,session FROM pref_source_facts WHERE owner=? UNION SELECT source,session FROM pref_structured_witnesses WHERE owner=?',
       )
-      .all(owner)
+      .all(owner, owner)
     this.db.prepare('DELETE FROM pref_source_facts WHERE owner=?').run(owner)
+    this.db
+      .prepare('DELETE FROM pref_structured_witnesses WHERE owner=?')
+      .run(owner)
     this.derived(() => {
       for (const row of sessions)
         this.restoreSession({
@@ -651,16 +890,29 @@ export class EvidenceDatabase {
         Number(row.at),
         JSON.parse(String(row.rules)) as Constraint[],
       )
+    const calls = this.db.prepare(
+      'SELECT tool,questions,asked FROM pref_calls WHERE source=? AND session=?',
+    )
+    for (const row of calls.all(...args))
+      this.restoreStructuredResponse(
+        { ...session, toolUseId: String(row.tool) },
+        String(row.questions),
+        Number(row.asked),
+      )
     const offers = this.db
       .prepare(
-        'SELECT tool,question FROM pref_offers WHERE source=? AND session=?',
+        'SELECT tool,question,repo FROM pref_offers WHERE source=? AND session=?',
       )
       .all(...args)
-    for (const row of offers)
-      this.restoreDirectSelection(
-        { ...session, toolUseId: String(row.tool) },
+    for (const row of offers) {
+      const origin = { ...session, toolUseId: String(row.tool) }
+      this.restoreStructuredChoices(
+        origin,
         String(row.question),
+        String(row.repo),
       )
+      this.restoreDirectSelection(origin, String(row.question))
+    }
     for (const row of this.db
       .prepare(
         'SELECT DISTINCT hash FROM pref_typed_candidates WHERE source=? AND session=?',
@@ -856,13 +1108,13 @@ export class EvidenceDatabase {
         this.db.exec(dirty)
         return false
       }
-      return true
-    }
-    this.db
-      .prepare(
-        'INSERT INTO pref_offers(source,session,tool,question,options,repo,kind,signature,asked) VALUES(?,?,?,?,?,?,?,?,?)',
-      )
-      .run(...args, options, input.repo, kind, signature, input.askedAt)
+    } else
+      this.db
+        .prepare(
+          'INSERT INTO pref_offers(source,session,tool,question,options,repo,kind,signature,asked) VALUES(?,?,?,?,?,?,?,?,?)',
+        )
+        .run(...args, options, input.repo, kind, signature, input.askedAt)
+    this.restoreStructuredChoices(input, question, input.repo)
     return true
   }
 
@@ -1091,9 +1343,18 @@ export class EvidenceDatabase {
         'DELETE FROM pref_instruction_candidates WHERE source=? AND session=? AND hash=? AND at=? RETURNING rules',
       )
       .get(session.source, session.sessionId, digest(text.trim()), at)
-    if (!row) return
     const values = [session.source, session.sessionId, digest(text.trim()), at]
+    if (
+      !row &&
+      !this.db
+        .prepare(
+          'SELECT 1 FROM pref_cancelled_instructions WHERE source=? AND session=? AND hash=? AND at=?',
+        )
+        .get(...values)
+    )
+      return
     this.insertPrimary('pref_cancelled_instructions', session, values)
+    if (!row) return
     for (const rule of JSON.parse(String(row.rules)) as Constraint[]) {
       const removed = this.db
         .prepare(
@@ -1368,20 +1629,18 @@ export class EvidenceDatabase {
     at: number,
   ): void {
     const hash = digest(text.trim())
-    const rejected = this.db
-      .prepare(
-        'INSERT OR IGNORE INTO pref_misdirected_typed SELECT source,session,tool,question,hash,at FROM pref_typed_candidates WHERE source=? AND session=? AND tool=? AND question=? AND hash=? AND at=?',
-      )
-      .run(...fields(origin), cleanQuestion(question), hash, at)
-    if (rejected.changes) {
-      this.primary('pref_misdirected_typed', origin, [
-        ...fields(origin),
-        cleanQuestion(question),
-        hash,
-        at,
-      ])
+    const values = [...fields(origin), cleanQuestion(question), hash, at]
+    if (
+      !this.db
+        .prepare(
+          'SELECT 1 FROM pref_typed_candidates WHERE source=? AND session=? AND tool=? AND question=? AND hash=? AND at=?',
+        )
+        .get(...values)
+    )
+      return
+    // Each native correction independently rejects this pairing, even when another transcript already materialized the rejection.
+    if (this.insertPrimary('pref_misdirected_typed', origin, values).changes)
       this.reconcileTyped(origin, hash, at)
-    }
   }
 
   /** Preserve an independently human-authored text reply when a separate role-only mirror later becomes ambiguous.

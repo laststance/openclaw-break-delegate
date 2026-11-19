@@ -81,6 +81,8 @@ export async function startService(
       .get(id) as unknown as PendingReceipt | undefined
   }
   const activeAsks = new Set<string>()
+  // Only the live service that evaluated the original cards can authorize their emission.
+  const deliveryChecks = new Map<string, () => string | undefined>()
   const stopSignal = new AbortController()
   const probe = new LocalActivityProbe({ codexHome: options.roots?.codex, now })
   const poll = options.poll ?? ((c) => probe.poll(c))
@@ -242,6 +244,7 @@ export async function startService(
         'SELECT receipt,sessionId,questionId,breakId FROM bd_delivery_receipts WHERE expired=0 AND expires<=?',
       )
       .all(now())) {
+      deliveryChecks.delete(String(row.receipt))
       coordinator.settleAnswer(
         String(row.sessionId),
         String(row.questionId),
@@ -533,32 +536,27 @@ export async function startService(
         coordinator.hold(sessionId, questionId, 'Confirmation unavailable')
         return null
       }
-      // History import and a new explicit instruction can change eligibility while the model is answering.
-      for (const [index, card] of cards.entries()) {
-        const fresh = preferences.evaluate(card, {
-          cwd,
-          now: now(),
-          session: { source: 'claude', sessionId },
-        })
-        if (fresh.eligibleLabel !== payload[index]!.candidate) {
-          coordinator.hold(
-            sessionId,
-            questionId,
-            fresh.reason ?? 'Preference changed during confirmation',
-          )
-          return null
+      // Reuse the original policy inputs at claim time and at the final hook authorization.
+      const blockingReason = (): string | undefined => {
+        if (
+          db
+            .prepare('SELECT 1 FROM bd_incomplete_prompts WHERE incarnation=?')
+            .get(incarnation)
+        )
+          return 'An instruction exceeded the hook input limit'
+        for (const [index, card] of cards.entries()) {
+          const fresh = preferences.evaluate(card, {
+            cwd,
+            now: now(),
+            session: { source: 'claude', sessionId },
+          })
+          if (fresh.eligibleLabel !== payload[index]!.candidate)
+            return fresh.reason ?? 'Preference changed during confirmation'
         }
       }
-      if (
-        db
-          .prepare('SELECT 1 FROM bd_incomplete_prompts WHERE incarnation=?')
-          .get(incarnation)
-      ) {
-        coordinator.hold(
-          sessionId,
-          questionId,
-          'An instruction exceeded the hook input limit',
-        )
+      const reason = blockingReason()
+      if (reason) {
+        coordinator.hold(sessionId, questionId, reason)
         return null
       }
       const authorizedBreak = coordinator.status().break
@@ -596,15 +594,25 @@ export async function startService(
         )
       )
         return null
+      deliveryChecks.set(receipt, blockingReason)
       return { answers, receipt, deliverBefore: authorizedBreak.endsAt }
     } finally {
       activeAsks.delete(id)
     }
   }
   /** Check the original live card again when the Gateway returns a claim and immediately before the hook emits it. */
-  function mayDeliver(receipt: PendingReceipt | undefined): boolean {
-    if (!receipt || !receipt.incarnation || receipt.emitted || receipt.applied)
+  function mayDeliver(id: unknown): boolean {
+    const receipt = getReceipt(id)
+    if (
+      !receipt?.incarnation ||
+      receipt.emitted ||
+      receipt.applied ||
+      typeof id !== 'string'
+    )
       return false
+    const check = deliveryChecks.get(id)
+    if (!check || check() !== undefined) return false
+    // Policy replay can take time. Sample the clock again before accepting the original recipient.
     const at = now()
     return (
       at < receipt.expires &&
@@ -624,6 +632,7 @@ export async function startService(
       )
       .get(receiptId)
     if (!row) return
+    deliveryChecks.delete(receiptId)
     coordinator.settleAnswer(
       String(row.sessionId),
       String(row.questionId),
@@ -643,6 +652,7 @@ export async function startService(
       receipt.applied
     )
       return false
+    deliveryChecks.delete(id)
     coordinator.discardUndelivered(receipt.sessionId, receipt.questionId)
     if (
       preferences.releaseUndelivered(
@@ -723,8 +733,7 @@ export async function startService(
         const value = await onHook(r, ctx)
         tick()
         if (isObject(value) && typeof value.receipt === 'string') {
-          const claim = getReceipt(value.receipt)
-          if (!mayDeliver(claim)) {
+          if (!mayDeliver(value.receipt)) {
             retireUndelivered(value.receipt)
             return null
           }
@@ -732,7 +741,7 @@ export async function startService(
         return value
       }
       case 'can-deliver': {
-        return mayDeliver(getReceipt(r.receipt))
+        return mayDeliver(r.receipt)
       }
       case 'undelivered':
         return retireUndelivered(r.receipt)

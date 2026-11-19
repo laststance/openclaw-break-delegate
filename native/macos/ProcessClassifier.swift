@@ -39,10 +39,10 @@ private let nodeSwitches = Set("""
 --permission --permission-audit --preserve-symlinks --preserve-symlinks-main --prof --report-compact
 --report-exclude-env --report-exclude-network --report-on-fatalerror --report-on-process-timeout
 --report-on-signal --report-uncaught-exception --throw-deprecation --tls-max-v1.2 --tls-max-v1.3 --tls-min-v1.0
---tls-min-v1.1 --tls-min-v1.2 --tls-min-v1.3 --trace-deprecation --trace-env --trace-env-js-stack
+--tls-min-v1.1 --tls-min-v1.2 --tls-min-v1.3 --trace-gc --trace_gc --trace-deprecation --trace-env --trace-env-js-stack
 --trace-env-native-stack --trace-exit --trace-promises --trace-sigint --trace-sync-io --trace-tls
 --trace-uncaught --trace-warnings --track-heap-objects --use-bundled-ca --use-env-proxy --use-openssl-ca
---use-system-ca --webstorage --zero-fill-buffers
+--use-system-ca --warnings --require-module --webstorage --zero-fill-buffers
 """.split(whereSeparator: { $0.isWhitespace }).map(String.init))
 
 private let nodeOtherModes = Set("""

@@ -1,4 +1,9 @@
 import { typedQuestionId, typedResponseId } from '../preferences/index.js'
+import {
+  codexReplyLink,
+  fromDecisionBrief,
+  linkedBrief,
+} from '../preferences/records.js'
 import { constants } from 'node:fs'
 import { open, realpath, type FileHandle } from 'node:fs/promises'
 import { isAbsolute, relative, resolve, sep } from 'node:path'
@@ -117,6 +122,11 @@ interface Request {
   automatic: boolean
   questions: Map<string, Set<string> | null>
 }
+interface ObservedQuestion {
+  tool: string
+  messageId?: string
+  answered?: true
+}
 interface Turn {
   state: Activity
   pending: Map<string, Request | null>
@@ -129,7 +139,13 @@ interface Turn {
     }
   >
   nextPruneAt: number
-  previousQuestion?: { id: string; text: string }
+  recentQuestions: ObservedQuestion[]
+  previousQuestion?: {
+    question: ObservedQuestion
+    text: string
+    at: number
+    item: boolean
+  }
 }
 function unknownTurn(): Turn {
   return {
@@ -137,6 +153,7 @@ function unknownTurn(): Turn {
     pending: new Map(),
     calls: new Map(),
     nextPruneAt: 0,
+    recentQuestions: [],
   }
 }
 interface Tail {
@@ -229,6 +246,52 @@ function ordinaryReply(text: string): boolean {
   return /^(?:yes|no|y|n|sure|okay|ok|go ahead|please do|do it|option [1-9]|[1-9]|はい|いいえ|お願い(?:します)?|進めて(?:ください)?|[1-9１-９](?:番|番目))[.!。！]?$/iu.test(
     text.trim(),
   )
+}
+
+/** Retain native offer identities for explicit replies while limiting unlinked replies to the preceding question.
+ * Called by {@link applyEvent} for both supported assistant message envelopes.
+ * @example observeQuestion(turn, { message: 'Proceed?', id: 'q' }, at, false)
+ */
+function observeQuestion(
+  turn: Turn,
+  payload: Json,
+  at: number,
+  item: boolean,
+): void {
+  const previous = turn.previousQuestion
+  turn.previousQuestion = undefined
+  const text = payload.message
+  if (
+    typeof text !== 'string' ||
+    (payload.phase !== undefined && payload.phase !== 'final_answer') ||
+    (!/[?？]\s*$/u.test(text) && !fromDecisionBrief(text, at))
+  )
+    return
+  const messageId =
+    (typeof payload.id === 'string' && payload.id) ||
+    (typeof payload.message_id === 'string' && payload.message_id) ||
+    undefined
+  // A legacy mirror can omit the ID that its completed native item supplies.
+  if (
+    previous &&
+    previous.text === text &&
+    (previous.item !== item || previous.at === at) &&
+    Math.abs(previous.at - at) <= 2000 &&
+    (!previous.question.messageId ||
+      !messageId ||
+      previous.question.messageId === messageId)
+  ) {
+    previous.question.messageId ??= messageId
+    turn.previousQuestion = previous
+    return
+  }
+  const question: ObservedQuestion = {
+    tool: typedQuestionId(text, at),
+    messageId,
+  }
+  turn.recentQuestions.push(question)
+  if (turn.recentQuestions.length > 8) turn.recentQuestions.shift()
+  turn.previousQuestion = { question, text, at, item }
 }
 
 /** Unwrap native TUI items while excluding hook prompts, generated context and tool output. */
@@ -439,29 +502,18 @@ function applyEvent(
       if (p.type === 'turn_aborted' || p.type === 'turn_failed')
         turn.previousQuestion = undefined
     } else if (p.type === 'agent_message') {
-      turn.previousQuestion = undefined
-      // Require a directly preceding completed assistant question, not a tool log or quoted prompt.
-      if (
-        typeof p.message === 'string' &&
-        /[?？]\s*$/u.test(p.message) &&
-        (p.phase === 'final_answer' || p.phase === undefined)
-      ) {
-        turn.previousQuestion = {
-          text: p.message,
-          id:
-            typeof p.id === 'string' && p.id
-              ? p.id
-              : typeof p.message_id === 'string' && p.message_id
-                ? p.message_id
-                : typedQuestionId(p.message, at),
-        }
-      }
+      observeQuestion(turn, p, at, payload.type === 'item_completed')
     } else if (p.type === 'user_message') {
-      const previous = turn.previousQuestion
+      const replyTo = codexReplyLink(payload, object(payload.item) ?? {})
+      const target =
+        replyTo !== undefined
+          ? linkedBrief(turn.recentQuestions, replyTo)
+          : turn.previousQuestion?.question
       turn.previousQuestion = undefined
       const text = p.message
       if (
-        !previous ||
+        !target ||
+        target.answered ||
         typeof text !== 'string' ||
         !text.trim() ||
         text.startsWith('<') ||
@@ -473,17 +525,13 @@ function applyEvent(
         (p.author && !['user', 'human'].includes(String(p.author)))
       )
         return
-      if (
-        p.reply_to !== previous.id &&
-        p.in_reply_to !== previous.id &&
-        !ordinaryReply(text)
-      )
-        return
+      if (replyTo === undefined && !ordinaryReply(text)) return
+      target.answered = true
       const answerKey = typedResponseId(
         text,
         at,
         typeof p.client_id === 'string' ? p.client_id : undefined,
-        previous.id,
+        target.messageId || target.tool,
       )
       record(answerKey)
     } else if (

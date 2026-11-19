@@ -490,7 +490,22 @@ export function instructionConstraints(
       approvalText,
     )
   }
-  if (asksForApproval(text)) return [{ kind: '*', required: '*' }]
+  // A polite request can join two imperatives with a comma, "and then" or "but also".
+  const clauses = text
+    .split(
+      /\s*(?:[,;、]\s*(?:(?:and|but)\s+)?|\b(?:and|but)\s+)(?:(?:then|also)\s+)?|ただし\s*/u,
+    )
+    .map((clause) => clause.trim())
+    .filter(Boolean)
+  const addressedRequest =
+    /^(?:(?:can|could|would|will) you\b|please\b|explain\b|describe\b|tell me\b)/u.test(
+      text,
+    )
+  if (
+    asksForApproval(text) ||
+    (addressedRequest && clauses.slice(1).some(asksForApproval))
+  )
+    return [{ kind: '*', required: '*' }]
   // A question asking for information does not impose a standing constraint. Polite requests can still contain an explicit limit.
   if (
     !explicit &&
@@ -499,12 +514,10 @@ export function instructionConstraints(
       text,
     )
   ) {
-    const clauses = text
-      .split(/\b(?:and|but)\s+|[,;、]|ただし\s*/u)
+    const directives = clauses
       .slice(1)
-      .map((clause) => clause.trim())
       .filter((clause) => restriction.test(clause) || asksForApproval(clause))
-    return clauses.flatMap((clause) =>
+    return directives.flatMap((clause) =>
       instructionConstraints(clause.replace(/[?？]$/u, ''), true),
     )
   }
@@ -551,6 +564,18 @@ export function instructionConstraints(
           : ['response-language', 'documentation-language']
       ).map((kind) => ({ kind, required: '*' }))
     }
+  }
+  // An explicit preference with an unfamiliar qualifier still blocks a conflicting guess on that topic.
+  const imperative =
+    /^(?:(?:can|could|would|will) you\s+)?(?:please\s+)?(?:run|rerun|use|write|fix|address|repair|file|defer|keep|choose|summarize|provide|reply|answer)\b|(?:してください|でお願いします|をお願いします)[。.!！]?$/u.test(
+      text,
+    )
+  if (imperative && !restriction.test(text) && !operation.test(text)) {
+    const topics = decisionTypes.filter(
+      (type) => type.topic.test(text) && meanings(text, type).length > 0,
+    )
+    if (topics.length)
+      return topics.map((type) => ({ kind: type.kind, required: '*' }))
   }
   return explicit || restriction.test(text) || isStandingReplyInstruction(text)
     ? [{ kind: '*', required: '*' }]
