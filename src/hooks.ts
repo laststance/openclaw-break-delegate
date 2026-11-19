@@ -300,7 +300,7 @@ export async function runHook(
         directory,
         { op: 'can-deliver', receipt: v.receipt },
         1200,
-      )
+      ).catch(() => false)
       if (live !== true || Date.now() >= v.deliverBefore) {
         await requestGateway(
           directory,

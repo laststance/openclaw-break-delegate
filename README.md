@@ -23,11 +23,15 @@ openclaw break-delegate authorize-notifications
 openclaw break-delegate status
 ```
 
-`setup` preserves existing Claude settings and registers the hook executable from this install. Run it again after moving or updating the installation. A custom settings file can be selected with `setup --settings /absolute/path/to/settings.json`. Installing against a settings file hands its Break Delegate hooks to that profile. Removal affects hooks owned by the selected profile. Setup compares the file immediately before replacing it; another editor writing at that exact instant cannot share its lock. Start an interactive Claude session to establish an identifiable terminal instance. Notification permission can also be granted from the Break Delegate menu.
+`setup` registers the hook executable from this installation. Run it again after moving or updating the package. Use `setup --settings /absolute/path/to/settings.json` for a custom Claude settings file. Installing against that file hands its Break Delegate hooks to the selected profile. Removal affects hooks owned by that profile.
+
+On macOS, the packaged helper can atomically exchange an existing settings file and preserve the exact previous file. If setup detects a competing edit, it reports the conflict and keeps recovery copies in the private `settings.json.break-delegate-backups/` directory beside the settings file. Start an interactive Claude session to establish an identifiable terminal instance. Notification permission can also be granted from the Break Delegate menu.
 
 ## Take a break
 
 The plugin uses a rolling 60-minute window. Each minute with an active session earns 1 point plus 0.1 per additional concurrent session. A verified human response earns 4 points. A terminal waiting for input contributes no running time. At 45 points the Mac offers a break. Four agents testing unattended for 30 minutes earn 39 points. One agent running for 30 minutes with five human answers earns 50.
+
+For Codex, elapsed running time requires a live app-server observation. A local rollout can establish an explicit wait, completed turn or human answer. An open turn by itself leaves its running time unknown because some execution approvals do not appear in the rollout.
 
 Dismiss the invitation to silence it until the score falls below 45 and reaches it again, or snooze it for 15 minutes. Accepting fixes the participating terminals at that moment. New question cards in those terminals can receive replies for up to 15 minutes. Existing cards, execution approvals, conflicting instructions and questions with insufficient evidence wait for you. Other work continues. On return the workload score starts at zero.
 

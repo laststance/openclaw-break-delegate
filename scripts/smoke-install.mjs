@@ -17,6 +17,11 @@ import { fileURLToPath } from 'node:url'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
+const hostDirectory = join(root, 'node_modules/openclaw')
+const hostPackage = JSON.parse(
+  readFileSync(join(hostDirectory, 'package.json'), 'utf8'),
+)
+const hostExecutable = join(hostDirectory, hostPackage.bin.openclaw)
 const expectedArchive =
   manifest.name.replace(/^@/, '').replaceAll('/', '-') +
   '-' +
@@ -49,7 +54,7 @@ const env = {
   CLAUDE_CONFIG_DIR: join(tmp, 'claude'),
 }
 const host = (args) =>
-  execFileSync('openclaw', args, {
+  execFileSync(process.execPath, [hostExecutable, ...args], {
     cwd: root,
     env,
     encoding: 'utf8',
@@ -112,13 +117,10 @@ try {
   await once(portProbe, 'listening')
   const port = portProbe.address().port
   await new Promise((done) => portProbe.close(done))
-  const hostPackage = JSON.parse(
-    readFileSync(join(root, 'node_modules/openclaw/package.json'), 'utf8'),
-  )
   const gateway = spawn(
     process.execPath,
     [
-      join(root, 'node_modules/openclaw', hostPackage.bin.openclaw),
+      hostExecutable,
       'gateway',
       'run',
       '--allow-unconfigured',

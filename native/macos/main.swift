@@ -13,6 +13,19 @@ func writeFrame(_ message: [String: Any]) {
 // A notification delivered after gateway shutdown may relaunch the bundle without its pipe.
 // Ignore that launch before registering delegates, showing a window or handling any action.
 let arguments = CommandLine.arguments
+// An atomic exchange leaves the exact displaced settings file available to the CLI for recovery.
+if arguments.count >= 2, arguments[1] == "--exchange-settings" {
+    guard arguments.count == 4 else { exit(64) }
+    if renamex_np(arguments[2], arguments[3], UInt32(RENAME_SWAP)) == 0 {
+        print("exchanged")
+        exit(0)
+    }
+    if errno == ENOTSUP || errno == ENOSYS || errno == EINVAL {
+        print("unsupported")
+        exit(0)
+    }
+    exit(1)
+}
 if arguments.count >= 2, arguments[1] == "--classify-claude-process" {
     let kind = arguments.count == 3 ? Int32(arguments[2]).map(classifyClaudeProcess) : nil
     print((kind ?? .unknown).rawValue)

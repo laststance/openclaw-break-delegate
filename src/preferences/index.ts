@@ -17,9 +17,14 @@ import {
 import type { QuestionCard } from './policy.js'
 import { canonicalRepository } from './repository.js'
 
-export { typedResponseId } from './database.js'
+export { typedResponseId, typedQuestionId } from './database.js'
 export { canonicalRepository } from './repository.js'
-export { classifyCard, normalizeQuestionCard, isTypedReply } from './policy.js'
+export {
+  classifyCard,
+  normalizeQuestionCard,
+  isTypedReply,
+  isStandingReplyInstruction,
+} from './policy.js'
 export { hasAnswerNotes } from './records.js'
 export type {
   EvidenceSource,

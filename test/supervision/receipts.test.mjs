@@ -73,66 +73,158 @@ test('successful or failed native tool completion releases only its own held per
   assert.equal(status(), 'running')
 })
 
-test('a permission without a tool ID is held for the original matched operation and cannot be released by a separate tool', (t) => {
+test('an ID-less permission survives a matching completion when an identical parallel call lost its pre-hook', (t) => {
   // Arrange
-  const { s, start, event, status } = setup(t)
-  const original = { command: 'pnpm test', timeout: 10 }
-  event('PreToolUse', 't1', original)
-  event('PermissionRequest', undefined, { timeout: 10, command: 'pnpm test' })
-  const breakId = start()
-  // Act
-  event('PreToolUse', 't2', { command: 'pnpm lint' })
-  assert.equal(event('PostToolUse', 't2', { command: 'pnpm lint' }), false)
-  // Assert
-  assert.equal(status(), 'waiting')
-  assert.equal(s.review(breakId)[0].outcome, 'held')
-  assert.equal(event('PostToolUse', 't1', original), true)
-  assert.equal(status(), 'running')
-  assert.equal(s.review(breakId)[0].outcome, 'resolved')
-})
-
-test('indistinguishable in-flight tools keep the anonymous approval held until every candidate ends', (t) => {
-  // Arrange
-  const { s, start, event, status } = setup(t)
+  const { s, start, event, status, context, advance } = setup(t)
   const id = start(),
     input = { command: 'same' }
-  event('PreToolUse', 'x', input)
-  event('PreToolUse', 'y', input)
+  event('PreToolUse', 'visible', input)
   event('PermissionRequest', undefined, input)
   // Act
-  assert.equal(event('PostToolUse', 'x', input), false)
+  assert.equal(event('PostToolUse', 'visible', input), false)
+  assert.equal(event('PostToolUseFailure', 'missing-pre', input), false)
+  s.observe({ provider: 'claude', ...context, status: 'idle' })
+  // Assert
   assert.equal(status(), 'waiting')
   assert.equal(s.review(id)[0].outcome, 'held')
-  assert.equal(event('PostToolUseFailure', 'y', input), true)
-  // Assert
-  assert.equal(status(), 'running')
+  s.observe({
+    provider: 'claude',
+    ...context,
+    status: 'idle',
+    turnEnded: true,
+    at: advance(),
+  })
+  assert.equal(status(), 'idle')
   assert.equal(s.review(id)[0].outcome, 'resolved')
 })
 
-test('a missing pre-hook can be recovered by one unique matching completion in the same incarnation', (t) => {
+test('a delayed turn end clears only approvals that predate its provider timestamp', (t) => {
   // Arrange
-  const { s, start, event, status } = setup(t)
+  const { s, start, event, context, advance } = setup(t)
   const id = start(),
-    input = { command: 'ls' }
-  event('PermissionRequest', undefined, input)
+    input = { command: 'same' }
+  event('PermissionRequest', 'denied', input)
+  const ended = advance()
+  event('PermissionRequest', 'later', input)
   // Act
-  assert.equal(
-    s.observeExecution({
-      event: 'PostToolUse',
-      sessionId: 'terminal',
-      incarnation: 'wrong',
-      toolName: 'Bash',
-      toolUseId: 'other',
-      fingerprint: toolInputFingerprint(input),
-    }),
-    false,
-  )
-  assert.equal(event('PostToolUse', 'foreign', { command: 'different' }), false)
-  assert.equal(status(), 'waiting')
-  assert.equal(event('PostToolUse', 'correct', input), true)
+  s.observe({
+    provider: 'claude',
+    ...context,
+    status: 'idle',
+    turnEnded: true,
+    at: ended,
+  })
   // Assert
+  assert.deepEqual(
+    s
+      .review(id)
+      .map((row) => [row.questionId, row.outcome])
+      .sort(),
+    [
+      ['approval:denied', 'resolved'],
+      ['approval:later', 'held'],
+    ],
+  )
+  assert.equal(event('PostToolUse', 'later', input), true)
+})
+
+test('failed approval registration, tool completion and terminal closure preserve the original permission for retry', (t) => {
+  // Arrange
+  const { db, s, start, event, status, context } = setup(t)
+  const id = start(),
+    input = { command: 'test' }
+  const fail = (sql) =>
+    db.exec(
+      'CREATE TRIGGER interrupt ' +
+        sql +
+        " BEGIN SELECT RAISE(ABORT,'write interrupted'); END",
+    )
+  const recover = () => db.exec('DROP TRIGGER interrupt')
+  // Act
+  fail('BEFORE INSERT ON sv_questions')
+  assert.throws(() => event('PermissionRequest', 'a', input), /interrupted/)
+  recover()
+  assert.equal(status(), 'running')
+  assert.equal(event('PermissionRequest', 'a', input), true)
+  fail('BEFORE UPDATE ON sv_reviews')
+  assert.throws(() => event('PostToolUse', 'a', input), /interrupted/)
+  assert.throws(
+    () => s.observe({ provider: 'claude', ...context, status: 'closed' }),
+    /interrupted/,
+  )
+  recover()
+  // Assert
+  assert.equal(status(), 'waiting')
+  assert.equal(s.review(id)[0].outcome, 'held')
+  s.action(id, 'return')
+  assert.equal(event('PostToolUse', 'a', input), true)
+  assert.equal(event('PostToolUse', 'a', input), false)
   assert.equal(s.review(id)[0].outcome, 'resolved')
   assert.equal(status(), 'running')
+})
+
+test('a receipt authorizes delivery only while its original claimed question and terminal are still waiting', (t) => {
+  // Arrange
+  const { s, start, context } = setup(t)
+  const id = start()
+  for (const q of ['cancel', 'close']) {
+    s.question({ ...context, questionId: q, question: 'Which?' })
+    assert.equal(s.isPendingDelivery('terminal', q, id, 'one'), false)
+    assert.equal(
+      s.commitAnswer(
+        { ...context, breakId: id, questionId: q, answer: 'First' },
+        () => true,
+      ),
+      true,
+    )
+  }
+  // Act
+  assert.equal(s.isPendingDelivery('terminal', 'cancel', id, 'one'), true)
+  assert.equal(s.isPendingDelivery('terminal', 'cancel', id, 'two'), false)
+  assert.equal(s.isPendingDelivery('terminal', 'cancel', 'other', 'one'), false)
+  s.resolveQuestion('terminal', 'cancel', 'failed')
+  // Assert
+  assert.equal(s.isPendingDelivery('terminal', 'cancel', id, 'one'), false)
+  assert.equal(s.isPendingDelivery('terminal', 'close', id, 'one'), true)
+  s.observe({ provider: 'claude', ...context, status: 'closed' })
+  assert.equal(s.isPendingDelivery('terminal', 'close', id, 'one'), false)
+  assert.deepEqual(
+    s.review(id).map((row) => row.outcome),
+    ['pending', 'pending'],
+  )
+})
+
+test('a complete roster omission and duplicate startup leave the open card on its original terminal generation', (t) => {
+  // Arrange
+  const { s, start, context, advance, status } = setup(t)
+  const id = start(),
+    generation = s.status().sessions[0].generation
+  s.question({ ...context, questionId: 'card', question: 'Which?' })
+  // Act
+  s.snapshot('claude-agents', [], {
+    at: advance(),
+    status: 'available',
+    detail: 'Missing',
+  })
+  assert.equal(status(), 'waiting')
+  s.observe({
+    provider: 'claude',
+    ...context,
+    status: 'idle',
+    newSession: true,
+    canDelegate: true,
+    at: advance(),
+  })
+  // Assert
+  assert.equal(s.status().sessions[0].generation, generation)
+  assert.equal(s.review(id)[0].outcome, 'held')
+  assert.equal(
+    s.commitAnswer(
+      { ...context, breakId: id, questionId: 'card', answer: 'First' },
+      () => true,
+    ),
+    true,
+  )
 })
 
 test('confirmed zero-byte delivery clears the proposed answer, holds the original question, and consumes the claim', (t) => {
@@ -260,9 +352,10 @@ test('multi-frame local review returns every original receipt exactly once after
     /another break/,
   )
   const pages = [initial]
-  while (pages.at(-1).nextCursor)
+  while (pages.at(-1).nextCursor && pages.length < ids.length)
     pages.push(s.reviewPage({ cursor: pages.at(-1).nextCursor }))
   // Assert
+  assert.equal(pages.at(-1).nextCursor, null)
   const rows = pages.flatMap((p) => p.rows)
   assert.ok(Buffer.byteLength(JSON.stringify(rows)) > 256 * 1024)
   assert.deepEqual(

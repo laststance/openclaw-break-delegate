@@ -35,152 +35,133 @@ export function toolInputFingerprint(input: unknown): string | undefined {
 
 interface Attempt {
   toolName: string
-  fingerprint?: string
   at: number
   completed: boolean
 }
-interface Approval {
-  toolName: string
-  fingerprint?: string
-  at: number
-  candidates: string[]
-}
 interface Group {
   attempts: Map<string, Attempt>
-  approvals: Map<string, Approval>
+  approvals: Map<string, number>
   lastSeen: number
+  endedAt: number
 }
 interface Matches {
   registered?: string
   completed: string[]
 }
 
-/**
- * Correlate read-only hook events within an exact native terminal incarnation.
- * A missing permission ID can refer to several concurrent identical invocations.
- * In that case every candidate must finish before the wait is released.
+/** Correlate exact tool IDs in a terminal. Anonymous permissions await a confirmed turn or session end.
  * @example tracker.observe(generation, observation, Date.now())
  */
 export class ExecutionApprovals {
-  readonly #groups = new Map<string, Group>()
+  #groups = new Map<string, Group>()
 
-  /** Keep earlier native event ordering comparable to new hooks after the wall clock moves. */
-  rebaseClock(delta: number): void {
-    for (const group of this.#groups.values()) {
-      group.lastSeen += delta
-      for (const attempt of group.attempts.values()) attempt.at += delta
-      for (const wait of group.approvals.values()) wait.at += delta
+  /** Roll back the copy-on-write tracker if a card update or its SQLite commit fails.
+   * @example tracker.transaction(() => persistCards())
+   */
+  transaction<T>(write: () => T): T {
+    const previous = this.#groups
+    this.#groups = new Map(previous)
+    try {
+      return write()
+    } catch (error) {
+      this.#groups = previous
+      throw error
     }
   }
 
-  /** A confirmed terminal exit makes all its outstanding native correlation records obsolete. */
+  #edit(generation: string, at: number): Group {
+    const previous = this.#groups.get(generation)
+    const group = {
+      attempts: new Map(previous?.attempts),
+      approvals: new Map(previous?.approvals),
+      lastSeen: Math.max(at, previous?.lastSeen ?? at),
+      endedAt: previous?.endedAt ?? -Infinity,
+    }
+    this.#groups.set(generation, group)
+    return group
+  }
+  /** Keep native event ordering comparable after the wall clock moves. */
+  rebaseClock(delta: number): void {
+    for (const [id, previous] of this.#groups) {
+      const group = this.#edit(id, previous.lastSeen)
+      group.lastSeen += delta
+      group.endedAt += delta
+      for (const [key, attempt] of group.attempts)
+        group.attempts.set(key, { ...attempt, at: attempt.at + delta })
+      for (const [key, at] of group.approvals)
+        group.approvals.set(key, at + delta)
+    }
+  }
+  /** Forget the native records once the original terminal closes. */
   close(generation: string): void {
     this.#groups.delete(generation)
   }
 
+  /** Retire only permissions that predate a confirmed end of the main agent response.
+   * @example tracker.endTurn(generation, stopAt)
+   */
+  endTurn(generation: string, at: number): string[] {
+    const group = this.#edit(generation, at)
+    group.endedAt = Math.max(group.endedAt, at)
+    const ended: string[] = []
+    for (const [key, opened] of group.approvals) {
+      if (opened > at) continue
+      group.approvals.delete(key)
+      ended.push(key)
+    }
+    for (const [key, attempt] of group.attempts)
+      if (!attempt.completed && attempt.at <= at)
+        group.attempts.set(key, { ...attempt, completed: true })
+    return ended
+  }
   observe(
     generation: string,
     input: ExecutionObservation,
     at: number,
   ): Matches {
-    for (const [key, group] of this.#groups) {
+    for (const [id, group] of this.#groups)
       if (!group.approvals.size && group.lastSeen < at - 3_600_000)
-        this.#groups.delete(key)
-    }
-    let group = this.#groups.get(generation)
-    if (!group) {
-      group = { attempts: new Map(), approvals: new Map(), lastSeen: at }
-      this.#groups.set(generation, group)
-    }
-    group.lastSeen = Math.max(at, group.lastSeen)
-    // Completed IDs briefly absorb duplicated or reordered hooks. Outstanding waits retain their candidates.
-    for (const [id, attempt] of group.attempts) {
-      if (
-        attempt.completed &&
-        attempt.at < at - 3_600_000 &&
-        ![...group.approvals.values()].some((wait) =>
-          wait.candidates.includes(id),
-        )
-      )
-        group.attempts.delete(id)
-    }
+        this.#groups.delete(id)
+    const group = this.#edit(generation, at)
+    const result: Matches = { completed: [] }
+    if (at <= group.endedAt) return result
+    for (const [key, attempt] of group.attempts)
+      if (attempt.completed && attempt.at < at - 3_600_000)
+        group.attempts.delete(key)
     const { toolUseId: id, toolName, fingerprint } = input
     const attempt = id ? group.attempts.get(id) : undefined
-    const result: Matches = { completed: [] }
-    if (attempt && attempt.toolName !== toolName) return result
+    if (
+      attempt &&
+      (attempt.toolName !== toolName || at < attempt.at || attempt.completed)
+    )
+      return result
     if (input.event === 'PreToolUse') {
       if (id && !attempt)
-        group.attempts.set(id, { toolName, fingerprint, at, completed: false })
+        group.attempts.set(id, { toolName, at, completed: false })
       return result
     }
     if (input.event === 'PermissionRequest') {
-      if (attempt?.completed) return result
-      const candidates = id
-        ? [id]
-        : [...group.attempts]
-            .filter(
-              ([, other]) =>
-                !other.completed &&
-                other.at <= at &&
-                other.toolName === toolName &&
-                !!fingerprint &&
-                other.fingerprint === fingerprint,
-            )
-            .map(([key]) => key)
-            .sort()
       if (id && !attempt)
-        group.attempts.set(id, { toolName, fingerprint, at, completed: false })
-      const key =
-        candidates.length === 1
-          ? 'approval:' + candidates[0]
-          : 'approval:unidentified:' +
-            createHash('sha256')
-              .update(
-                JSON.stringify([
-                  generation,
-                  at,
-                  toolName,
-                  fingerprint,
-                  candidates,
-                ]),
-              )
-              .digest('hex')
+        group.attempts.set(id, { toolName, at, completed: false })
+      // Even one identical pre-hook cannot rule out a second tool whose pre-hook was lost.
+      const key = id
+        ? 'approval:' + id
+        : 'approval:unidentified:' +
+          createHash('sha256')
+            .update(JSON.stringify([generation, at, toolName, fingerprint]))
+            .digest('hex')
       if (!group.approvals.has(key)) {
-        group.approvals.set(key, { toolName, fingerprint, at, candidates })
+        group.approvals.set(key, at)
         result.registered = key
       }
       return result
     }
-    if (!id || attempt?.completed || (attempt && at < attempt.at)) return result
-    group.attempts.set(id, {
-      toolName,
-      fingerprint: attempt?.fingerprint ?? fingerprint,
-      at,
-      completed: true,
-    })
-    const anonymous: string[] = []
-    for (const [key, wait] of group.approvals) {
-      if (wait.toolName !== toolName || wait.at > at) continue
-      if (
-        wait.candidates.includes(id) &&
-        wait.candidates.every(
-          (candidate) => group.attempts.get(candidate)?.completed,
-        )
-      ) {
-        result.completed.push(key)
-      } else if (
-        !wait.candidates.length &&
-        fingerprint &&
-        wait.fingerprint === fingerprint &&
-        (!attempt || attempt.at <= wait.at)
-      ) {
-        // A post without a recorded pre can resolve one unique, exact anonymous fingerprint.
-        anonymous.push(key)
-      }
-    }
-    if (anonymous.length === 1 && result.completed.length === 0)
-      result.completed.push(anonymous[0])
-    for (const key of result.completed) group.approvals.delete(key)
+    if (!id) return result
+    const key = 'approval:' + id,
+      opened = group.approvals.get(key)
+    if (opened !== undefined && opened > at) return result
+    group.attempts.set(id, { toolName, at, completed: true })
+    if (group.approvals.delete(key)) result.completed.push(key)
     return result
   }
 }

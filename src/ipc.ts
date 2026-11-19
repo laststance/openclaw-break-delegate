@@ -1,11 +1,19 @@
-import { createHash, randomUUID } from 'node:crypto'
-import { chmod, lstat, mkdir, unlink } from 'node:fs/promises'
+import { randomBytes } from 'node:crypto'
+import { chmod, lstat, rm, rmdir, unlink } from 'node:fs/promises'
 import { DatabaseSync } from 'node:sqlite'
-import { realpathSync } from 'node:fs'
 import { resolveStateDir } from 'openclaw/plugin-sdk/state-paths'
-import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
-import { createConnection, createServer, type Socket } from 'node:net'
+import { dirname, join, resolve } from 'node:path'
+import { createConnection, type Socket } from 'node:net'
+import { connect, createServer } from 'node:tls'
+import {
+  gatewayEndpoint,
+  gatewayIdentity,
+  gatewayTls,
+  keyBytes,
+  privateDirectory,
+  publishGatewayKey,
+  readGatewayKey,
+} from './ipc-auth.js'
 
 const maxFrame = 256 * 1024
 export type ObjectValue = Record<string, unknown>
@@ -27,14 +35,6 @@ export function dataDirectory(stateDir?: string): string {
     process.env.BREAK_DELEGATE_STATE_DIR ||
       join(stateDir || resolveStateDir(), 'break-delegate'),
   )
-}
-
-function socketAddress(directory: string): string {
-  const key = createHash('sha256')
-    .update(realpathSync(directory))
-    .digest('hex')
-    .slice(0, 20)
-  return join(tmpdir(), 'bd-' + (process.getuid?.() ?? 'user') + '-' + key, 's')
 }
 
 /** A Gateway result may release a provisional delivery when its hook connection disappears. */
@@ -71,48 +71,57 @@ function readFrame(socket: Socket, receive: (value: unknown) => void): void {
  * @example
  * const status = await requestGateway(dataDirectory(), { op: "status" });
  */
-export function requestGateway(
+export async function requestGateway(
   directory: string,
   request: ObjectValue,
   timeout = 4500,
 ): Promise<unknown> {
+  const endpoint = gatewayEndpoint(directory)
+  const psk = await readGatewayKey(endpoint)
   return new Promise((success, failure) => {
-    const socket = createConnection(socketAddress(directory))
+    const socket = connect({
+      ...gatewayTls,
+      path: endpoint.address,
+      pskCallback: () => ({ identity: gatewayIdentity, psk }),
+      // The PSK handshake authenticates this profile without an X.509 hostname.
+      checkServerIdentity: () => undefined,
+    })
     const timer = setTimeout(
       () => socket.destroy(new Error('Break Delegate Gateway timed out.')),
       timeout,
     )
-    socket.once('connect', () => socket.write(JSON.stringify(request) + '\n'))
     socket.once('error', failure)
     socket.once('close', () => {
       clearTimeout(timer)
       failure(new Error('Break Delegate Gateway closed the connection.'))
     })
-    readFrame(socket, (frame) => {
-      if (isObject(frame) && frame.ok === true) success(frame.value)
-      else
-        failure(
-          new Error(
-            isObject(frame) && typeof frame.error === 'string'
-              ? frame.error
-              : 'Break Delegate request failed.',
-          ),
-        )
-      socket.destroy()
+    socket.once('secureConnect', () => {
+      if (!socket.authorized) {
+        socket.destroy(new Error('Gateway authentication failed.'))
+        return
+      }
+      readFrame(socket, (frame) => {
+        if (isObject(frame) && frame.ok === true) success(frame.value)
+        else
+          failure(
+            new Error(
+              isObject(frame) && typeof frame.error === 'string'
+                ? frame.error
+                : 'Break Delegate request failed.',
+            ),
+          )
+        socket.destroy()
+      })
+      try {
+        const body = JSON.stringify(request)
+        if (Buffer.byteLength(body) > maxFrame)
+          throw new Error('Oversized local request.')
+        socket.write(body + '\n')
+      } catch {
+        socket.destroy(new Error('Invalid or oversized local request.'))
+      }
     })
   })
-}
-
-async function privateDirectory(path: string): Promise<void> {
-  await mkdir(path, { recursive: true, mode: 0o700 })
-  const st = await lstat(path)
-  if (
-    !st.isDirectory() ||
-    st.isSymbolicLink() ||
-    (process.getuid && st.uid !== process.getuid())
-  )
-    throw new Error('Local state directory must be owned by this user.')
-  await chmod(path, 0o700)
 }
 
 /** Bind the user-private socket before opening the coordinator's writable database.
@@ -124,49 +133,59 @@ export async function listenGateway(
   handler: Handler,
 ): Promise<() => Promise<void>> {
   await privateDirectory(directory)
-  const address = socketAddress(directory)
-  await privateDirectory(resolve(address, '..'))
+  const { profile, address, keyFile } = gatewayEndpoint(directory)
+  const socketDirectory = dirname(address)
+  const psk = randomBytes(keyBytes)
   const clients = new Set<Socket>()
-  const server = createServer((socket) => {
-    clients.add(socket)
-    const abort = new AbortController()
-    socket.setTimeout(60_000, () => socket.destroy())
-    socket.on('error', () => socket.destroy())
-    socket.on('close', () => {
-      abort.abort()
-      clients.delete(socket)
-    })
-    const ctx = {
-      signal: abort.signal,
-      connected: () => !socket.destroyed && !abort.signal.aborted,
-    }
-    readFrame(socket, (msg) => {
-      if (!isObject(msg)) {
-        socket.destroy()
-        return
+  const server = createServer(
+    {
+      ...gatewayTls,
+      handshakeTimeout: 4500,
+      pskCallback: (_socket, identity) =>
+        identity === gatewayIdentity ? psk : null,
+    },
+    (socket) => {
+      const abort = new AbortController()
+      socket.setTimeout(60_000, () => socket.destroy())
+      socket.on('error', () => socket.destroy())
+      socket.once('close', () => abort.abort())
+      const ctx = {
+        signal: abort.signal,
+        connected: () => !socket.destroyed && !abort.signal.aborted,
       }
-      if (
-        msg.op === 'authorize-notifications' ||
-        msg.op === 'import' ||
-        msg.op === 'replay'
-      )
-        socket.setTimeout(190000)
-      void handler(msg, ctx).then(
-        (value) => {
-          if (ctx.connected())
-            socket.end(JSON.stringify({ ok: true, value }) + '\n')
-        },
-        () => {
-          if (ctx.connected())
-            socket.end(
-              JSON.stringify({
-                ok: false,
-                error: 'Local operation failed. Check Gateway diagnostics.',
-              }) + '\n',
-            )
-        },
-      )
-    })
+      readFrame(socket, (msg) => {
+        if (!isObject(msg)) {
+          socket.destroy()
+          return
+        }
+        if (
+          msg.op === 'authorize-notifications' ||
+          msg.op === 'import' ||
+          msg.op === 'replay'
+        )
+          socket.setTimeout(190000)
+        void handler(msg, ctx).then(
+          (value) => {
+            if (ctx.connected())
+              socket.end(JSON.stringify({ ok: true, value }) + '\n')
+          },
+          () => {
+            if (ctx.connected())
+              socket.end(
+                JSON.stringify({
+                  ok: false,
+                  error: 'Local operation failed. Check Gateway diagnostics.',
+                }) + '\n',
+              )
+          },
+        )
+      })
+    },
+  )
+  // Include raw clients that are still negotiating TLS when startup or shutdown ends.
+  server.on('connection', (socket) => {
+    clients.add(socket)
+    socket.once('close', () => clients.delete(socket))
   })
   const bind = () =>
     new Promise<void>((ok, reject) => {
@@ -183,7 +202,25 @@ export async function listenGateway(
       server.listen(address)
     })
   // The OS releases this SQLite file lock when its owner exits, including after a crash.
-  const owner = new DatabaseSync(join(resolve(address, '..'), 'owner.sqlite'))
+  const owner = new DatabaseSync(join(profile, 'owner.sqlite'))
+  let published = false
+  let fallbackReady = false
+  let closing: Promise<void> | undefined
+  const stop = async () => {
+    try {
+      for (const socket of clients) socket.destroy()
+      if (server.listening)
+        await new Promise<void>((done) => server.close(() => done()))
+      if (published) await rm(keyFile, { force: true })
+      if (fallbackReady)
+        await rmdir(socketDirectory).catch((error: NodeJS.ErrnoException) => {
+          if (error.code !== 'ENOENT' && error.code !== 'ENOTEMPTY') throw error
+        })
+    } finally {
+      owner.close()
+    }
+  }
+  const close = () => (closing ??= stop())
   try {
     owner.exec('BEGIN EXCLUSIVE')
   } catch (error) {
@@ -196,6 +233,10 @@ export async function listenGateway(
     throw error
   }
   try {
+    if (socketDirectory !== profile) {
+      await privateDirectory(socketDirectory)
+      fallbackReady = true
+    }
     try {
       await bind()
     } catch (err) {
@@ -205,11 +246,18 @@ export async function listenGateway(
       if (!old.isSocket() || (process.getuid && old.uid !== process.getuid()))
         throw err
       try {
-        await requestGateway(
-          directory,
-          { op: 'ping', nonce: randomUUID() },
-          1000,
-        )
+        // A connect-only probe can detect a stale socket without sending a hook or credential.
+        await new Promise<void>((ok, fail) => {
+          const probe = createConnection(address)
+          probe.once('connect', () => {
+            probe.destroy()
+            ok()
+          })
+          probe.once('error', fail)
+          probe.setTimeout(1000, () =>
+            probe.destroy(new Error('Gateway probe timed out.')),
+          )
+        })
         throw err
       } catch (probe) {
         if ((probe as NodeJS.ErrnoException).code !== 'ECONNREFUSED') throw err
@@ -220,16 +268,11 @@ export async function listenGateway(
       await bind()
     }
     await chmod(address, 0o600)
+    await publishGatewayKey(keyFile, psk)
+    published = true
   } catch (error) {
-    owner.close()
+    await close()
     throw error
   }
-  return async () => {
-    for (const socket of clients) socket.destroy()
-    try {
-      await new Promise<void>((done) => server.close(() => done()))
-    } finally {
-      owner.close()
-    }
-  }
+  return close
 }

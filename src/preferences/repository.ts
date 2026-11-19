@@ -42,9 +42,9 @@ function remoteIdentity(value: string): string | null {
   const host = remote.hostname.toLowerCase()
   if (remote.protocol === 'ssh:' && remote.pathname.startsWith('/~'))
     return null
-  const path = remote.pathname
-    .replace(/^\/+|\/+$/gu, '')
-    .replace(/\.git$/iu, '')
+  const literalPath = remote.pathname.replace(/^\/+|\/+$/gu, '')
+  const path =
+    host === 'github.com' ? literalPath.replace(/\.git$/iu, '') : literalPath
   if (!path || !path.includes('/')) return null
   // Generic SSH servers interpret a relative SCP path inside the named account's home. GitHub owner/repository paths have host-wide meaning.
   if (host !== 'github.com' && remote.protocol === 'ssh:') {
@@ -53,7 +53,7 @@ function remoteIdentity(value: string): string | null {
       'remote:' +
       digest(
         JSON.stringify([
-          'ssh',
+          'ssh-literal-path',
           remote.host.toLowerCase(),
           remote.username,
           relativeSsh ? 'home' : 'absolute',
@@ -65,7 +65,8 @@ function remoteIdentity(value: string): string | null {
   return (
     'remote:' +
     digest(
-      remote.host.toLowerCase() +
+      (host === 'github.com' ? '' : 'literal-path:') +
+        remote.host.toLowerCase() +
         '/' +
         (host === 'github.com' ? path.toLowerCase() : path),
     )

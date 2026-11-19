@@ -13,6 +13,8 @@ export interface Observation {
   canDelegate?: boolean
   incarnation?: string
   newSession?: boolean
+  /** True only for the original main-agent Stop hook. */
+  turnEnded?: boolean
   /** Provider observation time, in Unix milliseconds. */
   at?: number
 }
@@ -58,8 +60,13 @@ export const minute = 60_000
  * Resolve independent views of one provider session at a single instant.
  * Blocked cards and explicit user waits take precedence over concurrent views reporting work.
  */
-function statusAt(session: Session, at: number): Activity {
+function statusAt(
+  session: Session,
+  at: number,
+  includeUnconfirmedWaits = true,
+): Activity {
   if (session.closed) return 'closed'
+  if (includeUnconfirmedWaits && session.waiting.size) return 'waiting'
   const live = [...session.samples.entries()].filter(
     ([, s]) => s.at <= at && at < s.until,
   )
@@ -228,14 +235,13 @@ export class Workload {
       session &&
       !session.closed &&
       !!event.incarnation &&
-      session.incarnation === event.incarnation &&
-      (session.missingFromRosterAt ?? -Infinity) < session.lastHook
+      session.incarnation === event.incarnation
     // A duplicate or delayed SessionStart cannot erase a newer workload state or a live card.
     if (
       starting &&
       session &&
       sameTerminal &&
-      statusAt(session, now) !== 'unknown'
+      statusAt(session, now, false) !== 'unknown'
     )
       return
     if (!session || (starting && !sameTerminal)) {
@@ -301,7 +307,7 @@ export class Workload {
         session.missingFromRosterAt = at
       }
       const previous = session.samples.get(source)
-      if (previous && previous.at <= at && !found.has(key)) {
+      if (completeRoster && previous && previous.at <= at && !found.has(key)) {
         this.#account(session, now)
         session.samples.delete(source)
       }
@@ -339,7 +345,7 @@ export class Workload {
       sessionId: id,
       generation: session.generation,
       canDelegate: session.canDelegate,
-      status: statusAt(session, now),
+      status: statusAt(session, now, false),
     }
   }
 
@@ -352,14 +358,14 @@ export class Workload {
     else session.waiting.delete(question)
   }
 
-  views(now: number): SessionView[] {
+  views(now: number, includeUnconfirmedWaits = true): SessionView[] {
     return [...this.#sessions.values()].map((s) => ({
       provider: s.provider,
       client: s.client,
       sessionId: s.sessionId,
       generation: s.generation,
       canDelegate: s.canDelegate,
-      status: statusAt(s, now),
+      status: statusAt(s, now, includeUnconfirmedWaits),
     }))
   }
 

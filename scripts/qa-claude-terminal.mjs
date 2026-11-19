@@ -288,7 +288,7 @@ const terminal = spawn(
   [driver, run, claude, sessionId, address, fakeKey],
   { stdio: ['ignore', 'ignore', 'inherit'] },
 )
-const terminalEnded = once(terminal, 'exit')
+const terminalEnded = once(terminal, 'close')
 try {
   const transcriptFolder = join(config, 'projects')
   const until = Date.now() + 55_000
@@ -367,15 +367,37 @@ try {
   )
   console.log('Real Claude session completed with the delegated answer.')
 } finally {
-  await writeFile(
-    join(run, 'evidence.json'),
-    JSON.stringify(evidence, null, 2) + '\n',
-    { mode: 0o600 },
-  )
-  await writeFile(join(run, 'stop'), '')
-  const [exitCode] = await terminalEnded
-  server.closeAllConnections()
-  await new Promise((done) => server.close(done))
-  await stop()
-  assert.equal(exitCode, 0, 'The isolated PTY did not exit cleanly.')
+  try {
+    await writeFile(
+      join(run, 'evidence.json'),
+      JSON.stringify(evidence, null, 2) + '\n',
+      { mode: 0o600 },
+    )
+  } finally {
+    try {
+      await writeFile(join(run, 'stop'), '').catch(() =>
+        terminal.kill('SIGTERM'),
+      )
+      const waitForExit = (ms) =>
+        Promise.race([terminalEnded, delay(ms, null, { ref: false })])
+      let exited = await waitForExit(8000)
+      if (!exited) {
+        terminal.kill('SIGTERM')
+        exited = await waitForExit(5000)
+      }
+      if (!exited) {
+        terminal.kill('SIGKILL')
+        exited = await waitForExit(2000)
+      }
+      assert.equal(exited?.[0], 0, 'The isolated PTY did not exit cleanly.')
+    } finally {
+      try {
+        const closed = new Promise((done) => server.close(done))
+        server.closeAllConnections()
+        await closed
+      } finally {
+        await stop()
+      }
+    }
+  }
 }

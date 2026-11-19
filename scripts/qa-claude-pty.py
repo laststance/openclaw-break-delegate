@@ -59,6 +59,11 @@ if pid == 0:
     os.execve(args[0], args, env)
 
 deadline = time.monotonic() + 65
+def terminate_driver(_signal, _frame):
+    # The JS runner can request cleanup even if its stop file cannot be written.
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, terminate_driver)
 ansi = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[=>]")
 with (run_dir / "terminal.txt").open("w", encoding="utf-8") as log:
     try:

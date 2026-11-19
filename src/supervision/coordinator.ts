@@ -150,6 +150,7 @@ export class Supervision {
   readonly #snoozeMs: number
   readonly #invitationMs: number
   readonly #approvals = new ExecutionApprovals()
+  #writing = false
   #coverage = new Map<string, Coverage>()
   #lastAt: number
 
@@ -188,16 +189,20 @@ export class Supervision {
   }
 
   #transaction<T>(apply: () => T): T {
+    if (this.#writing) return apply()
     this.#db.exec('BEGIN IMMEDIATE')
+    this.#writing = true
     const lastAt = this.#lastAt,
       coverage = this.#coverage
     this.#coverage = new Map(coverage)
     try {
-      const result = this.#work.transaction(() => {
-        const result = apply()
-        this.#db.exec('COMMIT')
-        return result
-      })
+      const result = this.#work.transaction(() =>
+        this.#approvals.transaction(() => {
+          const result = apply()
+          this.#db.exec('COMMIT')
+          return result
+        }),
+      )
       if (this.#lastAt < lastAt)
         this.#approvals.rebaseClock(this.#lastAt - lastAt)
       return result
@@ -206,6 +211,8 @@ export class Supervision {
       this.#coverage = coverage
       if (this.#db.isTransaction) this.#db.exec('ROLLBACK')
       throw error
+    } finally {
+      this.#writing = false
     }
   }
 
@@ -305,7 +312,7 @@ export class Supervision {
 
   #supervising(now: number) {
     return this.#work
-      .views(now)
+      .views(now, false)
       .some((s) => s.status === 'running' || s.status === 'waiting')
   }
 
@@ -376,6 +383,31 @@ export class Supervision {
             now,
           )
         this.#approvals.close(previous.generation)
+      }
+      if (
+        lifecycle &&
+        observation.turnEnded &&
+        observation.status === 'idle' &&
+        observation.incarnation
+      ) {
+        const terminal = this.#work.claude(
+          observation.sessionId,
+          observation.incarnation,
+          now,
+        )
+        const at = observation.at ?? now
+        if (terminal && Number.isFinite(at) && at <= now)
+          for (const questionId of this.#approvals.endTurn(
+            terminal.generation,
+            at,
+          ))
+            this.#resolveApproval(
+              observation.sessionId,
+              terminal.generation,
+              questionId,
+              'The native turn ended before this approval completed',
+              now,
+            )
       }
       if (
         lifecycle &&
@@ -557,7 +589,7 @@ export class Supervision {
 
   /**
    * Track a local Claude operation without granting permission or inferring a human reply.
-   * Original tool IDs win; an ID-less permission uses the exact terminal, tool and input fingerprint.
+   * Only the original tool ID resolves an individual permission. Anonymous waits require a native turn or session boundary.
    * @example supervisor.observeExecution({event:'PostToolUse',sessionId:'s',incarnation:'p',toolUseId:'t',toolName:'Bash'})
    */
   observeExecution(input: ExecutionObservation): boolean {
@@ -572,67 +604,82 @@ export class Supervision {
     )
       return false
     if (now < this.#lastAt) this.tick()
-    const base = {
-      provider: 'claude' as const,
-      sessionId: input.sessionId,
-      incarnation: input.incarnation,
-      canDelegate: true,
-      at,
-    }
-    let currentTerminal = this.#work.claude(
-      input.sessionId,
-      input.incarnation,
-      now,
-    )
-    const isOpening =
-      input.event === 'PreToolUse' || input.event === 'PermissionRequest'
-    if (!currentTerminal && isOpening) {
-      this.observe({ ...base, status: 'running' })
-      currentTerminal = this.#work.claude(
+    return this.#transaction(() => {
+      const base = {
+        provider: 'claude' as const,
+        sessionId: input.sessionId,
+        incarnation: input.incarnation,
+        canDelegate: true,
+        at,
+      }
+      let currentTerminal = this.#work.claude(
         input.sessionId,
         input.incarnation,
         now,
       )
-    }
-    if (!currentTerminal) return false
-    if (input.event === 'PreToolUse' && input.toolUseId)
-      this.observe({
-        ...base,
-        status: currentTerminal.status === 'waiting' ? 'waiting' : 'running',
-      })
-    const match = this.#approvals.observe(currentTerminal.generation, input, at)
-    if (match.registered) {
-      if (this.#card(input.sessionId, match.registered)?.live === 0)
-        return false
-      this.observe({ ...base, status: 'waiting' })
-      this.question({
-        sessionId: input.sessionId,
-        questionId: match.registered,
-        incarnation: input.incarnation,
-        kind: 'approval',
-        question: 'Execution approval for ' + input.toolName,
-        openedAt: at,
-      })
-    }
-    if (match.completed.length) {
-      this.#transaction(() => {
-        for (const questionId of match.completed) {
-          this.#db
-            .prepare(
-              "UPDATE sv_questions SET live=0,disposition='resolved' WHERE sessionId=? AND questionId=? AND kind='approval' AND generation=?",
-            )
-            .run(input.sessionId, questionId, currentTerminal.generation)
-          this.#db
-            .prepare(
-              "UPDATE sv_reviews SET outcome='resolved',reason='Tool completed; the approval is no longer pending',at=? WHERE sessionId=? AND questionId=? AND outcome='held' AND breakId IN (SELECT id FROM sv_breaks WHERE endedAt IS NULL)",
-            )
-            .run(now, input.sessionId, questionId)
-          this.#work.setWaiting(input.sessionId, questionId, false, now)
-        }
-      })
-      this.observe({ ...base, status: 'running' })
-    }
-    return !!match.registered || match.completed.length > 0
+      const isOpening =
+        input.event === 'PreToolUse' || input.event === 'PermissionRequest'
+      if (!currentTerminal && isOpening) {
+        this.observe({ ...base, status: 'running' })
+        currentTerminal = this.#work.claude(
+          input.sessionId,
+          input.incarnation,
+          now,
+        )
+      }
+      if (!currentTerminal) return false
+      if (input.event === 'PreToolUse' && input.toolUseId)
+        this.observe({
+          ...base,
+          status: currentTerminal.status === 'waiting' ? 'waiting' : 'running',
+        })
+      const match = this.#approvals.observe(
+        currentTerminal.generation,
+        input,
+        at,
+      )
+      if (match.registered) {
+        if (this.#card(input.sessionId, match.registered)?.live === 0)
+          return false
+        this.observe({ ...base, status: 'waiting' })
+        this.question({
+          sessionId: input.sessionId,
+          questionId: match.registered,
+          incarnation: input.incarnation,
+          kind: 'approval',
+          question: 'Execution approval for ' + input.toolName,
+          openedAt: at,
+        })
+      }
+      if (match.completed.length) {
+        for (const questionId of match.completed)
+          this.#resolveApproval(
+            input.sessionId,
+            currentTerminal.generation,
+            questionId,
+            'Tool completed; the approval is no longer pending',
+            now,
+          )
+        this.observe({ ...base, status: 'running' })
+      }
+      return !!match.registered || match.completed.length > 0
+    })
+  }
+
+  #resolveApproval(
+    sessionId: string,
+    generation: string,
+    questionId: string,
+    reason: string,
+    now: number,
+  ) {
+    const card = this.#card(sessionId, questionId)
+    if (
+      card?.kind === 'approval' &&
+      card.live &&
+      card.generation === generation
+    )
+      this.#resolveQuestion(sessionId, questionId, reason, now)
   }
 
   /** Consume a correlated native action; callbacks from expired invitations or old breaks fail closed. */
@@ -671,7 +718,7 @@ export class Supervision {
       this.#db
         .prepare('INSERT INTO sv_breaks VALUES(?,?,?,NULL)')
         .run(breakId, now, now + this.#breakMs)
-      for (const s of this.#work.views(now)) {
+      for (const s of this.#work.views(now, false)) {
         if (
           s.provider !== 'claude' ||
           !s.canDelegate ||
@@ -948,6 +995,42 @@ export class Supervision {
       )
       return false
     }
+  }
+
+  /**
+   * Recheck the original waiting terminal before its hook writes an already claimed answer.
+   * The gateway calls this read-only gate when the hook presents its opaque delivery receipt.
+   * @example supervisor.isPendingDelivery('session', 'question', 'break', 'terminal')
+   */
+  isPendingDelivery(
+    sessionId: string,
+    questionId: string,
+    breakId: string,
+    incarnation: string,
+  ): boolean {
+    if (!incarnation) return false
+    const now = this.#now(),
+      active = this.#active(),
+      card = this.#card(sessionId, questionId)
+    if (
+      !active ||
+      active.id !== breakId ||
+      now < this.#lastAt ||
+      now < active.startedAt ||
+      now >= active.expiresAt ||
+      !card?.live ||
+      card.disposition !== 'pending' ||
+      card.candidate !== breakId ||
+      card.kind !== 'choice'
+    )
+      return false
+    const session = this.#work.claude(sessionId, incarnation, now)
+    return (
+      !!session?.canDelegate &&
+      session.status === 'waiting' &&
+      session.generation === card.generation &&
+      this.#member(breakId, sessionId, session.generation)
+    )
   }
 
   /** Settle only an earlier claim, including when completion arrives just after the break ends. */

@@ -1,6 +1,7 @@
 import { strict as assert } from 'node:assert'
-import { spawn, spawnSync } from 'node:child_process'
+import childProcess, { spawn, spawnSync } from 'node:child_process'
 import { EventEmitter, once } from 'node:events'
+import { syncBuiltinESMExports } from 'node:module'
 import {
   existsSync,
   mkdirSync,
@@ -16,6 +17,7 @@ import {
   createNativeBreakUi,
   nativeHelperExecutable,
 } from '../../dist/native/index.js'
+import { claudeTerminal } from '../../dist/terminal.js'
 
 const fixture = fileURLToPath(new URL('./pipe-fixture.mjs', import.meta.url))
 const repo = fileURLToPath(new URL('../../', import.meta.url))
@@ -70,71 +72,79 @@ test(
   },
 )
 
-test('late receipts silently refresh only their returned review while later break actions remain available', async (t) => {
-  // Arrange
-  const { ui, commands, children, actions, events } = gateway(t)
-  const waiting = {
-    answered: [],
-    held: [{ question: 'Which option?', reason: 'Awaiting delivery' }],
-  }
-  const sent = {
-    answered: [{ question: 'Which option?', answer: 'First' }],
-    held: [],
-  }
-  await ui.summary('first-break', waiting)
-  await ui.active('later-break', Date.now() + 900_000)
-
-  // Act
-  await ui.refreshSummary('first-break', sent)
-  await ui.refreshSummary('unknown-break', waiting)
-  const accepted = once(events, 'action')
-  children[0].send({
-    frames: [{ type: 'action', id: 'later-break', kind: 'return' }],
-  })
-  await accepted
-  await ui.summary('later-break', waiting)
-  while (commands.length < 4) await once(events, 'command')
-  await ui.refreshSummary('first-break', waiting)
-
-  // Assert
-  assert.deepEqual(
-    commands.map(({ kind, id }) => [kind, id]),
-    [
-      ['summary', 'first-break'],
-      ['active', 'later-break'],
-      ['refreshSummary', 'first-break'],
-      ['summary', 'later-break'],
-    ],
-  )
-  assert.equal(commands[2].review.answered[0].answer, 'First')
-  assert.deepEqual(actions, [{ kind: 'return', id: 'later-break' }])
-})
-
-test('reconnecting after a settled receipt restores the corrected review without a second banner', async (t) => {
-  // Arrange
-  const { ui, children, events } = gateway(t, { retryMs: 10 })
-  await Promise.all([
-    once(events, 'command'),
-    ui.summary('returned', { answered: [], held: [] }),
-  ])
-  await Promise.all([
-    once(events, 'command'),
-    ui.refreshSummary('returned', {
+test(
+  'late receipts silently refresh only their returned review while later break actions remain available',
+  { timeout: 5000 },
+  async (t) => {
+    // Arrange
+    const { ui, commands, children, actions, events } = gateway(t)
+    const waiting = {
       answered: [],
-      held: [{ question: 'Which option?', reason: 'Delivery failed' }],
-    }),
-  ])
-  const reconnected = once(events, 'command')
+      held: [{ question: 'Which option?', reason: 'Awaiting delivery' }],
+    }
+    const sent = {
+      answered: [{ question: 'Which option?', answer: 'First' }],
+      held: [],
+    }
+    await ui.summary('first-break', waiting)
+    await ui.active('later-break', Date.now() + 900_000)
 
-  // Act
-  children[0].kill('SIGKILL')
-  const [restored] = await reconnected
+    // Act
+    await ui.refreshSummary('first-break', sent)
+    await ui.refreshSummary('unknown-break', waiting)
+    const accepted = once(events, 'action')
+    children[0].send({
+      frames: [{ type: 'action', id: 'later-break', kind: 'return' }],
+    })
+    await accepted
+    await ui.summary('later-break', waiting)
+    while (commands.length < 4) await once(events, 'command')
+    await ui.refreshSummary('first-break', waiting)
 
-  // Assert
-  assert.equal(restored.kind, 'summary')
-  assert.equal(restored.silent, true)
-  assert.equal(restored.review.held[0].reason, 'Delivery failed')
-})
+    // Assert
+    assert.deepEqual(
+      commands.map(({ kind, id }) => [kind, id]),
+      [
+        ['summary', 'first-break'],
+        ['active', 'later-break'],
+        ['refreshSummary', 'first-break'],
+        ['summary', 'later-break'],
+      ],
+    )
+    assert.equal(commands[2].review.answered[0].answer, 'First')
+    assert.deepEqual(actions, [{ kind: 'return', id: 'later-break' }])
+  },
+)
+
+test(
+  'reconnecting after a settled receipt restores the corrected review without a second banner',
+  { timeout: 5000 },
+  async (t) => {
+    // Arrange
+    const { ui, children, events } = gateway(t, { retryMs: 10 })
+    await Promise.all([
+      once(events, 'command'),
+      ui.summary('returned', { answered: [], held: [] }),
+    ])
+    await Promise.all([
+      once(events, 'command'),
+      ui.refreshSummary('returned', {
+        answered: [],
+        held: [{ question: 'Which option?', reason: 'Delivery failed' }],
+      }),
+    ])
+    const reconnected = once(events, 'command')
+
+    // Act
+    children[0].kill('SIGKILL')
+    const [restored] = await reconnected
+
+    // Assert
+    assert.equal(restored.kind, 'summary')
+    assert.equal(restored.silent, true)
+    assert.equal(restored.review.held[0].reason, 'Delivery failed')
+  },
+)
 
 /** Runs an isolated helper process and records both ends of its pipe for assertions. */
 function gateway(t, { onChoice, ...options } = {}) {
@@ -173,32 +183,116 @@ function gateway(t, { onChoice, ...options } = {}) {
   return { children, commands, actions, events, ui, profileKeys }
 }
 
-test('rejected consent requires a second explicit action on a restored invitation', async (t) => {
+test(
+  'rejected consent requires a second explicit action on a restored invitation',
+  { timeout: 5000 },
+  async (t) => {
+    // Arrange
+    const { ui, children, actions, events } = gateway(t, {
+      onChoice: (action) =>
+        action.kind === 'start' ? 'restore-invitation' : undefined,
+    })
+    await Promise.all([once(events, 'command'), ui.invite('still-open')])
+    const restored = once(events, 'command')
+
+    // Act
+    children[0].send({
+      frames: [{ type: 'action', kind: 'start', id: 'still-open' }],
+    })
+    const [invitation] = await restored
+    const second = once(events, 'action')
+    children[0].send({
+      frames: [{ type: 'action', kind: 'dismiss', id: 'still-open' }],
+    })
+    await second
+
+    // Assert
+    assert.deepEqual([invitation.kind, invitation.id], ['invite', 'still-open'])
+    assert.deepEqual(actions, [
+      { kind: 'start', id: 'still-open' },
+      { kind: 'dismiss', id: 'still-open' },
+    ])
+  },
+)
+
+test(
+  'a full status queue still withdraws the native surface and coalesces duplicate clears',
+  { timeout: 5000 },
+  async (t) => {
+    // Arrange
+    const { ui, commands, events } = gateway(t)
+    await ui.invite('visible-invite')
+    const full = Array.from({ length: 32 }, () => ui.status())
+
+    // Act
+    const busy = ui.status()
+    const clears = Promise.all([ui.clear(), ui.clear()])
+    const ordinary = await Promise.all(full)
+    const withdrawn = await clears
+    while (!commands.some((command) => command.kind === 'clear'))
+      await once(events, 'command')
+
+    // Assert
+    assert.deepEqual(await busy, {
+      status: 'unavailable',
+      detail: 'The macOS helper is busy.',
+    })
+    assert.equal(
+      ordinary.every((result) => result.status === 'not-determined'),
+      true,
+    )
+    assert.deepEqual(withdrawn, [
+      { status: 'authorized' },
+      { status: 'authorized' },
+    ])
+    assert.equal(
+      commands.filter((command) => command.kind === 'clear').length,
+      1,
+    )
+  },
+)
+
+test('the hook recognizes a prerelease Claude terminal after native mode and TTY checks', (t) => {
   // Arrange
-  const { ui, children, actions, events } = gateway(t, {
-    onChoice: (action) =>
-      action.kind === 'start' ? 'restore-invitation' : undefined,
+  let mode = 'interactive'
+  let tty = 'ttys001'
+  const checks = []
+  const probe = t.mock.method(childProcess, 'execFileSync', (path, args) => {
+    if (path === '/bin/ps')
+      return (
+        '1 ' +
+        tty +
+        ' Fri Nov 20 14:12:00 2026 /Users/example/.local/share/claude/versions/2.1.328-beta.1'
+      )
+    assert.equal(path, nativeHelperExecutable)
+    checks.push(args)
+    return mode
   })
-  await Promise.all([once(events, 'command'), ui.invite('still-open')])
-  const restored = once(events, 'command')
+  syncBuiltinESMExports()
+  t.after(() => {
+    probe.mock.restore()
+    syncBuiltinESMExports()
+  })
 
   // Act
-  children[0].send({
-    frames: [{ type: 'action', kind: 'start', id: 'still-open' }],
-  })
-  const [invitation] = await restored
-  const second = once(events, 'action')
-  children[0].send({
-    frames: [{ type: 'action', kind: 'dismiss', id: 'still-open' }],
-  })
-  await second
+  const active = claudeTerminal()
+  mode = 'headless'
+  const printed = claudeTerminal()
+  mode = 'interactive'
+  tty = '??'
+  const detached = claudeTerminal()
 
   // Assert
-  assert.deepEqual([invitation.kind, invitation.id], ['invite', 'still-open'])
-  assert.deepEqual(actions, [
-    { kind: 'start', id: 'still-open' },
-    { kind: 'dismiss', id: 'still-open' },
-  ])
+  assert.equal(active, process.ppid + ':Fri Nov 20 14:12:00 2026')
+  assert.equal(printed, undefined)
+  assert.equal(detached, undefined)
+  assert.deepEqual(
+    checks,
+    Array.from({ length: 3 }, () => [
+      '--classify-claude-process',
+      String(process.ppid),
+    ]),
+  )
 })
 
 test('independent gateways launch their helpers with distinct stable profile scopes', async (t) => {

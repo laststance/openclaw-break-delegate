@@ -31,12 +31,8 @@ export function claudeTerminal(): string | undefined {
       )
       if (!match) return
       const [, parent, tty, started, command] = match
-      if (
-        /(?:^|\/)(?:claude(?:-code)?|node|versions\/\d+\.\d+\.\d+)$/.test(
-          command,
-        )
-      ) {
-        // Darwin provides the original argv boundaries; prompt prose cannot create a print-mode flag.
+      if (/(?:^|\/)(?:claude(?:-code)?|node|versions\/[^/]+)$/.test(command)) {
+        // Darwin validates the actual versioned executable, including prerelease suffixes, and its argv.
         const mode = execFileSync(
           nativeHelperExecutable,
           ['--classify-claude-process', String(pid)],

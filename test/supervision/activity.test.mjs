@@ -2,7 +2,15 @@ import { createServer } from 'node:http'
 import { once } from 'node:events'
 import { WebSocketServer } from 'ws'
 import assert from 'node:assert/strict'
-import { appendFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import {
+  appendFile,
+  mkdir,
+  mkdtemp,
+  open,
+  rename,
+  rm,
+  writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -18,6 +26,8 @@ import {
 } from '../../dist/supervision/activity.js'
 import { RolloutDetector } from '../../dist/supervision/codex-rollout.js'
 import { PreferenceStore } from '../../dist/preferences/index.js'
+import { startService } from '../../dist/service.js'
+import { requestGateway } from '../../dist/ipc.js'
 
 const now = Date.UTC(2026, 5, 1, 12)
 const ts = new Date(now).toISOString()
@@ -170,7 +180,7 @@ test('a live native rollout pauses while waiting and credits one exact structure
   await probe.poll(supervisor)
   // Assert
   assert.equal(supervisor.status().score, 4)
-  assert.equal(supervisor.status().sessions[0].status, 'running')
+  assert.equal(supervisor.status().sessions[0].status, 'unknown')
   assert.equal(
     supervisor.humanReply({
       provider: 'codex',
@@ -433,7 +443,7 @@ test('a direct human reply to the preceding native question counts while a new p
   ])
 })
 
-test('only a newly witnessed native reply survives rotation of the history that initially proved both typed answers', async (t) => {
+test('only a newly witnessed native reply survives a direct temporary workload withdrawal', async (t) => {
   // Arrange
   const { home, file } = await isolated(t)
   const question = event('agent_message', {
@@ -488,7 +498,7 @@ test('an incomplete or corrupted rollout stays unknown until a new turn boundary
     file,
     jsonl(session('cli'), event('task_started')) +
       'not a full event\n' +
-      JSON.stringify(event('task_started')),
+      JSON.stringify(event('task_complete')),
   )
   const detector = new RolloutDetector(home)
   // Act
@@ -497,7 +507,7 @@ test('an incomplete or corrupted rollout stays unknown until a new turn boundary
   const after = await detector.read([file])
   // Assert
   assert.equal(before.observations[0].status, 'unknown')
-  assert.equal(after.observations[0].status, 'running')
+  assert.equal(after.observations[0].status, 'idle')
 })
 
 test('an unreachable observer leaves explicit coverage while other native clients still contribute', async (t) => {
@@ -687,7 +697,7 @@ test('a live writer with no observed turn boundary reports partial coverage unti
   await probe.poll(supervisor)
   // Assert
   assert.equal(coverage(), 'partial')
-  await appendFile(file, jsonl(event('task_started')))
+  await appendFile(file, jsonl(event('task_complete')))
   await probe.poll(supervisor)
   assert.equal(coverage(), 'available')
 })
@@ -697,7 +707,7 @@ test('the bounded writer tail preserves a complete turn boundary and drops only 
   const { home, file, sessions } = await isolated(t)
   const second = join(sessions, 'rollout-inside.jsonl')
   const header = jsonl(session('cli'))
-  const boundary = jsonl(event('task_started'))
+  const boundary = jsonl(event('task_complete'))
   const padding = { type: 'ignored', payload: { padding: '' } }
   const occupied = Buffer.byteLength(boundary + jsonl(padding))
   padding.payload.padding = 'x'.repeat(2 * 1024 * 1024 - occupied)
@@ -709,7 +719,7 @@ test('the bounded writer tail preserves a complete turn boundary and drops only 
   const aligned = await detector.read([file])
   const interior = await detector.read([second])
   // Assert
-  assert.equal(aligned.observations[0].status, 'running')
+  assert.equal(aligned.observations[0].status, 'idle')
   assert.equal(interior.observations[0].status, 'unknown')
 })
 
@@ -765,5 +775,286 @@ test('verified rollout replies retry after an interrupted snapshot or credit and
   await probe.poll(interrupted)
   // Assert
   assert.deepEqual(attempts, ['tool:one', 'tool:two', 'tool:two'])
+  assert.equal(supervisor.status().score, 8)
+})
+
+test('rotating an open rollout cannot assign the old file’s reply to the replacement session', async (t) => {
+  // Arrange
+  const { home, file, sessions } = await isolated(t)
+  const next = join(sessions, 'rollout-replacement.jsonl')
+  await writeFile(
+    file,
+    jsonl(session('original'), input('first'), answer('first')),
+  )
+  await writeFile(
+    next,
+    jsonl(session('replacement'), input('second'), answer('second')),
+  )
+  const handle = await open(file)
+  const prototype = Object.getPrototypeOf(handle),
+    initial = await handle.stat(),
+    original = prototype.stat
+  await handle.close()
+  let rotated = false
+  t.mock.method(prototype, 'stat', async function (...args) {
+    const stat = await original.apply(this, args)
+    if (!rotated && stat.ino === initial.ino) {
+      rotated = true
+      await rename(next, file)
+    }
+    return stat
+  })
+  // Act
+  const detector = new RolloutDetector(home)
+  const before = await detector.read([file])
+  const after = await detector.read([file])
+  // Assert
+  assert.equal(rotated, true)
+  assert.deepEqual(
+    before.replies.map((r) => r.originId),
+    ['codex:original:tool:first'],
+  )
+  assert.deepEqual(
+    after.replies.map((r) => r.originId),
+    ['codex:replacement:tool:second'],
+  )
+})
+
+test('the first successful rollout sample after a read failure treats preexisting replies as history and only later appends as live', async (t) => {
+  // Arrange
+  const { home, file } = await isolated(t)
+  await writeFile(file, jsonl(session('cli'), input('old'), answer('old')))
+  const handle = await open(file),
+    proto = Object.getPrototypeOf(handle),
+    read = proto.read
+  await handle.close()
+  let reads = 0
+  t.mock.method(proto, 'read', async function (...args) {
+    if (++reads === 2) throw Error('initial read failed')
+    return read.apply(this, args)
+  })
+  const detector = new RolloutDetector(home)
+  // Act
+  const failed = await detector.read([file])
+  const initial = await detector.read([file])
+  await appendFile(file, jsonl(input('new'), answer('new')))
+  const appended = await detector.read([file])
+  // Assert
+  assert.equal(failed.partial, true)
+  assert.deepEqual(
+    initial.replies.map((r) => [r.responseId, r.observedLive]),
+    [['tool:old', false]],
+  )
+  assert.deepEqual(
+    appended.replies.map((r) => [r.responseId, r.observedLive]),
+    [['tool:new', true]],
+  )
+})
+
+test('an open rollout with no live provider status cannot charge time while a transient approval may be hidden', async (t) => {
+  // Arrange
+  const { home, file } = await isolated(t)
+  await writeFile(file, jsonl(session('cli'), event('task_started')))
+  const db = new DatabaseSync(':memory:')
+  t.after(() => db.close())
+  let clock = now,
+    provider = false
+  const supervisor = new Supervision(db, { now: () => clock })
+  const probe = new LocalActivityProbe({
+    codexHome: home,
+    now: () => clock,
+    readClaude: empty,
+    readWriters: async () => [file],
+    readCodex: async () => ({
+      observations: provider
+        ? [{ provider: 'codex', sessionId: 'cli', status: 'running' }]
+        : [],
+      detail: 'Local provider',
+    }),
+  })
+  // Act
+  await probe.poll(supervisor)
+  clock += 60000
+  await probe.poll(supervisor)
+  // Assert
+  assert.equal(supervisor.status().sessions[0].status, 'unknown')
+  assert.equal(supervisor.status().score, 0)
+  provider = true
+  await probe.poll(supervisor)
+  clock += 60000
+  await probe.poll(supervisor)
+  assert.equal(supervisor.status().sessions[0].status, 'running')
+  assert.equal(supervisor.status().score, 1)
+})
+
+test('ordinary native tool results cannot create permanent exclusions and marked unknown answers wait for their original question', async (t) => {
+  // Arrange
+  const { home, file } = await isolated(t)
+  await writeFile(
+    file,
+    jsonl(
+      session('cli'),
+      item('function_call', {
+        name: 'exec_command',
+        call_id: 'command',
+        arguments: '{}',
+      }),
+      answer('command', { timed_out: true }),
+      item('function_call_output', {
+        call_id: 'unknown',
+        output: '{"timed_out":true}',
+      }),
+      answer('early', { answers: {}, autoResolved: true }),
+    ),
+  )
+  const detector = new RolloutDetector(home)
+  // Act
+  const first = await detector.read([file])
+  await appendFile(
+    file,
+    jsonl(input('early'), answer('early'), input('valid'), answer('valid')),
+  )
+  const next = await detector.read([file])
+  // Assert
+  assert.deepEqual(first.excludedReplies, [])
+  assert.deepEqual(
+    [...new Set(next.excludedReplies.map((r) => r.responseId))],
+    ['tool:early'],
+  )
+  assert.deepEqual(
+    next.replies.map((r) => r.responseId),
+    ['tool:valid'],
+  )
+})
+
+test('replacing the Codex rollout reconciles an ambiguous typed reply through the gateway history import and restores only the confirmed answer', async (t) => {
+  // Arrange
+  const { home, file, sessions } = await isolated(t),
+    directory = join(home, 'gateway'),
+    history = join(home, 'history.jsonl')
+  const stamped = (offset, payload) => ({
+    timestamp: new Date(now + offset).toISOString(),
+    type: 'event_msg',
+    payload,
+  })
+  const question = (id, offset) =>
+    stamped(offset, {
+      type: 'agent_message',
+      id,
+      message:
+        'D1 — How should we handle an unrelated bug?\nA) Fix in this PR\nB) Open a separate issue\n<gstack-qid:scope>',
+    })
+  const response = (id, offset) =>
+    stamped(offset, { type: 'user_message', client_id: id, message: 'A' })
+  const receipt = (offset, id) => ({
+    session_id: 'cli',
+    ts: (now + offset) / 1000,
+    text: 'A',
+    client_id: id,
+  })
+  await writeFile(
+    file,
+    jsonl(session('cli'), question('q1', 100), response('r1', 500)),
+  )
+  await writeFile(history, jsonl(receipt(1000)))
+  const pass = async () => ({ status: 'not-determined' })
+  const stop = await startService({
+    directory,
+    now: () => now + 2000,
+    tickMs: 600000,
+    roots: { codex: home },
+    judge: async () => false,
+    log() {},
+    poll: async () => {},
+    nativeFactory: () => ({
+      status: pass,
+      authorize: pass,
+      invite: pass,
+      active: pass,
+      summary: pass,
+      clear: pass,
+      close() {},
+    }),
+  })
+  try {
+    const update = async () => {
+      await requestGateway(directory, { op: 'import' })
+      const status = await requestGateway(directory, { op: 'status' })
+      return status.supervision.score
+    }
+    assert.equal(await update(), 4)
+    // Act
+    const replacement = join(sessions, 'pending-replacement')
+    await writeFile(
+      replacement,
+      jsonl(session('cli'), question('q2', 800), response('r2', 1200)),
+    )
+    await rename(replacement, file)
+    // Assert
+    assert.equal(await update(), 0)
+    await appendFile(history, jsonl(receipt(1250, 'r2')))
+    assert.equal(await update(), 4)
+  } finally {
+    await stop()
+  }
+})
+
+test('two same-second native typed replies to different questions are each credited once across the live and historical readers', async (t) => {
+  // Arrange
+  const { home, file } = await isolated(t)
+  const db = new DatabaseSync(':memory:')
+  t.after(() => db.close())
+  const supervisor = new Supervision(db, { now: () => now }),
+    preferences = new PreferenceStore(db)
+  const probe = new LocalActivityProbe({
+    codexHome: home,
+    now: () => now,
+    readCodex: empty,
+    readClaude: empty,
+    readWriters: async () => [file],
+  })
+  await writeFile(file, jsonl(session('cli'), event('task_started')))
+  await probe.poll(supervisor)
+  // Act
+  await appendFile(
+    file,
+    jsonl(
+      event('agent_message', {
+        id: 'q1',
+        message: 'Proceed with the first option?',
+      }),
+      event('user_message', {
+        message: 'yes',
+        reply_to: 'q1',
+        origin: { kind: 'human' },
+      }),
+      event('agent_message', {
+        id: 'q2',
+        message: 'Proceed with the second option?',
+      }),
+      event('user_message', {
+        message: 'yes',
+        reply_to: 'q2',
+        origin: { kind: 'human' },
+      }),
+    ),
+  )
+  await probe.poll(supervisor)
+  await preferences.importHistory({ codex: home })
+  // Assert
+  const replies = preferences.humanResponsesSince(0)
+  assert.equal(replies.length, 2)
+  assert.equal(new Set(replies.map((reply) => reply.responseId)).size, 2)
+  assert.equal(supervisor.status().score, 8)
+  for (const reply of replies)
+    assert.equal(
+      supervisor.humanReply({
+        provider: reply.source,
+        sessionId: reply.sessionId,
+        responseId: reply.responseId,
+        at: reply.at,
+      }),
+      false,
+    )
   assert.equal(supervisor.status().score, 8)
 })

@@ -35,22 +35,33 @@ export function uniqueTypedMatches(
   }
   const edges = new Map<TypedCandidate, TypedReceipt[]>()
   const callers = new Map<TypedReceipt, TypedCandidate[]>()
+  const unique = new Set<TypedCandidate>()
+  const reserved = new Set<string>()
+  for (const id of copies.keys()) {
+    if (!id.startsWith('prompt:')) continue
+    const claimants = candidates.filter(
+      (candidate) => candidate.response_id === id,
+    )
+    if (!claimants.length) continue
+    reserved.add(id)
+    if (claimants.length === 1) unique.add(claimants[0]!)
+  }
+  const available = [...copies]
+    .filter(([id]) => !reserved.has(id))
+    .map(([, group]) => group)
   for (const candidate of candidates) {
     const id = candidate.response_id.startsWith('prompt:')
       ? candidate.response_id
       : ''
-    const exact = id && copies.get(id)
-    const eligible = exact
-      ? [exact[0]!]
-      : [...copies.values()]
-          .filter((group) =>
-            group.some(
-              (r) =>
-                near(candidate, r) &&
-                (!id || !r.submission || r.submission === id),
-            ),
-          )
-          .map((group) => group[0]!)
+    if (reserved.has(id)) continue
+    const eligible = available
+      .filter((group) =>
+        group.some(
+          (r) =>
+            near(candidate, r) && (!id || !r.submission || r.submission === id),
+        ),
+      )
+      .map((group) => group[0]!)
     edges.set(candidate, eligible)
     for (const receipt of eligible) {
       const matches = callers.get(receipt) ?? []
@@ -58,16 +69,11 @@ export function uniqueTypedMatches(
       callers.set(receipt, matches)
     }
   }
-  const unique = new Set<TypedCandidate>()
   for (const [candidate, eligible] of edges) {
     if (eligible.length !== 1) continue
     const receipt = eligible[0]!
     const possible = callers.get(receipt)!
-    const exact = possible.filter(
-      (c) => receipt.submission && c.response_id === receipt.submission,
-    )
-    const best = exact.length ? exact : possible
-    if (best.length === 1 && best[0] === candidate) unique.add(candidate)
+    if (possible.length === 1) unique.add(candidate)
   }
   return unique
 }

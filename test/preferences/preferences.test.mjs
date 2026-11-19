@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { execFileSync } from 'node:child_process'
+import { fixtureGit } from './git-fixture.mjs'
 import {
   mkdtempSync,
   mkdirSync,
@@ -17,6 +17,7 @@ import {
   normalizeQuestionCard,
   PreferenceStore,
   typedResponseId,
+  typedQuestionId,
 } from '../../dist/preferences/index.js'
 
 const base = Date.UTC(2025, 0, 1)
@@ -54,7 +55,7 @@ function createFixture(t) {
   const other = join(root, 'unrelated-repository')
   for (const cwd of [repo, other]) {
     mkdirSync(cwd)
-    execFileSync('git', ['-C', cwd, 'init', '--quiet'])
+    fixtureGit(root, cwd, ['init', '--quiet'])
   }
   return { root, repo, other, db, store: new PreferenceStore(db) }
 }
@@ -475,8 +476,7 @@ test('a delegated call is excluded before or after import and a rolled-back deli
 test('linked worktrees and HTTPS/SSH clones of the same origin share evidence while similarly named repositories stay separate', (t) => {
   // Arrange
   const { root, repo, other } = createFixture(t)
-  const git = (cwd, args) =>
-    execFileSync('git', ['-C', cwd, ...args], { stdio: 'ignore' })
+  const git = (cwd, args) => fixtureGit(root, cwd, args)
   git(repo, [
     '-c',
     'user.name=Fixture',
@@ -691,8 +691,18 @@ test('Codex selections and typed decision briefs require their own call or a mat
     [
       'tool:native',
       'tool:unknown',
-      typedResponseId('B', base + 5000),
-      typedResponseId('A, if the owner approves later', base + 21_000),
+      typedResponseId(
+        'B',
+        base + 5000,
+        undefined,
+        typedQuestionId(brief, base + 4000),
+      ),
+      typedResponseId(
+        'A, if the owner approves later',
+        base + 21_000,
+        undefined,
+        typedQuestionId(brief, base + 20_000),
+      ),
     ],
   )
 })
@@ -759,13 +769,18 @@ test('unknown and multi-question cards count one verified native response withou
   // Act
   const report = await store.importHistory({ claude })
   const unknown = store.evaluate(unknownCard, { cwd: repo })
-  const noEvidence = store.evaluate(tests, { cwd: repo })
+  const recognized = store.evaluate(bug, { cwd: repo })
 
   // Assert
   assert.equal(report.observations, 1)
   assert.equal(store.humanResponsesSince(0).length, 1)
   assert.equal(unknown.reason, 'unrecognized-question')
-  assert.equal(noEvidence.reason, 'no-local-evidence')
+  assert.equal(recognized.summary.currentTotal, 1)
+  assert.deepEqual(recognized.summary.choices[0], {
+    meaning: 'current-change',
+    current: 1,
+    other: 0,
+  })
 })
 
 test('explicit Other responses remain in accuracy and local consensus denominators without exposing their text or becoming a predicted label', (t) => {

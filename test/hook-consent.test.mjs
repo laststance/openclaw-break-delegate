@@ -3,6 +3,8 @@ import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { spawnSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 import { runHook } from '../dist/hooks.js'
 import { Readable } from 'node:stream'
 import { readHookInput } from '../dist/commands.js'
@@ -12,6 +14,22 @@ const card = {
   question: 'How should we handle an unrelated bug?',
   options: [{ label: 'Fix in this PR' }, { label: 'Open a separate issue' }],
 }
+
+test('an offline status command reports failure when its state directory is named hook', async (t) => {
+  // Arrange
+  const directory = await mkdtemp(join(tmpdir(), 'bd-cli-argument-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const cli = fileURLToPath(new URL('../dist/cli.js', import.meta.url))
+  // Act
+  const result = spawnSync(
+    process.execPath,
+    [cli, 'status', '--state-dir', 'hook'],
+    { cwd: directory, encoding: 'utf8' },
+  )
+  // Assert
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /offline|unavailable|no such file|ENOENT/i)
+})
 
 test('a suspended Claude hook leaves the original choice untouched after the break expires', async (t) => {
   // Arrange
@@ -100,6 +118,69 @@ test('Claude conveys an incomplete instruction and a qualified answer without co
   assert.deepEqual(observed[1].conditional, [card.question])
   assert.equal(observed[1].human, true)
   assert.equal(JSON.stringify(observed).includes(note), false)
+})
+
+test('an interrupted stdin stream reaches the instruction veto as unreadable input', async () => {
+  // Arrange
+  async function* interruptedInput() {
+    yield Buffer.from('{"session_id":')
+    throw Error('Closed input stream')
+  }
+
+  // Act
+  const body = await readHookInput(interruptedInput())
+
+  // Assert
+  assert.equal(body, undefined)
+})
+
+test('a rejected delivery check retires an unwritten answer while a failed stdout write retains its receipt', async (t) => {
+  // Arrange
+  const directory = await mkdtemp(join(tmpdir(), 'bd-recheck-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const operations = []
+  let recheckAvailable = false
+  const close = await listenGateway(directory, async ({ op }) => {
+    operations.push(op)
+    if (op === 'hook')
+      return {
+        receipt: 'fixture',
+        answers: { [card.question]: card.options[0].label },
+        deliverBefore: Date.now() + 60_000,
+      }
+    if (op === 'can-deliver' && !recheckAvailable)
+      throw Error('Transient check failure')
+    return true
+  })
+  t.after(close)
+  const body = {
+    session_id: 'session',
+    cwd: directory,
+    hook_event_name: 'PreToolUse',
+    tool_name: 'AskUserQuestion',
+    tool_use_id: 'q',
+    tool_input: { questions: [card] },
+  }
+  let writes = 0
+  const brokenOutput = async () => {
+    writes++
+    throw Error('Write result unknown')
+  }
+
+  // Act
+  await runHook(directory, body, brokenOutput, 'terminal')
+  recheckAvailable = true
+  await runHook(directory, body, brokenOutput, 'terminal')
+
+  // Assert
+  assert.equal(writes, 1)
+  assert.deepEqual(operations, [
+    'hook',
+    'can-deliver',
+    'undelivered',
+    'hook',
+    'can-deliver',
+  ])
 })
 
 test('a 300 KB task routes its instruction hold to the authenticated top-level session after the private prompt', async (t) => {

@@ -11,6 +11,7 @@ import {
 } from './ipc.js'
 import {
   PreferenceStore,
+  isStandingReplyInstruction,
   typedResponseId,
   type HistoryRoots,
 } from './preferences/index.js'
@@ -47,6 +48,7 @@ interface PendingReceipt {
   deliverBefore: number
   sessionId: string
   questionId: string
+  incarnation: string | null
   expires: number
   emitted: number
   applied: number
@@ -73,7 +75,7 @@ export async function startService(
     if (typeof id !== 'string' || id.length !== 36) return
     return db
       .prepare(
-        'SELECT sessionId,questionId,breakId,deliverBefore,expires,emitted,applied FROM bd_delivery_receipts WHERE receipt=?',
+        'SELECT sessionId,questionId,breakId,incarnation,deliverBefore,expires,emitted,applied FROM bd_delivery_receipts WHERE receipt=?',
       )
       .get(id) as unknown as PendingReceipt | undefined
   }
@@ -88,7 +90,7 @@ export async function startService(
   let effectsTask: Promise<void> | undefined
   let drainAgain = false
   let visibleInvitation: string | undefined
-  let shownDigest: string | undefined
+  let retainedDigest: string | undefined
   const key = (s: string, q: string) => JSON.stringify([s, q])
   function refreshActivity(): Promise<void> {
     polling ??= poll(coordinator)
@@ -159,8 +161,8 @@ export async function startService(
         })),
     }
   }
-  function refreshShownDigest(id: string) {
-    if (shownDigest === id && ui.refreshSummary) {
+  function refreshRetainedDigest(id: string) {
+    if (retainedDigest === id && ui.refreshSummary) {
       void ui
         .refreshSummary(id, nativeReview(id))
         .catch(() => options.log('The native review could not refresh.'))
@@ -180,21 +182,28 @@ export async function startService(
         drainAgain = false
         for (const effect of coordinator.takeEffects()) {
           if (closing) return
-          if (effect.kind !== 'digest') shownDigest = undefined
-          if (effect.kind === 'invitation') {
-            visibleInvitation = effect.id
-            nativeStatus = await ui.invite(effect.id)
-          } else {
-            visibleInvitation = undefined
-          }
-          if (effect.kind === 'break') {
-            const active = coordinator.status().break
-            if (active?.id === effect.id)
-              nativeStatus = await ui.active(effect.id, active.endsAt)
-          }
-          if (effect.kind === 'digest') {
-            shownDigest = effect.id
-            nativeStatus = await ui.summary(effect.id, nativeReview(effect.id))
+          try {
+            if (effect.kind === 'invitation') {
+              visibleInvitation = effect.id
+              nativeStatus = await ui.invite(effect.id)
+            } else {
+              visibleInvitation = undefined
+            }
+            if (effect.kind === 'break') {
+              const active = coordinator.status().break
+              if (active?.id === effect.id)
+                nativeStatus = await ui.active(effect.id, active.endsAt)
+            }
+            if (effect.kind === 'digest') {
+              retainedDigest = effect.id
+              nativeStatus = await ui.summary(
+                effect.id,
+                nativeReview(effect.id),
+              )
+            }
+          } catch {
+            // Each claimed effect is independent, including later break reviews.
+            options.log('A native break action could not be displayed.')
           }
         }
         if (
@@ -203,6 +212,7 @@ export async function startService(
           coordinator.status().invitationId !== visibleInvitation
         ) {
           visibleInvitation = undefined
+          retainedDigest = undefined
           nativeStatus = await ui.clear()
         }
       } while (drainAgain && !closing)
@@ -265,7 +275,15 @@ export async function startService(
       return null
     }
     if (event === 'Stop') {
-      coordinator.observe({ ...base, status: 'idle' })
+      coordinator.observe({
+        ...base,
+        status: 'idle',
+        turnEnded: true,
+        at:
+          typeof r.at === 'number' && Number.isFinite(r.at)
+            ? Math.min(r.at, now())
+            : now(),
+      })
       return null
     }
     if (
@@ -299,13 +317,19 @@ export async function startService(
       return null
     }
     if (event === 'UserPromptSubmit' && typeof r.prompt === 'string') {
-      preferences.recordInstruction(
-        'claude',
-        sessionId,
-        r.prompt,
-        now(),
-        r.truncated === true,
+      if (
+        typeof r.replyTo !== 'string' ||
+        !r.replyTo ||
+        r.truncated === true ||
+        isStandingReplyInstruction(r.prompt)
       )
+        preferences.recordInstruction(
+          'claude',
+          sessionId,
+          r.prompt,
+          now(),
+          r.truncated === true,
+        )
       if (typeof r.replyTo === 'string')
         coordinator.humanReply({
           provider: 'claude',
@@ -316,6 +340,7 @@ export async function startService(
             r.prompt,
             typeof r.at === 'number' ? r.at : now(),
             typeof r.clientId === 'string' ? r.clientId : undefined,
+            r.replyTo,
           ),
         })
       coordinator.observe({ ...base, status: 'running' })
@@ -559,6 +584,22 @@ export async function startService(
       activeAsks.delete(id)
     }
   }
+  /** Check the original live card again when the Gateway returns a claim and immediately before the hook emits it. */
+  function mayDeliver(receipt: PendingReceipt | undefined): boolean {
+    if (!receipt || !receipt.incarnation || receipt.emitted || receipt.applied)
+      return false
+    const at = now()
+    return (
+      at < receipt.expires &&
+      at < receipt.deliverBefore &&
+      coordinator.isPendingDelivery(
+        receipt.sessionId,
+        receipt.questionId,
+        receipt.breakId,
+        receipt.incarnation,
+      )
+    )
+  }
   function finalizeProviderReceipt(receiptId: string) {
     const row = db
       .prepare(
@@ -574,7 +615,7 @@ export async function startService(
     db.prepare('DELETE FROM bd_delivery_receipts WHERE receipt=?').run(
       receiptId,
     )
-    refreshShownDigest(String(row.breakId))
+    refreshRetainedDigest(String(row.breakId))
   }
   function retireUndelivered(id: unknown): boolean {
     const receipt = getReceipt(id)
@@ -608,7 +649,7 @@ export async function startService(
         }
       }
     }
-    refreshShownDigest(receipt.breakId)
+    refreshRetainedDigest(receipt.breakId)
     db.prepare('DELETE FROM bd_delivery_receipts WHERE receipt=?').run(id)
     return true
   }
@@ -666,11 +707,7 @@ export async function startService(
         tick()
         if (isObject(value) && typeof value.receipt === 'string') {
           const claim = getReceipt(value.receipt)
-          if (
-            !claim ||
-            now() >= claim.deliverBefore ||
-            coordinator.status().break?.id !== claim.breakId
-          ) {
+          if (!mayDeliver(claim)) {
             retireUndelivered(value.receipt)
             return null
           }
@@ -678,13 +715,7 @@ export async function startService(
         return value
       }
       case 'can-deliver': {
-        const receipt = getReceipt(r.receipt)
-        return (
-          !!receipt &&
-          now() < receipt.expires &&
-          now() < receipt.deliverBefore &&
-          coordinator.status().break?.id === receipt.breakId
-        )
+        return mayDeliver(getReceipt(r.receipt))
       }
       case 'undelivered':
         return retireUndelivered(r.receipt)
@@ -771,11 +802,15 @@ export async function startService(
     }
     throw err
   }
-  const refresh = async () => {
-    await refreshActivity()
+  const refresh = () => {
     if (closing) return
     tick()
     if (now() - lastImportAt >= 300000) void refreshHistory()
+    // Wall-clock deadlines and native reviews continue while a provider is slow.
+    if (!polling)
+      void refreshActivity().then(() => {
+        if (!closing) tick()
+      })
   }
   void ui
     .status()
@@ -785,10 +820,8 @@ export async function startService(
     .catch(() => {
       nativeStatus = { status: 'unavailable' }
     })
-  void refresh()
-  const timer = setInterval(() => {
-    void refresh()
-  }, options.tickMs ?? 15000)
+  refresh()
+  const timer = setInterval(refresh, options.tickMs ?? 15000)
   timer.unref()
   return async () => {
     closing = true

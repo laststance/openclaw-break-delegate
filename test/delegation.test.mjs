@@ -11,6 +11,7 @@ import { readHookInput, requestReview } from '../dist/commands.js'
 import { runHook } from '../dist/hooks.js'
 import { requestGateway } from '../dist/ipc.js'
 import { PreferenceStore } from '../dist/preferences/index.js'
+import { Supervision } from '../dist/supervision/index.js'
 
 test('an accepted break answers the original Claude card once and keeps its reply out of human history', async (t) => {
   // Arrange
@@ -245,16 +246,164 @@ test('an accepted break answers the original Claude card once and keeps its repl
   )
   assert.equal(state.supervision.activeBreakId, null)
   const verify = new DatabaseSync(join(directory, 'state.sqlite'))
-  assert.equal(
-    new PreferenceStore(verify).isDelegated(
-      'claude',
-      'terminal-A',
-      'live-card',
+  const history = new PreferenceStore(verify)
+  const humanReplies = history.humanResponsesSince(start - 2 * 86400000)
+  assert.ok(
+    humanReplies.some(
+      (row) => row.sessionId === 'past' && row.responseId === 'tool:past-0',
     ),
-    true,
   )
+  assert.equal(
+    humanReplies.some(
+      (row) =>
+        row.sessionId === 'terminal-A' && row.responseId === 'tool:live-card',
+    ),
+    false,
+  )
+  assert.equal(history.isDelegated('claude', 'terminal-A', 'live-card'), true)
   verify.close()
 })
+
+test(
+  'the return review appears at the break deadline while the provider poll is still waiting',
+  { timeout: 5000 },
+  async (t) => {
+    // Arrange
+    const directory = await mkdtemp(join(tmpdir(), 'bd-stalled-poll-'))
+    let now = Date.now(),
+      calls = 0,
+      act
+    const invitation = Promise.withResolvers(),
+      pollStarted = Promise.withResolvers(),
+      resume = Promise.withResolvers(),
+      digest = Promise.withResolvers()
+    const pass = async () => ({ status: 'authorized' })
+    const stop = await startService({
+      directory,
+      now: () => now,
+      tickMs: 15,
+      workload: { threshold: 4 },
+      roots: {},
+      log() {},
+      judge: async () => false,
+      nativeFactory(callback) {
+        act = callback
+        return {
+          status: pass,
+          authorize: pass,
+          active: pass,
+          clear: pass,
+          close() {},
+          async invite(id) {
+            invitation.resolve(id)
+            return pass()
+          },
+          async summary(id) {
+            digest.resolve(id)
+            return pass()
+          },
+        }
+      },
+      async poll(c) {
+        calls++
+        if (calls > 1) {
+          pollStarted.resolve()
+          return resume.promise
+        }
+        c.observe({
+          provider: 'claude',
+          sessionId: 'a',
+          incarnation: 'terminal',
+          status: 'running',
+          canDelegate: true,
+          newSession: true,
+        })
+        c.humanReply({
+          provider: 'claude',
+          sessionId: 'a',
+          responseId: 'human-answer',
+        })
+      },
+    })
+    t.after(async () => {
+      resume.resolve()
+      await stop()
+      await rm(directory, { recursive: true, force: true })
+    })
+    await act({ kind: 'start', id: await invitation.promise })
+    const breakId = (await requestGateway(directory, { op: 'status' }))
+      .supervision.activeBreakId
+    await pollStarted.promise
+    // Act
+    now += 15 * 60000
+    const shown = await digest.promise
+    // Assert
+    assert.equal(shown, breakId)
+    assert.equal(calls, 2)
+  },
+)
+
+test(
+  'a later break review is displayed when a previous native review fails in the same delivery batch',
+  { timeout: 5000 },
+  async (t) => {
+    // Arrange
+    const directory = await mkdtemp(join(tmpdir(), 'bd-native-batch-'))
+    let now = Date.now()
+    const database = new DatabaseSync(join(directory, 'state.sqlite'))
+    const c = new Supervision(database, { now: () => now, threshold: 4 })
+    const expected = []
+    for (const responseId of ['first answer', 'second answer']) {
+      now += 100
+      c.observe({
+        provider: 'claude',
+        sessionId: 'a',
+        incarnation: 'terminal',
+        status: 'running',
+        canDelegate: true,
+      })
+      c.humanReply({ provider: 'claude', sessionId: 'a', responseId })
+      assert.ok(c.action(c.status().invitationId, 'accept'))
+      const id = c.status().activeBreakId
+      expected.push(id)
+      assert.ok(c.action(id, 'return'))
+    }
+    database.close()
+    const shown = [],
+      completed = Promise.withResolvers()
+    const pass = async () => ({ status: 'authorized' })
+    // Act
+    const stop = await startService({
+      directory,
+      now: () => now,
+      roots: {},
+      log() {},
+      poll: async () => {},
+      judge: async () => false,
+      nativeFactory: () => ({
+        status: pass,
+        authorize: pass,
+        active: pass,
+        clear: pass,
+        invite: pass,
+        close() {},
+        async summary(id) {
+          shown.push(id)
+          if (shown.length === 1) throw Error('First review failed')
+          completed.resolve()
+          return pass()
+        },
+      }),
+    })
+    t.after(async () => {
+      await stop()
+      await rm(directory, { recursive: true, force: true })
+    })
+    await completed.promise
+    // Assert
+    assert.deepEqual(shown, expected)
+  },
+)
 
 test('a large task veto follows the resumed Claude session and permits a different session in the former process', async (t) => {
   // Arrange
@@ -397,3 +546,160 @@ test('a large task veto follows the resumed Claude session and permits a differe
     'held',
   )
 })
+
+test(
+  'cancelling a card prevents delivery and a later provider result refreshes the old review without covering the next invitation',
+  { timeout: 8000 },
+  async (t) => {
+    // Arrange
+    const directory = await mkdtemp(join(tmpdir(), 'bd-late-review-'))
+    t.after(() => rm(directory, { recursive: true, force: true }))
+    const cwd = join(directory, 'repo')
+    await mkdir(cwd)
+    execFileSync('git', ['init', '-q', cwd])
+    let now = Date.now()
+    const card = {
+      question: 'How should we handle an unrelated bug?',
+      options: [
+        { label: 'Fix in this PR' },
+        { label: 'Open a separate issue' },
+      ],
+    }
+    const answers = { [card.question]: 'Fix in this PR' }
+    const database = new DatabaseSync(join(directory, 'state.sqlite'))
+    const preferences = new PreferenceStore(database)
+    for (let i = 0; i < 28; i++) {
+      const at = now - 86400000 + i * 1000
+      preferences.recordHumanSelection({
+        source: 'claude',
+        sessionId: 'previous',
+        toolUseId: 'past-' + i,
+        cwd,
+        card,
+        label: 'Fix in this PR',
+        askedAt: at,
+        answeredAt: at + 1,
+      })
+    }
+    preferences.replay()
+    database.close()
+    const firstInvitation = Promise.withResolvers()
+    const secondInvitation = Promise.withResolvers()
+    const summary = Promise.withResolvers()
+    const settled = Promise.withResolvers()
+    const invitations = []
+    const authorized = async () => ({ status: 'authorized' })
+    let act,
+      observed,
+      seeded = false
+    const live = {
+      provider: 'claude',
+      sessionId: 'original',
+      incarnation: 'pty',
+      source: 'hook',
+      status: 'running',
+      canDelegate: true,
+    }
+    const stop = await startService({
+      directory,
+      now: () => now,
+      roots: {},
+      log() {},
+      judge: async () => true,
+      workload: { threshold: 4 },
+      tickMs: 60_000,
+      nativeFactory(handler) {
+        act = handler
+        return {
+          status: authorized,
+          authorize: authorized,
+          active: authorized,
+          clear: authorized,
+          close() {},
+          async invite(id) {
+            invitations.push(id)
+            ;(invitations.length === 1
+              ? firstInvitation
+              : secondInvitation
+            ).resolve(id)
+            return authorized()
+          },
+          async summary(id, review) {
+            summary.resolve({ id, review })
+            return authorized()
+          },
+          async refreshSummary(id, review) {
+            settled.resolve({ id, review })
+          },
+        }
+      },
+      async poll(coordinator) {
+        observed = coordinator
+        if (seeded) return
+        seeded = true
+        coordinator.observe({ ...live, newSession: true })
+        coordinator.humanReply({
+          provider: 'claude',
+          sessionId: 'original',
+          responseId: 'prior-supervision',
+        })
+      },
+    })
+    t.after(stop)
+    const rpc = (request) => requestGateway(directory, request)
+    const hook = (event, questionId, extra = {}) =>
+      rpc({
+        op: 'hook',
+        sessionId: 'original',
+        incarnation: 'pty',
+        cwd,
+        event,
+        questionId,
+        toolName: 'AskUserQuestion',
+        cards: [card],
+        ...extra,
+      })
+    await act({ kind: 'start', id: await firstInvitation.promise })
+    now += 10
+
+    // Act
+    const cancelled = await hook('PreToolUse', 'cancelled')
+    const permittedBeforeCancellation = await rpc({
+      op: 'can-deliver',
+      receipt: cancelled.receipt,
+    })
+    await hook('PostToolUseFailure', 'cancelled')
+    const permittedAfterCancellation = await rpc({
+      op: 'can-deliver',
+      receipt: cancelled.receipt,
+    })
+    await rpc({ op: 'undelivered', receipt: cancelled.receipt })
+    const accepted = await hook('PreToolUse', 'delivered')
+    await rpc({ op: 'ack', receipt: accepted.receipt })
+    await rpc({ op: 'return' })
+    const firstReview = await summary.promise
+    now += 10
+    observed.observe(live)
+    observed.humanReply({
+      provider: 'claude',
+      sessionId: 'original',
+      responseId: 'new-supervision',
+    })
+    await hook('UserPromptSubmit', undefined, { prompt: 'Continue the work.' })
+    const next = await secondInvitation.promise
+    await hook('PostToolUse', 'delivered', { answers })
+    const refreshed = await settled.promise
+    const status = await rpc({ op: 'status' })
+
+    // Assert
+    assert.equal(permittedBeforeCancellation, true)
+    assert.equal(permittedAfterCancellation, false)
+    assert.equal(firstReview.review.answered.length, 0)
+    assert.equal(refreshed.id, firstReview.id)
+    assert.deepEqual(refreshed.review.answered, [
+      { question: card.question, answer: 'Fix in this PR' },
+    ])
+    assert.equal(status.supervision.invitationId, next)
+    assert.equal(invitations.length, 2)
+  },
+)

@@ -7,6 +7,7 @@ import {
   readSync,
   readdirSync,
   type Dirent,
+  type BigIntStats,
 } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
@@ -170,6 +171,51 @@ function rangeHash(fd: number, start: number, stop: number): string {
   return hash.digest('hex')
 }
 
+const fileVersion = (stat: BigIntStats) =>
+  [stat.size, stat.mtimeNs, stat.ctimeNs].join(':')
+
+/** Verify every committed segment before {@link importFile} reuses a changed file. Yield between blocks for live gateway requests.
+ * @example await matchesPrefix(db,fd,key,offset)
+ */
+async function matchesPrefix(
+  db: EvidenceDatabase,
+  fd: number,
+  key: string,
+  stop: number,
+): Promise<boolean> {
+  const next = db.db.prepare(
+    'SELECT start,stop,hash FROM pref_file_segments WHERE path=? AND start=?',
+  )
+  const buffer = Buffer.allocUnsafe(chunkSize)
+  let cursor = 0
+  while (cursor < stop) {
+    const segment = next.get(key, cursor)
+    if (
+      !segment ||
+      Number(segment.stop) <= cursor ||
+      Number(segment.stop) > stop
+    )
+      return false
+    const hash = createHash('sha256'),
+      end = Number(segment.stop)
+    while (cursor < end) {
+      const n = readSync(
+        fd,
+        buffer,
+        0,
+        Math.min(buffer.length, end - cursor),
+        cursor,
+      )
+      if (!n) return false
+      hash.update(buffer.subarray(0, n))
+      cursor += n
+      await yieldToGateway()
+    }
+    if (hash.digest('hex') !== segment.hash) return false
+  }
+  return true
+}
+
 async function importFile(
   db: EvidenceDatabase,
   file: SourceFile,
@@ -184,10 +230,27 @@ async function importFile(
     const key = digest(file.format + '\0' + file.path)
     const old = db.db.prepare('SELECT * FROM pref_files WHERE path=?').get(key)
     const size = Number(info.size)
-    const resume =
+    let resume =
       old?.identity === identity &&
       Number(old.offset) <= size &&
       old.anchor === checkpointHash(fd, Number(old.offset))
+    const saveVersion = db.db.prepare(
+      'INSERT OR REPLACE INTO pref_file_versions VALUES(?,?)',
+    )
+    if (
+      resume &&
+      db.db
+        .prepare('SELECT stamp FROM pref_file_versions WHERE path=?')
+        .get(key)?.stamp !== fileVersion(info)
+    ) {
+      resume = await matchesPrefix(db, fd, key, Number(old!.offset))
+      if (fileVersion(info) !== fileVersion(fstatSync(fd, { bigint: true }))) {
+        if (retries < 2) await importFile(db, file, report, retries + 1)
+        else report.unreadable++
+        return
+      }
+      if (resume) saveVersion.run(key, fileVersion(info))
+    }
     const state: ParseState = resume
       ? (JSON.parse(String(old!.state)) as ParseState)
       : {}
@@ -204,15 +267,6 @@ async function importFile(
     )
     if (!resume)
       db.db.prepare('DELETE FROM pref_file_segments WHERE path=?').run(key)
-    else if (
-      saved &&
-      !db.db
-        .prepare('SELECT 1 FROM pref_file_segments WHERE path=? LIMIT 1')
-        .get(key)
-    ) {
-      // Populate a prefix fingerprint once when resuming a checkpoint written by an older decoder.
-      addSegment.run(key, 0, saved, rangeHash(fd, 0, saved))
-    }
     let stat = info
     let pending: Buffer[] = []
     let length = 0
@@ -276,6 +330,7 @@ async function importFile(
             JSON.stringify(state),
           )
           saved = commit
+          saveVersion.run(key, fileVersion(stat))
         }
       })
       offset += received
@@ -288,11 +343,6 @@ async function importFile(
         current.ctimeNs !== stat.ctimeNs
       ) {
         // Append-only writers keep the same prefix. A replacement must never inherit parser state or an offset from the prior file.
-        const segments = db.db
-          .prepare(
-            'SELECT start,stop,hash FROM pref_file_segments WHERE path=? AND stop<=? ORDER BY start',
-          )
-          .iterate(key, saved)
         const priorChunkMatches =
           rangeHash(fd, offset - received, offset) ===
           createHash('sha256').update(chunk.subarray(0, received)).digest('hex')
@@ -302,18 +352,12 @@ async function importFile(
             createHash('sha256')
               .update(Buffer.concat(pending, length))
               .digest('hex')
-        let unchanged =
-          Number(current.size) >= offset && priorChunkMatches && partialMatches
-        if (unchanged)
-          for (const segment of segments) {
-            if (
-              rangeHash(fd, Number(segment.start), Number(segment.stop)) !==
-              segment.hash
-            ) {
-              unchanged = false
-              break
-            }
-          }
+        const unchanged =
+          Number(current.size) >= offset &&
+          priorChunkMatches &&
+          partialMatches &&
+          (await matchesPrefix(db, fd, key, saved)) &&
+          fileVersion(current) === fileVersion(fstatSync(fd, { bigint: true }))
         if (!unchanged) {
           db.transaction(() => {
             db.db.prepare('DELETE FROM pref_files WHERE path=?').run(key)
@@ -327,6 +371,7 @@ async function importFile(
           return
         }
         stat = current
+        saveVersion.run(key, fileVersion(stat))
       }
     }
   } finally {

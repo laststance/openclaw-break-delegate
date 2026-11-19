@@ -99,13 +99,29 @@ export function typedResponseId(
   text: string,
   timestamp: number,
   clientId?: string,
+  questionId?: string,
 ): string {
-  return clientId && validId(clientId)
-    ? 'prompt:' + clientId
-    : 'typed:' +
-        digest(text.normalize('NFKC').trim()) +
-        ':' +
-        Math.floor(timestamp / 1000)
+  if (clientId && validId(clientId)) return 'prompt:' + clientId
+  if (questionId && validId(questionId))
+    return (
+      'typed:q:' +
+      digest(text.normalize('NFKC').trim()) +
+      ':' +
+      digest(questionId)
+    )
+  return (
+    'typed:' +
+    digest(text.normalize('NFKC').trim()) +
+    ':' +
+    Math.floor(timestamp / 1000)
+  )
+}
+
+/** Identify a preceding agent question across live and archived renderings when the provider omits its message ID.
+ * @example typedQuestionId('Which option?',1730000000123)
+ */
+export function typedQuestionId(text: string, at: number): string {
+  return 'question:' + digest(at + '\0' + text)
 }
 
 // Counts from another repository can describe a preference but cannot pass these two local thresholds.
@@ -142,6 +158,7 @@ export class EvidenceDatabase {
       CREATE INDEX IF NOT EXISTS pref_type_trials ON pref_predictions(kind,answered);
       CREATE TABLE IF NOT EXISTS pref_human_grants(source TEXT,session TEXT,tool TEXT,at INTEGER,PRIMARY KEY(source,session,tool));
       CREATE TABLE IF NOT EXISTS pref_calls(source TEXT,session TEXT,tool TEXT,questions TEXT,asked INTEGER,PRIMARY KEY(source,session,tool));
+      CREATE TABLE IF NOT EXISTS pref_pending_codex_outputs(session TEXT,tool TEXT,PRIMARY KEY(session,tool));
       CREATE TABLE IF NOT EXISTS pref_responses(source TEXT,session TEXT,response_id TEXT,tool TEXT,at INTEGER,PRIMARY KEY(source,session,response_id));
       CREATE INDEX IF NOT EXISTS pref_response_times ON pref_responses(at);
       CREATE TABLE IF NOT EXISTS pref_gstack_selections(session TEXT,tool TEXT,summary TEXT,label TEXT,at INTEGER,
@@ -156,10 +173,13 @@ export class EvidenceDatabase {
       CREATE TABLE IF NOT EXISTS pref_submissions(source TEXT,session TEXT,hash TEXT,at INTEGER,submission TEXT,PRIMARY KEY(source,session,hash,at,submission));
       CREATE TABLE IF NOT EXISTS pref_fallback_links(source TEXT,session TEXT,tool TEXT,question TEXT,at INTEGER,PRIMARY KEY(source,session,tool,question,at));
       CREATE TABLE IF NOT EXISTS pref_direct_text(source TEXT,session TEXT,tool TEXT,response_id TEXT,PRIMARY KEY(source,session,tool,response_id));
+      CREATE TABLE IF NOT EXISTS pref_direct_answers(source TEXT,session TEXT,tool TEXT,question TEXT,selected TEXT,at INTEGER,
+        PRIMARY KEY(source,session,tool,question));
       CREATE TABLE IF NOT EXISTS pref_lost_typed(source TEXT,session TEXT,response_id TEXT,seen INTEGER,PRIMARY KEY(source,session,response_id));
       CREATE INDEX IF NOT EXISTS pref_lost_typed_times ON pref_lost_typed(seen);
       CREATE TABLE IF NOT EXISTS pref_files(path TEXT PRIMARY KEY,identity TEXT,offset INTEGER,anchor TEXT,skipping INTEGER,state TEXT);
       CREATE TABLE IF NOT EXISTS pref_file_segments(path TEXT,start INTEGER,stop INTEGER,hash TEXT,PRIMARY KEY(path,start));
+      CREATE TABLE IF NOT EXISTS pref_file_versions(path TEXT PRIMARY KEY,stamp TEXT NOT NULL);
       CREATE VIEW IF NOT EXISTS pref_observations AS SELECT o.* FROM pref_offers o WHERE o.answered IS NOT NULL AND o.conflict=0
         AND NOT EXISTS(SELECT 1 FROM pref_exclusions x WHERE x.source=o.source AND x.session=o.session AND x.tool=o.tool);
     `)
@@ -206,6 +226,68 @@ export class EvidenceDatabase {
         )
       }
     })
+    this.transaction(() => {
+      if (
+        !db
+          .prepare('INSERT OR IGNORE INTO pref_decoder_versions VALUES(?)')
+          .run('validated-direct-answer-v1').changes
+      )
+        return
+      // The old marker proved authorship, but contained neither the question nor the validated selection. Revisit only sessions with those markers.
+      db.exec(
+        `DELETE FROM pref_files WHERE json_extract(state,'$.session') IN (SELECT session FROM pref_direct_text);`,
+      )
+      const stale = db
+        .prepare(
+          `UPDATE pref_offers AS o SET answered=NULL,selected=NULL WHERE o.answered IS NOT NULL
+        AND EXISTS(SELECT 1 FROM pref_direct_text d WHERE (d.source,d.session,d.tool)=(o.source,o.session,o.tool))
+        AND EXISTS(SELECT 1 FROM pref_typed_candidates c WHERE (c.source,c.session,c.tool,c.question)=(o.source,o.session,o.tool,o.question))
+        AND NOT EXISTS(SELECT 1 FROM pref_fallback_links f WHERE (f.source,f.session,f.tool,f.question)=(o.source,o.session,o.tool,o.question))`,
+        )
+        .run()
+      if (stale.changes) db.exec(dirty)
+    })
+    this.transaction(() => {
+      if (
+        !db
+          .prepare('INSERT OR IGNORE INTO pref_decoder_versions VALUES(?)')
+          .run('language-target-and-typed-question-v1').changes
+      )
+        return
+      const language = db
+        .prepare(
+          "SELECT source,session,tool,question,options FROM pref_offers WHERE kind='response-language'",
+        )
+        .all()
+      for (const row of language) {
+        const result = classifyCard({
+          question: String(row.question),
+          options: (JSON.parse(String(row.options)) as { label: string }[]).map(
+            ({ label }) => ({ label }),
+          ),
+        })
+        const kind = 'card' in result ? result.card.kind : null
+        db.prepare(
+          'UPDATE pref_offers SET kind=?, conflict=MAX(conflict,?) WHERE source=? AND session=? AND tool=? AND question=?',
+        ).run(
+          kind ?? 'response-language',
+          Number(!kind),
+          row.source,
+          row.session,
+          row.tool,
+          row.question,
+        )
+      }
+      if (language.length) db.exec(dirty)
+      // Older fallback identities can merge separate simultaneous replies. Re-read affected sessions and withdraw their previous aggregate identity.
+      db.prepare(
+        "INSERT OR REPLACE INTO pref_lost_typed SELECT source,session,response_id,? FROM pref_responses WHERE response_id GLOB 'typed:[0-9a-f]*'",
+      ).run(Date.now())
+      db.exec(`DELETE FROM pref_files WHERE json_extract(state,'$.session') IN (SELECT session FROM pref_responses WHERE response_id GLOB 'typed:[0-9a-f]*' UNION SELECT session FROM pref_typed_candidates WHERE response_id GLOB 'typed:[0-9a-f]*');
+        DELETE FROM pref_fallback_links AS f WHERE EXISTS(SELECT 1 FROM pref_typed_candidates c WHERE (c.source,c.session,c.tool,c.question,c.at)=(f.source,f.session,f.tool,f.question,f.at) AND c.response_id GLOB 'typed:[0-9a-f]*');
+        DELETE FROM pref_typed_candidates WHERE response_id GLOB 'typed:[0-9a-f]*';
+        DELETE FROM pref_responses WHERE response_id GLOB 'typed:[0-9a-f]*';`)
+    })
   }
 
   /** Save independently confirmed human effort even when the card has no learned decision type.
@@ -220,6 +302,19 @@ export class EvidenceDatabase {
       this.isPermanentlyExcluded(origin)
     )
       return
+    if (responseId.startsWith('typed:q:')) {
+      const legacy =
+        'typed:' + responseId.split(':')[2] + ':' + Math.floor(at / 1000)
+      const prior = this.db
+        .prepare(
+          'DELETE FROM pref_responses WHERE source=? AND session=? AND tool=? AND response_id=?',
+        )
+        .run(...fields(origin), legacy)
+      if (prior.changes)
+        this.db
+          .prepare('INSERT OR REPLACE INTO pref_lost_typed VALUES(?,?,?,?)')
+          .run(origin.source, origin.sessionId, legacy, Date.now())
+    }
     this.db
       .prepare('INSERT OR IGNORE INTO pref_responses VALUES(?,?,?,?,?)')
       .run(origin.source, origin.sessionId, responseId, origin.toolUseId, at)
@@ -537,11 +632,16 @@ export class EvidenceDatabase {
   /** A role-only task message becomes a session constraint only when the user's typed history independently matches it.
    * @example evidence.typedInstructionCandidate(session, 'Only review the change', at)
    */
-  typedInstructionCandidate(session: Session, text: string, at: number): void {
+  typedInstructionCandidate(
+    session: Session,
+    text: string,
+    at: number,
+    explicit = false,
+  ): void {
     const rules =
       text.length > 16_384
         ? [{ kind: '*', required: '*' }]
-        : instructionConstraints(text, false)
+        : instructionConstraints(text, explicit)
     if (!rules.length) return
     const hash = digest(text.trim())
     this.db
@@ -555,6 +655,26 @@ export class EvidenceDatabase {
       )
       .get(session.source, session.sessionId, hash, at - 2000, at + 2000)
     if (receipt) this.saveRules(session, at, rules)
+  }
+
+  /** Remove a role-only instruction after the native mirror identifies it as an answer to a specific question.
+   * @example evidence.cancelTypedInstruction(session,typed,at)
+   */
+  cancelTypedInstruction(session: Session, text: string, at: number): void {
+    const row = this.db
+      .prepare(
+        'DELETE FROM pref_instruction_candidates WHERE source=? AND session=? AND hash=? AND at=? RETURNING rules',
+      )
+      .get(session.source, session.sessionId, digest(text.trim()), at)
+    if (!row) return
+    for (const rule of JSON.parse(String(row.rules)) as Constraint[]) {
+      const removed = this.db
+        .prepare(
+          'DELETE FROM pref_constraints WHERE source=? AND session=? AND at=? AND kind=? AND required=?',
+        )
+        .run(session.source, session.sessionId, at, rule.kind, rule.required)
+      if (removed.changes) this.db.exec(dirty)
+    }
   }
 
   private restrictions(session: Session, at: number): Constraint[] {
@@ -712,20 +832,15 @@ export class EvidenceDatabase {
         .run(...fields(origin), c.question, c.at)
       if (!previous.changes) continue
       // Retract only evidence established by this fallback. A separately attested native submission still stands.
-      if (
-        !this.db
-          .prepare(
-            'SELECT 1 FROM pref_direct_text WHERE source=? AND session=? AND tool=?',
-          )
-          .get(...fields(origin))
-      ) {
-        const withdrawn = this.db
-          .prepare(
-            'UPDATE pref_offers SET selected=NULL,answered=NULL WHERE source=? AND session=? AND tool=? AND question=? AND answered IS NOT NULL',
-          )
-          .run(...fields(origin), c.question)
-        if (withdrawn.changes) this.db.exec(dirty)
-      }
+      const withdrawn = this.db
+        .prepare(
+          `UPDATE pref_offers AS o SET (selected,answered)=
+        (SELECT d.selected,d.at FROM pref_direct_answers d WHERE
+          (d.source,d.session,d.tool,d.question,d.selected)=(o.source,o.session,o.tool,o.question,o.selected))
+        WHERE o.source=? AND o.session=? AND o.tool=? AND o.question=? AND o.answered IS NOT NULL`,
+        )
+        .run(...fields(origin), c.question)
+      if (withdrawn.changes) this.db.exec(dirty)
       if (
         !this.db
           .prepare(
@@ -773,7 +888,16 @@ export class EvidenceDatabase {
       .prepare('INSERT OR IGNORE INTO pref_direct_text VALUES(?,?,?,?)')
       .run(...fields(origin), responseId)
     this.humanResponse(origin, responseId, at)
-    this.answer(origin, question, label, at, true)
+    if (this.answer(origin, question, label, at, true)) {
+      // A validated direct answer has its own chronology even if an earlier fallback currently owns the observation.
+      this.db
+        .prepare(
+          `INSERT INTO pref_direct_answers
+        SELECT source,session,tool,question,selected,? FROM pref_offers WHERE source=? AND session=? AND tool=? AND question=?
+        ON CONFLICT(source,session,tool,question) DO UPDATE SET selected=excluded.selected,at=MIN(at,excluded.at)`,
+        )
+        .run(at, ...fields(origin), cleanQuestion(question))
+    }
   }
 
   /** Expose temporary loss of typed-reply attribution separately from durable automation exclusions.

@@ -103,6 +103,18 @@ function codexResult(raw: unknown): Row {
   return parseObject(raw)
 }
 
+/** Recognize an unnamed native question-result mirror before its offer arrives.
+ * Ordinary command output can be large. Parse only strings that could contain an answers property.
+ * @example couldBeCodexQuestionResult('{"answers":{},"timed_out":true}')
+ */
+export function couldBeCodexQuestionResult(raw: unknown): boolean {
+  const text = Array.isArray(raw) ? record(raw[0]).text : raw
+  if (typeof text === 'string' && !/"answers"\s*:|\\u[\da-f]{4}/iu.test(text))
+    return false
+  const answers = codexResult(raw).answers
+  return !!answers && typeof answers === 'object' && !Array.isArray(answers)
+}
+
 /** Check the complete request for prefilled answers, a timer or machine authorship.
  * @example automaticCodexRequest({ questions: [] }, { autoResolutionMs: 0 })
  */

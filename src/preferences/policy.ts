@@ -151,9 +151,9 @@ const decisionTypes: readonly DecisionType[] = [
     kind: 'response-language',
     topic: /\b(?:language|english|japanese)\b|何語|言語|日本語|英語/u,
     vocabulary:
-      'language english japanese reply response explanation report writing write written answer final summary provide present use chat documentation document in',
+      'language english japanese reply replies response responses explanation report reports writing write written answer answers final summary provide present use chat conversation documentation document documents docs guide guides readme in',
     japanese:
-      '何語 言語 日本語 英語 返答 回答 説明 レポート 報告 最終 文書 チャット 書く 使う',
+      '何語 言語 日本語 英語 返答 回答 説明 レポート 報告 最終 文書 ドキュメント 資料 チャット 会話 書く 使う べきですか',
     choices: { english: /\benglish\b|英語/u, japanese: /\bjapanese\b|日本語/u },
   },
   {
@@ -197,6 +197,31 @@ const simpleReply =
 const qualification =
   /(?:\s*[,;:、，—]\s*|\s+)(?=(?:but|if|only|unless|provided|except|after|before|because|as long as)\b|ただし|但し|もし|条件|その場合)/iu
 const replyOrdinal = /^(?:option\s+)?([a-e1-5])(?:[.)]|番(?:目)?)?$/iu
+
+/** Identify explicit ongoing scope in a reply before {@link instructionConstraints} applies it to future questions.
+ * @example isStandingReplyInstruction('A for now, but always ask first from now on')
+ */
+export function isStandingReplyInstruction(text: string): boolean {
+  return /(?:^|[,;.!?、。]|\b(?:but|and)\b)\s*(?:(?:but|and|please)\s+)*(?:(?:always|never)\s+(?:ask|use|choose|run|prefer|write|answer|do|change|fix|send|apply|wait|check|keep|make|take|skip|allow)|from now on|going forward|for (?:all future|future|the rest of (?:this|the) session)|throughout (?:this|the) session|every time)\b|(?:^|[、。]|ただし|但し)\s*(?:今後|これからは|毎回|このセッション(?:全体|中))/iu.test(
+    text,
+  )
+}
+
+function languageTarget(text: string): string | null {
+  const document =
+    /\b(?:documents?|documentation|docs|guides?|readme|reports?)\b|文書|ドキュメント|資料|報告|レポート/u.test(
+      text,
+    )
+  const chat =
+    /\b(?:chat|repl(?:y|ies)|responses?|answers?|conversation|explanation)\b|会話|返答|回答|チャット|説明/u.test(
+      text,
+    )
+  return document === chat
+    ? null
+    : document
+      ? 'documentation-language'
+      : 'response-language'
+}
 
 /** Return the offered option index when a typed answer explicitly names its letter or number.
  * @example typedOptionIndex('option 2')
@@ -414,9 +439,20 @@ export function classifyCard(raw: QuestionCard): PolicyResult {
       choices.push({ label: option.label, meaning: choice[0]! })
     }
     const unique = new Set(choices.map((choice) => choice.meaning))
-    if (unique.size === options.length)
+    const kind =
+      type.kind === 'response-language' ? languageTarget(question) : type.kind
+    if (
+      type.kind === 'response-language' &&
+      languageTarget(
+        [question, ...options.flatMap((o) => [o.text, o.description])].join(
+          ' ',
+        ),
+      ) !== kind
+    )
+      continue
+    if (kind && unique.size === options.length)
       matches.push({
-        kind: type.kind,
+        kind,
         signature: [...unique].sort().join('|'),
         choices,
       })
@@ -441,9 +477,14 @@ export function instructionConstraints(
 ): Constraint[] {
   const text = questionText(value)
   if (!text) return []
+  // Remove a directive lead-in only at a sentence boundary so factual mentions and questions keep their original meaning.
+  const approvalText = text.replace(
+    /(^|[.!?。！？]\s*)(?:(?:can|could|would|will) you\s+)?(?:please\s+)?(?:(?:remember|be sure|make sure) to|(?:be sure|make sure) (?:that )?you|i (?:want|need) you to|you (?:must|should|need to))\s+/gu,
+    '$1',
+  )
   const approvalInstruction =
     /(?:^|[.!?。！？]\s*)(?:(?:can|could|would|will) you\s+)?(?:please\s+)?(?:(?:ask|consult|check with)\s+(?:me|the (?:user|owner))\s+(?:for (?:approval|permission|confirmation)|before\b|first\b)|(?:ask for|obtain|get|require|wait for) (?:my|the (?:user's|owner's)) (?:approval|permission|confirmation))|(?:承認|許可|確認)を(?:取って|求めて|得て|待って|取ること|求めること)|(?:私|本人|ユーザー)に(?:必ず)?確認して/u.test(
-      text,
+      approvalText,
     )
   if (approvalInstruction) return [{ kind: '*', required: '*' }]
   // A question asking for information does not impose a standing constraint. Polite requests can still contain an explicit limit.
@@ -453,8 +494,15 @@ export function instructionConstraints(
     !/^(?:please |(?:can|could|would|will) you (?!explain|tell me|describe))|ください|お願いします/u.test(
       text,
     )
-  )
-    return []
+  ) {
+    const clauses = text
+      .split(/\b(?:and|but)\s+|[,;、]|ただし\s*/u)
+      .slice(1)
+      .filter((clause) => restriction.test(clause))
+    return clauses.flatMap((clause) =>
+      instructionConstraints(clause.replace(/[?？]$/u, ''), true),
+    )
+  }
   // A negation, exception, second instruction or unparsed text must never be reduced to an affirmative choice.
   if (!operation.test(text)) {
     const normalized = text
@@ -465,12 +513,20 @@ export function instructionConstraints(
       if (!withinVocabulary(normalized, type)) return []
       const choices = meanings(normalized, type)
       return choices.length === 1
-        ? [{ kind: type.kind, required: choices[0]! }]
+        ? [
+            {
+              kind:
+                type.kind === 'response-language'
+                  ? (languageTarget(normalized) ?? type.kind)
+                  : type.kind,
+              required: choices[0]!,
+            },
+          ]
         : []
     })
     if (result.length === 1) return result
   }
-  return explicit || restriction.test(text)
+  return explicit || restriction.test(text) || isStandingReplyInstruction(text)
     ? [{ kind: '*', required: '*' }]
     : []
 }

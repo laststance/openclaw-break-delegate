@@ -4,6 +4,7 @@ import {
   automaticCodexRequest,
   codexCallId,
   codexInputTool,
+  couldBeCodexQuestionResult,
   parseObject,
   readCodexResult,
   record,
@@ -13,6 +14,7 @@ import {
 import {
   EvidenceDatabase,
   typedResponseId,
+  typedQuestionId,
   type EvidenceSource,
   type Origin,
   type Session,
@@ -21,6 +23,7 @@ import {
   normalizeLabel,
   normalizeQuestionCard,
   isTypedReply,
+  isStandingReplyInstruction,
   typedOptionIndex,
   type QuestionCard,
 } from './policy.js'
@@ -55,6 +58,7 @@ interface Brief {
   question: string
   labels: string[]
   messageId?: string
+  fingerprint?: string
 }
 export interface ParseState {
   session?: string
@@ -67,6 +71,7 @@ export interface ParseState {
     format: 'item' | 'legacy'
     hash: string
     at: number
+    unmatched?: Brief
   }
   brief?: Brief
 }
@@ -244,10 +249,15 @@ function rememberBrief(
         question: '',
         labels: [],
         messageId,
+        fingerprint: typedQuestionId(text, at),
       }
     return
   }
-  state.brief = { ...parsed.brief, messageId }
+  state.brief = {
+    ...parsed.brief,
+    messageId,
+    fingerprint: typedQuestionId(text, at),
+  }
   if (state.repo)
     db.offer({
       source,
@@ -292,10 +302,16 @@ function humanText(
       : pending.labels.find(
           (label) => normalizeLabel(label) === normalizeLabel(typed),
         )
-  const responseId = typedResponseId(typed, at, clientId)
+  const responseId = typedResponseId(
+    typed,
+    at,
+    clientId,
+    pending.messageId || pending.fingerprint || pending.tool,
+  )
   if (confirmed) {
     db.directText(origin, responseId, pending.question, matching ?? '', at)
-    if (!matching) db.instruction(session, text, at)
+    if (!matching && isStandingReplyInstruction(text))
+      db.instruction(session, text, at, true)
   } else {
     if (
       !db.typedCandidate(
@@ -308,7 +324,8 @@ function humanText(
       )
     )
       counts.unverified++
-    if (!matching) db.typedInstructionCandidate(session, text, at)
+    if (!matching && isStandingReplyInstruction(text))
+      db.typedInstructionCandidate(session, text, at, true)
   }
 }
 
@@ -475,6 +492,23 @@ function codexText(
     previous.hash === hash &&
     Math.abs(at - previous.at) <= 2000
   ) {
+    if (
+      speaker === 'user' &&
+      human &&
+      previous.unmatched &&
+      replyTo &&
+      replyTo === previous.unmatched.messageId
+    ) {
+      db.cancelTypedInstruction(
+        { source: 'codex', sessionId: state.session! },
+        text,
+        previous.at,
+      )
+      state.brief = previous.unmatched
+      delete previous.unmatched
+      humanText(db, 'codex', state, text, at, true, clientId, counts, replyTo)
+      return
+    }
     if (speaker === 'user' && human)
       db.typedReceipt(
         { source: 'codex', sessionId: state.session! },
@@ -492,6 +526,15 @@ function codexText(
     return
   }
   state.lastText = { speaker, format, hash, at }
+  if (
+    speaker === 'user' &&
+    format === 'legacy' &&
+    !human &&
+    !replyTo &&
+    state.brief &&
+    !isTypedReply(text, state.brief.labels)
+  )
+    state.lastText.unmatched = state.brief
   if (speaker === 'agent')
     rememberBrief(db, 'codex', state, text, at, messageId)
   else humanText(db, 'codex', state, text, at, human, clientId, counts, replyTo)
@@ -555,14 +598,36 @@ function codexRow(
   const nativeCall = (part: Row) => origin(codexCallId(part))
   const request = (call: Origin, args: Row, ...envelopes: Row[]) => {
     delete state.brief
-    if (automaticCodexRequest(args, row, payload, ...envelopes)) {
+    const marked = db.db
+      .prepare(
+        'DELETE FROM pref_pending_codex_outputs WHERE session=? AND tool=?',
+      )
+      .run(call.sessionId, call.toolUseId)
+    if (
+      marked.changes ||
+      automaticCodexRequest(args, row, payload, ...envelopes)
+    ) {
       db.exclude(call)
       counts.unverified++
       return
     }
     rememberCall(db, call, state.repo, readQuestions(args.questions), at)
   }
-  const result = (call: Origin, raw: unknown, ...envelopes: Row[]) => {
+  const result = (
+    call: Origin,
+    raw: unknown,
+    namedQuestion: boolean,
+    ...envelopes: Row[]
+  ) => {
+    if (!pairableId(call.toolUseId)) return
+    const known =
+      namedQuestion ||
+      !!db.db
+        .prepare(
+          'SELECT 1 FROM pref_calls WHERE source=? AND session=? AND tool=?',
+        )
+        .get(call.source, call.sessionId, call.toolUseId)
+    if (!known && !couldBeCodexQuestionResult(raw)) return
     const { output, automatic } = readCodexResult(
       raw,
       row,
@@ -571,6 +636,15 @@ function codexRow(
     )
     // A mirror may supply provenance before or after the unmarked copy of the same call.
     if (automatic) {
+      if (!known) {
+        // A generic result can resemble a question, including an empty answer map. Only a later matching request can establish its tool identity.
+        db.db
+          .prepare(
+            'INSERT OR IGNORE INTO pref_pending_codex_outputs VALUES(?,?)',
+          )
+          .run(call.sessionId, call.toolUseId)
+        return
+      }
       db.exclude(call)
       counts.unverified++
       return
@@ -591,7 +665,7 @@ function codexRow(
         codexInputTool(item.name) &&
         (!item.namespace || item.namespace === 'functions')
       ) {
-        result(nativeCall(item), item.output, item)
+        result(nativeCall(item), item.output, true, item)
         return
       }
       if (
@@ -703,7 +777,9 @@ function codexRow(
     payload.type === 'function_call_output' ||
     payload.type === 'custom_tool_call_output'
   ) {
-    result(nativeCall(payload), payload.output)
+    if (payload.name && !codexInputTool(payload.name)) return
+    if (payload.namespace && payload.namespace !== 'functions') return
+    result(nativeCall(payload), payload.output, codexInputTool(payload.name))
   }
 }
 

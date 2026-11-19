@@ -6,8 +6,11 @@ import {
   appendFileSync,
   rmSync,
   writeFileSync,
+  readFileSync,
+  existsSync,
+  chmodSync,
 } from 'node:fs'
-import { execFileSync } from 'node:child_process'
+import { fixtureGit } from './git-fixture.mjs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { DatabaseSync } from 'node:sqlite'
@@ -16,6 +19,8 @@ import {
   canonicalRepository,
   hasAnswerNotes,
   isTypedReply,
+  isStandingReplyInstruction,
+  typedResponseId,
 } from '../../dist/preferences/index.js'
 
 const card = {
@@ -67,7 +72,7 @@ function fixture(t) {
     codex = join(root, 'codex'),
     claude = join(root, 'claude')
   mkdirSync(repo)
-  execFileSync('git', ['-C', repo, 'init', '--quiet'])
+  fixtureGit(root, repo, ['init', '--quiet'])
   mkdirSync(join(codex, 'sessions'), { recursive: true })
   mkdirSync(join(claude, 'projects', 'repo'), { recursive: true })
   const file = join(codex, 'sessions', 'rollout-synthetic.jsonl')
@@ -522,6 +527,9 @@ test('questions about tests, documentation and approval leave later decisions el
     'Where should the documentation live?',
     'What does approval mean?',
     'Approval was already recorded.',
+    'Did you remember to ask me for approval?',
+    'Can you explain why I need you to get my approval?',
+    'The guide says to make sure you get my approval.',
   ])
     store.recordInstruction('claude', 'normal', note, base + 500)
   store.recordInstruction(
@@ -542,12 +550,144 @@ test('questions about tests, documentation and approval leave later decisions el
     '変更前に私に確認してください。',
     base + 500,
   )
+  for (const [session, text] of [
+    ['remember', 'Remember to ask me for approval.'],
+    ['ensure', 'Make sure you get my approval first.'],
+    ['need', 'I need you to get my approval.'],
+  ])
+    store.recordInstruction('claude', session, text, base + 500)
 
   // Assert
   assert.equal(decision('normal').eligibleLabel, 'Fix in this PR')
   assert.equal(decision('approval').reason, 'current-instructions')
   assert.equal(decision('polite').reason, 'current-instructions')
   assert.equal(decision('ja').reason, 'current-instructions')
+  assert.equal(decision('remember').reason, 'current-instructions')
+  assert.equal(decision('ensure').reason, 'current-instructions')
+  assert.equal(decision('need').reason, 'current-instructions')
+})
+
+test('withdrawn fallback evidence keeps only an independently validated selection at its actual response time', async (t) => {
+  // Arrange
+  const { store, repo, codex, file } = fixture(t)
+  const independent = { prompt_source: 'typed' }
+  append(join(codex, 'history.jsonl'), [receipt(1500), receipt(11500)])
+  append(file, [
+    question('skew', 1000),
+    typed('direct-skew', 'A', 800, independent),
+    question('skew', 1000),
+    typed('weak-skew', 'A', 1500),
+    question('valid', 11000),
+    typed('weak-valid', 'A', 11500),
+    question('valid', 11000),
+    typed('direct-valid', 'A', 11800, independent),
+  ])
+  const unique = await store.importHistory({ codex })
+  append(file, [
+    question('ambiguous-skew', 1600),
+    typed('second-skew', 'A', 1700),
+    question('ambiguous-valid', 11600),
+    typed('second-valid', 'A', 11700),
+  ])
+
+  // Act
+  const ambiguous = await store.importHistory({ codex })
+
+  // Assert
+  assert.equal(unique.observations, 2)
+  assert.equal(ambiguous.observations, 1)
+  assert.equal(
+    store.evaluate(card, { cwd: repo, now: base + 11600 }).summary.currentTotal,
+    0,
+  )
+  assert.equal(
+    store.evaluate(card, { cwd: repo, now: base + 11900 }).summary.currentTotal,
+    1,
+  )
+  assert.deepEqual(
+    store.humanResponsesSince(0).map((r) => r.responseId),
+    ['prompt:direct-skew', 'prompt:direct-valid'],
+  )
+})
+
+test('an unrelated or unidentified Codex tool output cannot withdraw human workload, while an early empty timed-out answer is excluded when its question arrives', async (t) => {
+  // Arrange
+  const { store, codex, file, db } = fixture(t)
+  const output = (id, body, extra = {}) =>
+    event(
+      'response_item',
+      {
+        type: 'function_call_output',
+        call_id: id,
+        output: typeof body === 'string' ? body : JSON.stringify(body),
+        ...extra,
+      },
+      5,
+    )
+  append(file, [
+    event('response_item', {
+      type: 'function_call',
+      name: 'exec_command',
+      call_id: 'shell',
+      arguments: '{}',
+    }),
+    output('shell', {
+      timed_out: true,
+      source: 'agent',
+      output: 'n'.repeat(200_000),
+    }),
+    output('nested', { delegated: true, payload: { answers: {} } }),
+    output(
+      'named-ordinary',
+      { answers, timedOut: true },
+      { name: 'other_tool' },
+    ),
+    native(
+      {
+        type: 'FunctionCallOutput',
+        id: 'native-ordinary',
+        name: 'exec_command',
+        output: { answers, timedOut: true },
+      },
+      6,
+    ),
+    output('unconfirmed', { answers, timed_out: true }),
+    output('early-empty', { answers: {}, timed_out: true }),
+    output(
+      'explicit',
+      { timed_out: true },
+      { name: 'functions.request_user_input' },
+    ),
+  ])
+  const first = await store.importHistory({ codex })
+  const earlyKeys = store.excludedResponsesSince(0).map((r) => r.responseId)
+  append(file, [
+    ask('early-empty'),
+    reply('early-empty'),
+    ask('human'),
+    reply('human'),
+  ])
+
+  // Act
+  const restarted = new PreferenceStore(db)
+  const final = await restarted.importHistory({ codex })
+
+  // Assert
+  assert.equal(first.unverified, 1)
+  assert.deepEqual(earlyKeys, ['tool:explicit'])
+  assert.equal(final.unverified, 1)
+  assert.equal(final.observations, 1)
+  assert.deepEqual(
+    restarted.humanResponsesSince(0).map((r) => r.responseId),
+    ['tool:human'],
+  )
+  assert.deepEqual(
+    restarted
+      .excludedResponsesSince(0)
+      .map((r) => r.responseId)
+      .sort(),
+    ['tool:early-empty', 'tool:explicit'],
+  )
 })
 
 test('a new task following a question earns no response or Other, while linked replies and choices with qualifications do', async (t) => {
@@ -723,6 +863,8 @@ test('absolute SCP paths share an SSH repository across clones and home-relative
   // Assert
   assert.match(absolute, /^remote:/u)
   assert.equal(absolute, uri)
+  assert.notEqual(absolute, key('git@git.example:/srv/git/project'))
+  assert.notEqual(alice, key('alice@git.example:team/project'))
   assert.notEqual(alice, bob)
   assert.notEqual(alice, key('alice@git.example:/team/project.git'))
   assert.equal(key('alice@git.example:~/team/project.git'), null)
@@ -731,4 +873,398 @@ test('absolute SCP paths share an SSH repository across clones and home-relative
     key('git@github.com:Org/Repo.git'),
     key('https://github.com/org/repo.git'),
   )
+})
+
+test('a native receipt is reserved before assigning another receipt to a nearby answer without a submission ID', async (t) => {
+  // Arrange
+  const { store, codex, file } = fixture(t)
+  append(join(codex, 'history.jsonl'), [
+    receipt(100, 'native-A'),
+    receipt(140, 'native-B'),
+  ])
+  append(file, [
+    question('d1', 25),
+    typed('native-A', 'A', 100),
+    question('d2', 120),
+    typed(undefined, 'A', 150),
+  ])
+
+  // Act
+  const report = await store.importHistory({ codex })
+
+  // Assert
+  assert.equal(report.observations, 2)
+  assert.deepEqual(
+    store.humanResponsesSince(0).map((r) => r.responseId),
+    ['prompt:native-A', typedResponseId('A', base + 150, undefined, 'd2')],
+  )
+})
+
+test('identical independently typed answers within one second credit two distinct questions once across copies', async (t) => {
+  // Arrange
+  const { store, codex, file } = fixture(t)
+  const rows = [
+    question('q1', 100),
+    typed(undefined, 'A', 200, { prompt_source: 'typed' }),
+    question('q2', 300),
+    typed(undefined, 'A', 350, { prompt_source: 'typed' }),
+  ]
+  append(file, [...rows, ...rows])
+
+  // Act
+  const report = await store.importHistory({ codex })
+
+  // Assert
+  assert.equal(report.observations, 2)
+  assert.deepEqual(
+    store.humanResponsesSince(0).map((r) => r.responseId),
+    [
+      typedResponseId('A', base + 200, undefined, 'q1'),
+      typedResponseId('A', base + 350, undefined, 'q2'),
+    ],
+  )
+  assert.notEqual(
+    typedResponseId('A', base + 200, undefined, 'q1'),
+    typedResponseId('A', base + 350, undefined, 'q2'),
+  )
+})
+
+test('a linked native Codex mirror credits a free-form answer once and removes the provisional task instruction', async (t) => {
+  // Arrange
+  const { store, codex, file, repo } = fixture(t)
+  for (let i = 0; i < 25; i++)
+    store.recordHumanSelection({
+      source: 'claude',
+      sessionId: 'training',
+      toolUseId: 't' + i,
+      cwd: repo,
+      card,
+      label: 'Fix in this PR',
+      askedAt: base - 1500 + i * 10,
+      answeredAt: base - 1499 + i * 10,
+    })
+  const message = 'Only for this change, I have a third option.'
+  append(join(codex, 'history.jsonl'), [
+    { session_id: 'root', ts: (base + 200) / 1000, text: message },
+  ])
+  append(file, [question('offer', 100), typed(undefined, message, 200)])
+  await store.importHistory({ codex })
+  const session = { source: 'codex', sessionId: 'root' }
+  const before = store.evaluate(card, { cwd: repo, session })
+  append(file, [
+    native(
+      {
+        type: 'UserMessage',
+        client_id: 'native',
+        id: 'n',
+        reply_to: 'offer',
+        content: [{ type: 'text', text: message }],
+      },
+      201,
+    ),
+  ])
+
+  // Act
+  const report = await store.importHistory({ codex })
+  const after = store.evaluate(card, { cwd: repo, session })
+
+  // Assert
+  assert.equal(before.reason, 'current-instructions')
+  assert.equal(after.eligibleLabel, 'Fix in this PR')
+  assert.equal(report.observations, 26)
+  assert.deepEqual(after.summary.choices.at(-1), {
+    meaning: 'other-response',
+    current: 1,
+    other: 0,
+  })
+  assert.deepEqual(
+    store.humanResponsesSince(base).map((r) => r.responseId),
+    ['prompt:native'],
+  )
+})
+
+test('a restriction inside an explanation request overrides a learned full-suite answer, while a factual question imposes no rule', (t) => {
+  // Arrange
+  const { store, repo } = fixture(t)
+  const tests = {
+    question: 'Which tests should we run?',
+    options: [{ label: 'Focused tests' }, { label: 'Full suite' }],
+  }
+  for (let i = 0; i < 25; i++)
+    store.recordHumanSelection({
+      source: 'claude',
+      sessionId: 'past',
+      toolUseId: 't' + i,
+      cwd: repo,
+      card: tests,
+      label: 'Full suite',
+      askedAt: base + i * 10,
+      answeredAt: base + i * 10 + 1,
+    })
+  store.replay()
+  const decision = (id) =>
+    store.evaluate(tests, {
+      cwd: repo,
+      session: { source: 'claude', sessionId: id },
+    })
+
+  // Act
+  store.recordInstruction(
+    'claude',
+    'limited',
+    'Can you explain the changes and only run focused tests?',
+    base + 1000,
+  )
+  store.recordInstruction(
+    'claude',
+    'unknown',
+    'Can you explain the changes but only use my custom plan?',
+    base + 1000,
+  )
+  store.recordInstruction(
+    'claude',
+    'general',
+    'Why did only focused tests fail?',
+    base + 1000,
+  )
+
+  // Assert
+  assert.equal(decision('limited').reason, 'current-instructions')
+  assert.equal(decision('unknown').reason, 'current-instructions')
+  assert.equal(decision('general').eligibleLabel, 'Full suite')
+})
+
+test('answer qualifications stay local to the selected option, with a standing rule applied only to an explicitly ongoing instruction', async (t) => {
+  // Arrange
+  const { store, repo, codex, file } = fixture(t)
+  for (let i = 0; i < 75; i++)
+    store.recordHumanSelection({
+      source: 'claude',
+      sessionId: 'past',
+      toolUseId: 't' + i,
+      cwd: repo,
+      card,
+      label: 'Fix in this PR',
+      askedAt: base - 1500 + i * 10,
+      answeredAt: base - 1499 + i * 10,
+    })
+  const msg = 'A, only for this change',
+    session = { source: 'codex', sessionId: 'root' }
+  append(join(codex, 'history.jsonl'), [
+    { session_id: 'root', ts: (base + 5200) / 1000, text: msg },
+  ])
+  append(file, [
+    question('one', 100),
+    typed('direct', msg, 180, { prompt_source: 'typed' }),
+    question('two', 5100),
+    typed('joined', msg, 5200),
+  ])
+  await store.importHistory({ codex })
+  const local = store.evaluate(card, { cwd: repo, session })
+  append(file, [
+    question('three', 8000),
+    typed('ongoing', 'A, but always ask me first from now on', 8100, {
+      prompt_source: 'typed',
+    }),
+  ])
+
+  // Act
+  await store.importHistory({ codex })
+
+  // Assert
+  assert.equal(local.eligibleLabel, 'Fix in this PR')
+  assert.equal(
+    isStandingReplyInstruction('A, only if our tests always pass'),
+    false,
+  )
+  assert.equal(
+    isStandingReplyInstruction('A, but never skip tests from now on'),
+    true,
+  )
+  assert.deepEqual(local.summary.choices.at(-1), {
+    meaning: 'other-response',
+    current: 2,
+    other: 0,
+  })
+  assert.equal(
+    store.evaluate(card, { cwd: repo, session }).reason,
+    'current-instructions',
+  )
+})
+
+test('document-language evidence never enables a chat-language answer in the same repository', (t) => {
+  // Arrange
+  const { store, repo, db } = fixture(t)
+  const options = [{ label: 'English' }, { label: 'Japanese' }]
+  const docs = {
+    question: 'Which language should we use for documentation?',
+    options,
+  }
+  const chat = { question: 'Which language should we use in chat?', options }
+  for (let i = 0; i < 25; i++)
+    store.recordHumanSelection({
+      source: 'claude',
+      sessionId: 'past',
+      toolUseId: 'doc' + i,
+      cwd: repo,
+      card: docs,
+      label: 'English',
+      askedAt: base + i * 10,
+      answeredAt: base + i * 10 + 1,
+    })
+  store.replay()
+
+  // Act
+  const document = store.evaluate(
+    { question: '文書は何語で書くべきですか？', options },
+    { cwd: repo },
+  )
+  const conversation = store.evaluate(chat, { cwd: repo })
+  db.exec(
+    "UPDATE pref_offers SET kind='response-language' WHERE kind='documentation-language'; DELETE FROM pref_decoder_versions WHERE version='language-target-and-typed-question-v1'",
+  )
+  const upgraded = new PreferenceStore(db)
+  upgraded.replay()
+
+  // Assert
+  assert.equal(document.eligibleLabel, 'English')
+  assert.equal(conversation.reason, 'no-local-evidence')
+  assert.equal(conversation.summary.currentTotal, 0)
+  assert.equal(upgraded.evaluate(chat, { cwd: repo }).summary.currentTotal, 0)
+  assert.equal(upgraded.evaluate(docs, { cwd: repo }).eligibleLabel, 'English')
+})
+
+test('corrected middle rows with identical size and endpoint anchors retract earlier evidence between imports', async (t) => {
+  // Arrange
+  const { store, codex, file } = fixture(t)
+  append(file, [
+    ask('corrected'),
+    reply('corrected', { timed_out: false }),
+    { type: 'trailer', padding: 'z'.repeat(500) },
+  ])
+  const before = await store.importHistory({ codex })
+  const original = readFileSync(file, 'utf8')
+  const corrected = original.replace('false', 'true ')
+  writeFileSync(file, corrected)
+
+  // Act
+  const after = await store.importHistory({ codex })
+  const again = await store.importHistory({ codex })
+
+  // Assert
+  assert.equal(before.observations, 1)
+  assert.equal(original.length, corrected.length)
+  assert.equal(after.observations, 0)
+  assert.deepEqual(
+    store.excludedResponsesSince(0).map((r) => r.responseId),
+    ['tool:corrected'],
+  )
+  assert.equal(again.bytesRead, 0)
+})
+
+test('a gateway task can run during validation of an append-only multi-megabyte prefix and a concurrent rewrite invalidates that validation', async (t) => {
+  // Arrange
+  const { store, codex, file } = fixture(t)
+  append(file, [
+    ask('watched'),
+    reply('watched', { timed_out: false }),
+    ...Array.from({ length: 32 }, () => ({
+      type: 'padding',
+      value: 'z'.repeat(96 * 1024),
+    })),
+  ])
+  await store.importHistory({ codex })
+  append(file, [{ type: 'append' }])
+  let ticks = 0,
+    done = false
+  const pulse = () => {
+    if (!done) {
+      ticks++
+      setImmediate(pulse)
+    }
+  }
+  setImmediate(pulse)
+  const resumed = await store.importHistory({ codex })
+  done = true
+  const original = readFileSync(file, 'utf8')
+  append(file, [{ type: 'append-two' }])
+  const scanning = store.importHistory({ codex })
+  await new Promise((resolve) =>
+    setImmediate(() =>
+      setImmediate(() => {
+        writeFileSync(file, original.replace('false', 'true '))
+        resolve()
+      }),
+    ),
+  )
+
+  // Act
+  const revised = await scanning
+
+  // Assert
+  assert.ok(ticks >= 10)
+  assert.equal(resumed.bytesRead, Buffer.byteLength('{"type":"append"}\n'))
+  assert.equal(revised.observations, 0)
+  assert.deepEqual(
+    store.excludedResponsesSince(0).map((r) => r.responseId),
+    ['tool:watched'],
+  )
+})
+
+test('Git variables and a rejecting developer hook cannot redirect a fixture commit or write to the inherited repository', (t) => {
+  // Arrange
+  const root = mkdtempSync(join(tmpdir(), 'break-isolated-git-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const inherited = join(root, 'inherited'),
+    repo = join(root, 'fixture'),
+    hooks = join(root, 'hooks')
+  for (const dir of [inherited, repo, hooks]) mkdirSync(dir)
+  fixtureGit(root, inherited, ['init', '--quiet'])
+  const marker = join(root, 'hook-ran')
+  writeFileSync(
+    join(hooks, 'pre-commit'),
+    '#!/bin/sh\ntouch "' + marker + '"\nexit 1\n',
+  )
+  chmodSync(join(hooks, 'pre-commit'), 0o700)
+  const hostile = {
+    GIT_DIR: join(inherited, '.git'),
+    GIT_WORK_TREE: inherited,
+    GIT_COMMON_DIR: join(inherited, '.git'),
+    GIT_CONFIG_COUNT: '1',
+    GIT_CONFIG_KEY_0: 'core.hooksPath',
+    GIT_CONFIG_VALUE_0: hooks,
+  }
+  const saved = Object.fromEntries(
+    Object.keys(hostile).map((key) => [key, process.env[key]]),
+  )
+
+  // Act
+  try {
+    Object.assign(process.env, hostile)
+    fixtureGit(root, repo, ['init', '--quiet'])
+    fixtureGit(root, repo, [
+      '-c',
+      'user.name=Fixture',
+      '-c',
+      'user.email=test@example.invalid',
+      'commit',
+      '--no-gpg-sign',
+      '--allow-empty',
+      '-m',
+      'fixture',
+    ])
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
+
+  // Assert
+  const ref = readFileSync(join(repo, '.git', 'HEAD'), 'utf8')
+    .trim()
+    .replace('ref: ', '')
+  assert.equal(existsSync(join(repo, '.git', ref)), true)
+  assert.equal(existsSync(join(inherited, '.git', ref)), false)
+  assert.equal(existsSync(marker), false)
 })

@@ -636,3 +636,52 @@ test('an ambiguous settlement after a completed card never makes a later unident
   assert.equal(gate.eligible, false)
   assert.match(gate.reason, /already pending/)
 })
+
+test('a pending card remains visibly waiting after observations expire while an unattended terminal becomes unknown', (t) => {
+  // Arrange
+  const { supervisor, observe, advance } = setup(t, { observationTtlMs: 100 })
+  observe('card')
+  observe('other')
+  supervisor.question({
+    sessionId: 'card',
+    questionId: 'q',
+    question: 'Which?',
+  })
+  // Act
+  advance(101)
+  // Assert
+  assert.deepEqual(
+    supervisor.status().sessions.map((s) => [s.sessionId, s.status]),
+    [
+      ['card', 'waiting'],
+      ['other', 'unknown'],
+    ],
+  )
+  assert.equal(supervisor.status().supervising, false)
+})
+test('partial and unavailable polls retain fresh observations until expiry or a complete roster withdrawal', (t) => {
+  // Arrange
+  const { supervisor, advance, clock } = setup(t, { observationTtlMs: 1000 })
+  const poll = (rows, status) =>
+    supervisor.snapshot('codex-app-server', rows, {
+      at: clock(),
+      status,
+      detail: 'test',
+    })
+  const busy = { provider: 'codex', sessionId: 'one', status: 'running' }
+  poll([busy], 'available')
+  advance(100)
+  // Act
+  poll([], 'partial')
+  assert.equal(supervisor.status().sessions[0].status, 'running')
+  advance(100)
+  poll([], 'unavailable')
+  // Assert
+  assert.equal(supervisor.status().sessions[0].status, 'running')
+  advance(801)
+  assert.equal(supervisor.status().sessions[0].status, 'unknown')
+  poll([busy], 'available')
+  advance(1)
+  poll([], 'available')
+  assert.equal(supervisor.status().sessions[0]?.status ?? 'unknown', 'unknown')
+})

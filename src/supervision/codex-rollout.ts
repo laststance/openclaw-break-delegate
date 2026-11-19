@@ -1,12 +1,13 @@
-import { createHash } from 'node:crypto'
+import { typedQuestionId, typedResponseId } from '../preferences/index.js'
 import { constants } from 'node:fs'
-import { open, realpath } from 'node:fs/promises'
+import { open, realpath, type FileHandle } from 'node:fs/promises'
 import { isAbsolute, relative, resolve, sep } from 'node:path'
 import {
   automaticCodexRecord,
   automaticCodexRequest,
   codexCallId,
   codexInputTool,
+  couldBeCodexQuestionResult,
   readCodexResult,
 } from '../provenance.js'
 import type { Activity, Observation } from './workload.js'
@@ -90,15 +91,25 @@ export async function rolloutMeta(
   try {
     const stat = await file.stat()
     if (!stat.isFile()) return
-    const buffer = Buffer.alloc(Math.min(stat.size, headerLimit))
-    const { bytesRead } = await file.read(buffer, 0, buffer.length, 0)
-    const end = buffer.subarray(0, bytesRead).indexOf(10)
-    if (end < 0) return
-    const header = object(JSON.parse(buffer.toString('utf8', 0, end)))
-    return header?.type === 'session_meta' ? object(header.payload) : undefined
+    return await readRolloutHeader(file, stat.size)
   } finally {
     await file.close()
   }
+}
+
+/** Read the session identity from the same inode that supplies native events across path rotation.
+ * @example const meta = await readRolloutHeader(file, size)
+ */
+async function readRolloutHeader(
+  file: FileHandle,
+  size: number,
+): Promise<Json | undefined> {
+  const buffer = Buffer.alloc(Math.min(size, headerLimit))
+  const { bytesRead } = await file.read(buffer, 0, buffer.length, 0)
+  const end = buffer.subarray(0, bytesRead).indexOf(10)
+  if (end < 0) return
+  const header = object(JSON.parse(buffer.toString('utf8', 0, end)))
+  return header?.type === 'session_meta' ? object(header.payload) : undefined
 }
 
 interface Request {
@@ -109,7 +120,17 @@ interface Request {
 interface Turn {
   state: Activity
   pending: Map<string, Request | null>
+  calls: Map<string, { kind: 'question' | 'other' | 'marked'; at: number }>
+  nextPruneAt: number
   previousQuestion?: { id: string; text: string }
+}
+function unknownTurn(): Turn {
+  return {
+    state: 'unknown',
+    pending: new Map(),
+    calls: new Map(),
+    nextPruneAt: 0,
+  }
 }
 interface Tail {
   client: 'cli' | 'desktop'
@@ -217,6 +238,12 @@ function applyEvent(
   const id = codexCallId(p)
   const at =
     typeof value.timestamp === 'string' ? Date.parse(value.timestamp) : NaN
+  if (at >= turn.nextPruneAt) {
+    // Keep tool identities and reordered partial records for the workload window.
+    for (const [key, call] of turn.calls)
+      if (call.at < at - 3_600_000) turn.calls.delete(key)
+    turn.nextPruneAt = at + 60_000
+  }
   const record = (responseId: string, excluded = false) => {
     if (Number.isFinite(at))
       (excluded ? excludedReplies : replies).push({
@@ -233,12 +260,15 @@ function applyEvent(
     ...envelopes: Json[]
   ) => {
     turn.previousQuestion = undefined
+    const marked = turn.calls.get(id)?.kind === 'marked'
+    turn.calls.set(id, { kind: 'question', at })
     if (!args) {
-      if ([value, payload, ...envelopes].some(automaticCodexRecord))
+      if (marked || [value, payload, ...envelopes].some(automaticCodexRecord))
         record('tool:' + id, true)
       return
     }
     const request = requestFor(args, value, payload, ...envelopes)
+    request.automatic ||= marked
     const previous = turn.pending.get(id)
     // The app-server may report an automatic choice on another envelope for the same call.
     if (previous) {
@@ -253,20 +283,31 @@ function applyEvent(
     id: string,
     raw: unknown,
     complete: boolean,
+    namedQuestion: boolean,
     ...envelopes: Json[]
   ) => {
     const request = turn.pending.get(id)
+    const known = turn.calls.get(id)?.kind
+    if (complete) turn.pending.delete(id)
+    const question = namedQuestion || !!request || known === 'question'
+    if (!question && (known === 'other' || !couldBeCodexQuestionResult(raw)))
+      return
     const { output, automatic } = readCodexResult(
       raw,
       value,
       payload,
       ...envelopes,
     )
-    // An early or late marked mirror excludes the same call even after its pending request has closed.
+    if (!question) {
+      // An unnamed answer can precede its offer. Only a later question identity confirms this exclusion.
+      if (automatic) turn.calls.set(id, { kind: 'marked', at })
+      return
+    }
+    turn.calls.set(id, { kind: 'question', at })
+    // A late marked mirror excludes the same call even after its pending request has closed.
     if (automatic || request?.automatic) record('tool:' + id, true)
     else if (complete && request && selectionsMatch(request, output))
       record('tool:' + id)
-    if (complete) turn.pending.delete(id)
   }
   if (value.type === 'event_msg') {
     const item = object(payload.item)
@@ -279,11 +320,26 @@ function applyEvent(
         codexInputTool(item.name) &&
         (!item.namespace || item.namespace === 'functions')
       if (id) {
+        if (
+          (item.type === 'FunctionCall' ||
+            item.type === 'FunctionCallOutput') &&
+          item.name &&
+          !inputTool
+        ) {
+          turn.calls.set(id, { kind: 'other', at })
+          if (
+            item.type === 'FunctionCallOutput' &&
+            payload.type === 'item_completed'
+          )
+            turn.pending.delete(id)
+          return
+        }
         if (item.type === 'FunctionCallOutput' && inputTool) {
           finishRequest(
             id,
             item.output,
             payload.type === 'item_completed',
+            true,
             item,
           )
           return
@@ -334,12 +390,11 @@ function applyEvent(
         turn.previousQuestion = {
           text: p.message,
           id:
-            typeof p.id === 'string'
+            typeof p.id === 'string' && p.id
               ? p.id
-              : createHash('sha256')
-                  .update(String(value.timestamp))
-                  .update(p.message)
-                  .digest('hex'),
+              : typeof p.message_id === 'string' && p.message_id
+                ? p.message_id
+                : typedQuestionId(p.message, at),
         }
       }
     } else if (p.type === 'user_message') {
@@ -365,15 +420,12 @@ function applyEvent(
         !ordinaryReply(text)
       )
         return
-      const answerKey =
-        typeof p.client_id === 'string' && p.client_id
-          ? 'prompt:' + p.client_id
-          : 'typed:' +
-            createHash('sha256')
-              .update(text.normalize('NFKC').trim())
-              .digest('hex') +
-            ':' +
-            Math.floor(at / 1000)
+      const answerKey = typedResponseId(
+        text,
+        at,
+        typeof p.client_id === 'string' ? p.client_id : undefined,
+        previous.id,
+      )
       record(answerKey)
     } else if (
       [
@@ -400,12 +452,20 @@ function applyEvent(
         (!p.namespace || p.namespace === 'functions')
       )
         trackRequest(id, args)
-      else if (name === 'request_permissions') turn.pending.set(id, null)
+      else {
+        turn.calls.set(id, { kind: 'other', at })
+        if (name === 'request_permissions') turn.pending.set(id, null)
+      }
     } else if (
       p.type === 'function_call_output' ||
       p.type === 'custom_tool_call_output'
     ) {
-      finishRequest(id, p.output, true)
+      const namedQuestion =
+        codexInputTool(p.name) && (!p.namespace || p.namespace === 'functions')
+      if (p.name && !namedQuestion) {
+        turn.calls.set(id, { kind: 'other', at })
+        turn.pending.delete(id)
+      } else finishRequest(id, p.output, true, namedQuestion)
     }
   }
 }
@@ -456,7 +516,7 @@ export class RolloutDetector {
           ) {
             // A first read can reconstruct a reply, but only a continuing native writer witnesses new bytes.
             observedLive = false
-            const meta = await rolloutMeta(path, this.#home)
+            const meta = await readRolloutHeader(file, stat.size)
             const client = meta && nativeClient(meta)
             if (!meta || !client || typeof meta.id !== 'string') {
               misses++
@@ -465,11 +525,10 @@ export class RolloutDetector {
             tail = {
               ino: stat.ino,
               offset: Math.max(0, stat.size - tailLimit),
-              state: { state: 'unknown', pending: new Map() },
+              state: unknownTurn(),
               sessionId: meta.id,
               client,
             }
-            this.#tails.set(path, tail)
             // Include the preceding byte: a newline there makes the record at the cutoff complete.
             if (tail.offset > 0) {
               const preceding = tail.offset - 1
@@ -482,6 +541,10 @@ export class RolloutDetector {
           }
           const buffer = Buffer.alloc(stat.size - tail.offset)
           const read = await file.read(buffer, 0, buffer.length, tail.offset)
+          if (read.bytesRead < buffer.length) {
+            misses++
+            continue
+          }
           const complete =
             buffer.subarray(0, read.bytesRead).lastIndexOf(10) + 1
           if (complete) {
@@ -500,12 +563,13 @@ export class RolloutDetector {
                   observedLive,
                 )
               else {
-                tail.state = { state: 'unknown', pending: new Map() }
+                tail.state = unknownTurn()
                 misses++
               }
             }
             tail.offset += complete
           }
+          this.#tails.set(path, tail)
           observations.push({
             provider: 'codex',
             sessionId: tail.sessionId,
@@ -514,7 +578,9 @@ export class RolloutDetector {
               (request) => request === null || request.blocking,
             )
               ? 'waiting'
-              : tail.state.state,
+              : tail.state.state === 'running'
+                ? 'unknown'
+                : tail.state.state,
           })
         } finally {
           await file.close()
@@ -532,7 +598,7 @@ export class RolloutDetector {
         misses > 0 ||
         observations.some((observation) => observation.status === 'unknown'),
       detail:
-        'Live native rollout writers. Unattributed or automatically resolved replies receive no points.',
+        'Native rollout writers confirm reported waits, idle turns and attributable replies. Running time requires live provider status because transient approval waits are not persisted.',
     }
   }
 }

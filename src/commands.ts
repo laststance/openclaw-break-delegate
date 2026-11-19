@@ -196,6 +196,7 @@ export async function runCommand(
   const settings = take('--settings')
   const [op, extra, ...rest] = args
   if (op === 'hook') {
+    // An unavailable hook leaves the original question in Claude's terminal.
     await runHook(
       directory,
       await readHookInput(process.stdin),
@@ -205,7 +206,7 @@ export async function runCommand(
         ),
       undefined,
       extra,
-    )
+    ).catch(() => undefined)
     return
   }
   if (!op || op === 'help' || op === '--help' || op === '-h') {

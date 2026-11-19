@@ -176,6 +176,7 @@ export function createNativeBreakUi(
   let failures = 0
   let retry: NodeJS.Timeout | undefined
   const pending = new Map<number, Pending>()
+  let pendingClear: Promise<NativeStatus> | undefined
   const timeoutMs = options.timeoutMs ?? 8_000
   // Match the gateway's normalized profile path without exposing a folder name on a banner or in argv.
   const profileKey = createHash('sha256')
@@ -200,6 +201,7 @@ export function createNativeBreakUi(
   ): void {
     if (child !== instance) return
     child = undefined
+    pendingClear = undefined
     for (const receipt of pending.values()) {
       clearTimeout(receipt.timer)
       receipt.finish(result)
@@ -325,10 +327,13 @@ export function createNativeBreakUi(
   }
 
   function write(instance: Helper, command: Command): Promise<NativeStatus> {
-    if (pending.size >= 32)
+    // One additional slot lets the gateway withdraw a stale surface when ordinary traffic is full.
+    if (command.kind === 'clear' && pendingClear) return pendingClear
+    if (command.kind !== 'clear' && pending.size >= 32)
       return Promise.resolve(unavailable('The macOS helper is busy.'))
+    pendingClear = undefined
     const request = ++sequence
-    return new Promise((finish) => {
+    const result = new Promise<NativeStatus>((finish) => {
       const delay =
         command.kind === 'authorize' ? Math.max(timeoutMs, 120_000) : timeoutMs
       const timer = setTimeout(() => {
@@ -343,6 +348,14 @@ export function createNativeBreakUi(
       pending.set(request, { finish, timer })
       instance.stdin.write(JSON.stringify({ request, ...command }) + '\n')
     })
+    if (command.kind === 'clear') {
+      pendingClear = result
+      const settled = () => {
+        if (pendingClear === result) pendingClear = undefined
+      }
+      void result.then(settled, settled)
+    }
+    return result
   }
 
   function dispatch(command: Command): Promise<NativeStatus> {
