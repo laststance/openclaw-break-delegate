@@ -1,0 +1,78 @@
+{
+  "name": "@laststance/openclaw-break-delegate",
+  "version": "0.1.0",
+  "description": "Take a macOS break while OpenClaw answers familiar questions in your existing Claude Code sessions.",
+  "license": "MIT",
+  "author": "Laststance",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/laststance/openclaw-break-delegate.git"
+  },
+  "homepage": "https://github.com/laststance/openclaw-break-delegate",
+  "bugs": {
+    "url": "https://github.com/laststance/openclaw-break-delegate/issues"
+  },
+  "keywords": [
+    "openclaw",
+    "openclaw-plugin",
+    "claude-code",
+    "codex",
+    "macos"
+  ],
+  "bin": {
+    "openclaw-break-delegate": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "openclaw.plugin.json",
+    "native/generated/BreakDelegate.app",
+    "native",
+    "README.md",
+    "LICENSE",
+    "DESIGN.md",
+    "GLOSSARY.md",
+    "docs/adr"
+  ],
+  "engines": {
+    "node": ">=24.16.0 <25 || >=26.1.0"
+  },
+  "packageManager": "pnpm@12.15.0",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "build:native": "bash native/build-helper.sh",
+    "test": "pnpm run build && node --test --test-concurrency=2 \"test/**/*.test.mjs\"",
+    "validate": "pnpm test && openclaw plugins validate --root . --json && openclaw plugins lint --root . --json",
+    "pack:release": "node scripts/pack.mjs",
+    "smoke:install": "node scripts/smoke-install.mjs",
+    "format:check": "prettier --check src \"test/**/*.mjs\" \"scripts/*.mjs\""
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.11.5"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "@types/ws": "8.18.2",
+    "openclaw": "2026.11.5",
+    "prettier": "3.10.1",
+    "typescript": "7.0.2"
+  },
+  "openclaw": {
+    "extensions": [
+      "./dist/index.js"
+    ],
+    "compat": {
+      "pluginApi": ">=2026.11.5"
+    },
+    "build": {
+      "openclawVersion": "2026.11.5"
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "typebox": "1.4.2",
+    "ws": "8.22.0"
+  }
+}

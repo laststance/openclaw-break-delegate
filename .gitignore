@@ -1,0 +1,11 @@
+node_modules/
+dist/
+release/
+coverage/
+native/generated/
+!/.gstack/
+/.gstack/*
+!/.gstack/pregate.json
+.serena/
+.DS_Store
+*.tgz
