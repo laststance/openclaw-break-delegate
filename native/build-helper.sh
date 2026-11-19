@@ -40,7 +40,8 @@ cp "$native_dir/macos/Info.plist" "$app/Contents/Info.plist"
 sdk="$(xcrun --sdk macosx --show-sdk-path)"
 for cpu in arm64 x86_64; do
     xcrun swiftc -O -swift-version 5 -target "$cpu-apple-macos13.0" -sdk "$sdk" \
-        "$native_dir/macos/Surface.swift" "$native_dir/macos/ReviewWindow.swift" "$native_dir/macos/BreakApp.swift" "$native_dir/macos/main.swift" \
+        "$native_dir/macos/Surface.swift" "$native_dir/macos/ReviewWindow.swift" "$native_dir/macos/BreakApp.swift" \
+        "$native_dir/macos/ProcessClassifier.swift" "$native_dir/macos/main.swift" \
         -o "$build_dir/$cpu"
 done
 xcrun lipo -create "$build_dir/arm64" "$build_dir/x86_64" -output "$binary"

@@ -8,6 +8,12 @@ import {
   type QuestionCard,
 } from './policy.js'
 import { digest } from './repository.js'
+import {
+  receiptWindow,
+  uniqueTypedMatches,
+  type TypedCandidate,
+  type TypedReceipt,
+} from './receipts.js'
 
 export type EvidenceSource = 'claude' | 'codex'
 export interface Origin {
@@ -125,6 +131,7 @@ export class EvidenceDatabase {
         answered INTEGER, selected TEXT, conflict INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(source,session,tool,question));
       CREATE INDEX IF NOT EXISTS pref_local ON pref_offers(kind,signature,repo,answered);
       CREATE TABLE IF NOT EXISTS pref_exclusions(source TEXT,session TEXT,tool TEXT,PRIMARY KEY(source,session,tool));
+      CREATE TABLE IF NOT EXISTS pref_provisional_claims(source TEXT,session TEXT,tool TEXT,PRIMARY KEY(source,session,tool));
       CREATE TABLE IF NOT EXISTS pref_withdrawals(source TEXT,session TEXT,tool TEXT,seen INTEGER,PRIMARY KEY(source,session,tool));
       CREATE INDEX IF NOT EXISTS pref_withdrawal_times ON pref_withdrawals(seen);
       CREATE TABLE IF NOT EXISTS pref_decoder_versions(version TEXT PRIMARY KEY);
@@ -145,7 +152,14 @@ export class EvidenceDatabase {
         PRIMARY KEY(source,session,hash,at));
       CREATE TABLE IF NOT EXISTS pref_typed_candidates(source TEXT,session TEXT,tool TEXT,question TEXT,hash TEXT,label TEXT,at INTEGER,response_id TEXT,
         PRIMARY KEY(source,session,tool,question,hash,at));
+      CREATE INDEX IF NOT EXISTS pref_typed_candidate_times ON pref_typed_candidates(source,session,hash,at);
+      CREATE TABLE IF NOT EXISTS pref_submissions(source TEXT,session TEXT,hash TEXT,at INTEGER,submission TEXT,PRIMARY KEY(source,session,hash,at,submission));
+      CREATE TABLE IF NOT EXISTS pref_fallback_links(source TEXT,session TEXT,tool TEXT,question TEXT,at INTEGER,PRIMARY KEY(source,session,tool,question,at));
+      CREATE TABLE IF NOT EXISTS pref_direct_text(source TEXT,session TEXT,tool TEXT,response_id TEXT,PRIMARY KEY(source,session,tool,response_id));
+      CREATE TABLE IF NOT EXISTS pref_lost_typed(source TEXT,session TEXT,response_id TEXT,seen INTEGER,PRIMARY KEY(source,session,response_id));
+      CREATE INDEX IF NOT EXISTS pref_lost_typed_times ON pref_lost_typed(seen);
       CREATE TABLE IF NOT EXISTS pref_files(path TEXT PRIMARY KEY,identity TEXT,offset INTEGER,anchor TEXT,skipping INTEGER,state TEXT);
+      CREATE TABLE IF NOT EXISTS pref_file_segments(path TEXT,start INTEGER,stop INTEGER,hash TEXT,PRIMARY KEY(path,start));
       CREATE VIEW IF NOT EXISTS pref_observations AS SELECT o.* FROM pref_offers o WHERE o.answered IS NOT NULL AND o.conflict=0
         AND NOT EXISTS(SELECT 1 FROM pref_exclusions x WHERE x.source=o.source AND x.session=o.session AND x.tool=o.tool);
     `)
@@ -166,6 +180,32 @@ export class EvidenceDatabase {
         DELETE FROM pref_files WHERE json_type(state,'$.interactive') IS NOT NULL;`)
       db.exec(dirty)
     })
+    this.transaction(() => {
+      if (
+        !db
+          .prepare('INSERT OR IGNORE INTO pref_decoder_versions VALUES(?)')
+          .run('unique-typed-receipts-v1').changes
+      )
+        return
+      db.exec(`INSERT OR IGNORE INTO pref_submissions SELECT source,session,hash,at,'' FROM pref_typed_receipts;
+        INSERT OR IGNORE INTO pref_fallback_links SELECT c.source,c.session,c.tool,c.question,c.at FROM pref_typed_candidates c
+        WHERE EXISTS(SELECT 1 FROM pref_responses r WHERE r.source=c.source AND r.session=c.session AND r.tool=c.tool AND r.response_id=c.response_id)
+        OR EXISTS(SELECT 1 FROM pref_offers o WHERE o.source=c.source AND o.session=c.session AND o.tool=c.tool AND o.question=c.question AND o.answered=c.at);`)
+      for (const item of db
+        .prepare(
+          'SELECT DISTINCT source,session,hash,at FROM pref_typed_candidates',
+        )
+        .all()) {
+        this.reconcileTyped(
+          {
+            source: item.source as EvidenceSource,
+            sessionId: String(item.session),
+          },
+          String(item.hash),
+          Number(item.at),
+        )
+      }
+    })
   }
 
   /** Save independently confirmed human effort even when the card has no learned decision type.
@@ -177,7 +217,7 @@ export class EvidenceDatabase {
       !validId(origin.toolUseId) ||
       !responseId ||
       !time(at) ||
-      this.isExcluded(origin)
+      this.isPermanentlyExcluded(origin)
     )
       return
     this.db
@@ -210,6 +250,7 @@ export class EvidenceDatabase {
     const rows = this.db
       .prepare(
         `SELECT w.source,w.session,w.tool,w.seen FROM pref_withdrawals w WHERE w.seen>=?
+      AND NOT EXISTS(SELECT 1 FROM pref_provisional_claims p WHERE p.source=w.source AND p.session=w.session AND p.tool=w.tool)
       AND (EXISTS(SELECT 1 FROM pref_exclusions x WHERE x.source=w.source AND x.session=w.session AND x.tool=w.tool)
         OR NOT EXISTS(SELECT 1 FROM pref_responses r WHERE r.source=w.source AND r.session=w.session AND r.tool=w.tool)) ORDER BY w.seen`,
       )
@@ -229,6 +270,18 @@ export class EvidenceDatabase {
     return !!this.db
       .prepare(
         'SELECT 1 FROM pref_exclusions WHERE source=? AND session=? AND tool=?',
+      )
+      .get(...fields(origin))
+  }
+
+  /** Retain positively attributed human evidence behind a provisional claim in case the original hook later proves it wrote zero bytes.
+   * @example evidence.isPermanentlyExcluded(origin)
+   */
+  isPermanentlyExcluded(origin: Origin): boolean {
+    return !!this.db
+      .prepare(
+        `SELECT 1 FROM pref_exclusions x WHERE x.source=? AND x.session=? AND x.tool=?
+      AND NOT EXISTS(SELECT 1 FROM pref_provisional_claims p WHERE p.source=x.source AND p.session=x.session AND p.tool=x.tool)`,
       )
       .get(...fields(origin))
   }
@@ -317,11 +370,7 @@ export class EvidenceDatabase {
       !offer ||
       offer.conflict ||
       answeredAt < offer.asked ||
-      this.db
-        .prepare(
-          'SELECT 1 FROM pref_exclusions WHERE source=? AND session=? AND tool=?',
-        )
-        .get(...fields(origin))
+      this.isPermanentlyExcluded(origin)
     )
       return false
     const options = JSON.parse(offer.options) as {
@@ -365,22 +414,30 @@ export class EvidenceDatabase {
     return offer.selected === null
   }
 
-  /** Tombstone the canonical provider/session/call before returning a delegated response or importing an automated decision.
+  /** Permanently exclude an automated or ambiguous provider result, including a call already hidden by a delivery claim.
    * @example evidence.exclude({source:'claude', sessionId:'s', toolUseId:'t'})
    */
   exclude(origin: Origin, seenAt = Date.now()): void {
     if (!validId(origin.sessionId) || !validId(origin.toolUseId)) return
+    const provisional = this.db
+      .prepare(
+        'DELETE FROM pref_provisional_claims WHERE source=? AND session=? AND tool=?',
+      )
+      .run(...fields(origin))
     const result = this.db
       .prepare('INSERT OR IGNORE INTO pref_exclusions VALUES(?,?,?)')
       .run(...fields(origin))
-    if (result.changes)
+    if (result.changes || provisional.changes)
       this.db
         .prepare(
           'INSERT INTO pref_withdrawals VALUES(?,?,?,?) ON CONFLICT(source,session,tool) DO UPDATE SET seen=MAX(seen,excluded.seen)',
         )
         .run(...fields(origin), seenAt)
+    if (result.changes) this.invalidateAnswered(origin)
+  }
+
+  private invalidateAnswered(origin: Origin): void {
     if (
-      result.changes &&
       this.db
         .prepare(
           'SELECT 1 FROM pref_offers WHERE source=? AND session=? AND tool=? AND answered IS NOT NULL LIMIT 1',
@@ -388,6 +445,45 @@ export class EvidenceDatabase {
         .get(...fields(origin))
     )
       this.db.exec(dirty)
+  }
+
+  /** Hide a pending delivery's evidence from replay and workload without issuing a permanent withdrawal.
+   * @example evidence.claimDelivery(origin)
+   */
+  claimDelivery(origin: Origin): void {
+    if (
+      !validId(origin.sessionId) ||
+      !validId(origin.toolUseId) ||
+      this.isExcluded(origin)
+    )
+      return
+    this.db
+      .prepare('INSERT INTO pref_provisional_claims VALUES(?,?,?)')
+      .run(...fields(origin))
+    this.db
+      .prepare('INSERT INTO pref_exclusions VALUES(?,?,?)')
+      .run(...fields(origin))
+    this.invalidateAnswered(origin)
+  }
+
+  /** Remove only this plugin's provisional quarantine once the original hook establishes zero bytes were written.
+   * Legacy or explicit provider exclusions have no provisional marker and remain in force.
+   * @example evidence.releaseClaim(origin)
+   */
+  releaseClaim(origin: Origin): boolean {
+    const own = this.db
+      .prepare(
+        'DELETE FROM pref_provisional_claims WHERE source=? AND session=? AND tool=?',
+      )
+      .run(...fields(origin))
+    if (!own.changes) return false
+    this.db
+      .prepare(
+        'DELETE FROM pref_exclusions WHERE source=? AND session=? AND tool=?',
+      )
+      .run(...fields(origin))
+    this.invalidateAnswered(origin)
+    return true
   }
 
   /** Capture only the categorical meaning of a human instruction for live and historical conflict checks.
@@ -576,23 +672,143 @@ export class EvidenceDatabase {
         at,
         responseId,
       )
-    // Codex's CLI history records whole seconds. Permit its one-second precision around the actual submission.
-    const receipt = this.db
+    this.reconcileTyped(origin, hash, at)
+    return !!this.db
       .prepare(
-        'SELECT 1 FROM pref_typed_receipts WHERE source=? AND session=? AND hash=? AND at BETWEEN ? AND ?',
+        'SELECT 1 FROM pref_fallback_links WHERE source=? AND session=? AND tool=? AND question=? AND at=?',
       )
-      .get(origin.source, origin.sessionId, hash, at - 2000, at + 2000)
-    if (!receipt) return false
+      .get(...fields(origin), cleanQuestion(question), at)
+  }
+
+  private reconcileTyped(session: Session, hash: string, at: number): void {
+    const query = [
+      session.source,
+      session.sessionId,
+      hash,
+      at - 4 * receiptWindow,
+      at + 4 * receiptWindow,
+    ] as const
+    const candidates = this.db
+      .prepare(
+        'SELECT tool,question,label,at,response_id FROM pref_typed_candidates WHERE source=? AND session=? AND hash=? AND at BETWEEN ? AND ?',
+      )
+      .all(...query) as unknown as TypedCandidate[]
+    const receipts = this.db
+      .prepare(
+        'SELECT at,submission FROM pref_submissions WHERE source=? AND session=? AND hash=? AND at BETWEEN ? AND ?',
+      )
+      .all(...query) as unknown as TypedReceipt[]
+    const matches = uniqueTypedMatches(candidates, receipts)
+    const affected = candidates.filter(
+      (c) => Math.abs(c.at - at) <= 2 * receiptWindow,
+    )
+    for (const c of affected) {
+      if (matches.has(c)) continue
+      const origin = { ...session, toolUseId: c.tool }
+      const previous = this.db
+        .prepare(
+          'DELETE FROM pref_fallback_links WHERE source=? AND session=? AND tool=? AND question=? AND at=?',
+        )
+        .run(...fields(origin), c.question, c.at)
+      if (!previous.changes) continue
+      // Retract only evidence established by this fallback. A separately attested native submission still stands.
+      if (
+        !this.db
+          .prepare(
+            'SELECT 1 FROM pref_direct_text WHERE source=? AND session=? AND tool=?',
+          )
+          .get(...fields(origin))
+      ) {
+        const withdrawn = this.db
+          .prepare(
+            'UPDATE pref_offers SET selected=NULL,answered=NULL WHERE source=? AND session=? AND tool=? AND question=? AND answered IS NOT NULL',
+          )
+          .run(...fields(origin), c.question)
+        if (withdrawn.changes) this.db.exec(dirty)
+      }
+      if (
+        !this.db
+          .prepare(
+            'SELECT 1 FROM pref_direct_text WHERE source=? AND session=? AND tool=? AND response_id=?',
+          )
+          .get(...fields(origin), c.response_id)
+      ) {
+        const removed = this.db
+          .prepare(
+            'DELETE FROM pref_responses WHERE source=? AND session=? AND tool=? AND response_id=?',
+          )
+          .run(...fields(origin), c.response_id)
+        if (removed.changes)
+          this.db
+            .prepare(
+              'INSERT INTO pref_lost_typed VALUES(?,?,?,?) ON CONFLICT(source,session,response_id) DO UPDATE SET seen=excluded.seen',
+            )
+            .run(session.source, session.sessionId, c.response_id, Date.now())
+      }
+    }
+    // Release new unambiguous pairs only after obsolete matches have freed their canonical response identities.
+    for (const c of affected) {
+      if (!matches.has(c)) continue
+      const origin = { ...session, toolUseId: c.tool }
+      const added = this.db
+        .prepare('INSERT OR IGNORE INTO pref_fallback_links VALUES(?,?,?,?,?)')
+        .run(...fields(origin), c.question, c.at)
+      if (!added.changes) continue
+      this.humanResponse(origin, c.response_id, c.at)
+      this.answer(origin, c.question, c.label, c.at, true)
+    }
+  }
+
+  /** Preserve an independently human-authored text reply when a separate role-only mirror later becomes ambiguous.
+   * @example evidence.directText(origin, responseId, question, label, answeredAt)
+   */
+  directText(
+    origin: Origin,
+    responseId: string,
+    question: string,
+    label: string,
+    at: number,
+  ): void {
+    this.db
+      .prepare('INSERT OR IGNORE INTO pref_direct_text VALUES(?,?,?,?)')
+      .run(...fields(origin), responseId)
     this.humanResponse(origin, responseId, at)
-    return this.answer(origin, question, label, at, true)
+    this.answer(origin, question, label, at, true)
+  }
+
+  /** Expose temporary loss of typed-reply attribution separately from durable automation exclusions.
+   * @example evidence.unmatchedSince(Date.now()-3600000)
+   */
+  unmatchedSince(since: number): HumanResponse[] {
+    return this.db
+      .prepare(
+        `SELECT s.source,s.session,s.response_id,s.seen FROM pref_lost_typed s WHERE s.seen>=? AND NOT EXISTS(
+       SELECT 1 FROM pref_responses r WHERE r.source=s.source AND r.session=s.session AND r.response_id=s.response_id)`,
+      )
+      .all(since)
+      .map((row) => ({
+        source: row.source as EvidenceSource,
+        sessionId: String(row.session),
+        responseId: String(row.response_id),
+        at: Number(row.seen),
+      }))
   }
 
   /** Index an explicitly typed CLI history entry without retaining the person's original text.
    * @example evidence.typedReceipt({source:'codex', sessionId:'s'}, 'A', at)
    */
-  typedReceipt(session: Session, typed: string, at: number): void {
+  typedReceipt(
+    session: Session,
+    typed: string,
+    at: number,
+    nativeId?: string,
+  ): void {
     if (!validId(session.sessionId) || !time(at) || !typed) return
     const hash = digest(typed.trim())
+    const submission = nativeId && validId(nativeId) ? 'prompt:' + nativeId : ''
+    this.db
+      .prepare('INSERT OR IGNORE INTO pref_submissions VALUES(?,?,?,?,?)')
+      .run(session.source, session.sessionId, hash, at, submission)
     this.db
       .prepare('INSERT OR IGNORE INTO pref_typed_receipts VALUES(?,?,?,?)')
       .run(session.source, session.sessionId, hash, at)
@@ -607,22 +823,7 @@ export class EvidenceDatabase {
         Number(item.at),
         JSON.parse(String(item.rules)) as Constraint[],
       )
-    const candidates = this.db
-      .prepare(
-        'SELECT tool,question,label,at,response_id FROM pref_typed_candidates WHERE source=? AND session=? AND hash=? AND at BETWEEN ? AND ?',
-      )
-      .all(session.source, session.sessionId, hash, at - 2000, at + 2000)
-    for (const c of candidates) {
-      const origin = { ...session, toolUseId: String(c.tool) }
-      this.humanResponse(origin, String(c.response_id), Number(c.at))
-      this.answer(
-        origin,
-        String(c.question),
-        String(c.label),
-        Number(c.at),
-        true,
-      )
-    }
+    this.reconcileTyped(session, hash, at)
   }
 
   /** Rebuild the withheld-answer trials only after actual inputs change. Answers must precede the next question strictly.

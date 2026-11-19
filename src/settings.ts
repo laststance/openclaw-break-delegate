@@ -9,6 +9,7 @@ import {
   rm,
 } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
+import { DatabaseSync } from 'node:sqlite'
 import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
@@ -40,44 +41,18 @@ function ours(h: unknown): boolean {
 }
 
 /** Serialize setup and removal, reclaiming a lock only after its recorded owner has exited. */
-async function lockSettings(
-  path: string,
-): Promise<import('node:fs/promises').FileHandle> {
+/** Serialize editors of one Claude settings file using an OS-released file lock.
+ * @example
+ * const owner = lockSettings(settings + '.break-delegate-owner.sqlite')
+ */
+function lockSettings(path: string): DatabaseSync {
+  const owner = new DatabaseSync(path)
   try {
-    const handle = await open(path, 'wx', 0o600)
-    try {
-      await handle.writeFile(String(process.pid))
-      return handle
-    } catch (err) {
-      await handle.close()
-      await rm(path, { force: true })
-      throw err
-    }
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err
-    const previous = await lstat(path)
-    if (
-      !previous.isFile() ||
-      (process.getuid && previous.uid !== process.getuid())
-    )
-      throw err
-    const pid = Number(await readFile(path, 'utf8'))
-    if (Number.isSafeInteger(pid) && pid > 0) {
-      try {
-        process.kill(pid, 0)
-      } catch (probe) {
-        if ((probe as NodeJS.ErrnoException).code === 'ESRCH') {
-          const current = await lstat(path)
-          if (current.ino === previous.ino && current.dev === previous.dev) {
-            await rm(path)
-            return lockSettings(path)
-          }
-        }
-      }
-    }
-    throw new Error(
-      'Claude settings are being edited by another Break Delegate setup. Retry when it finishes.',
-    )
+    owner.exec('PRAGMA busy_timeout=2000; BEGIN EXCLUSIVE')
+    return owner
+  } catch (error) {
+    owner.close()
+    throw error
   }
 }
 
@@ -102,7 +77,7 @@ export async function configureHooks(
   }
   const folder = dirname(file)
   await mkdir(folder, { recursive: true, mode: 0o700 })
-  const lock = await lockSettings(file + '.break-delegate.lock')
+  const lock = lockSettings(file + '.break-delegate-owner.sqlite')
   const tmp = join(folder, '.break-delegate-' + randomUUID() + '.tmp')
   try {
     let old = ''
@@ -125,12 +100,15 @@ export async function configureHooks(
     const original = JSON.stringify(settings)
     const hooks: ObjectValue = isObject(settings.hooks) ? settings.hooks : {}
     const cli = fileURLToPath(new URL('./cli.js', import.meta.url))
-    const command =
-      [process.execPath, cli, '--state-dir', stateDir, 'hook']
-        .map(quoteShell)
-        .join(' ') +
-      ' ' +
-      owned
+    const commandPrefix = [
+      process.execPath,
+      cli,
+      '--state-dir',
+      stateDir,
+      'hook',
+    ]
+      .map(quoteShell)
+      .join(' ')
     for (const [event, matcher] of Object.entries(events)) {
       const current = hooks[event] ?? []
       if (!Array.isArray(current))
@@ -138,16 +116,26 @@ export async function configureHooks(
           'Existing hook list for ' + event + ' must be an array.',
         )
       const entries: unknown[] = []
+      // Setup hands this settings file to the selected profile. Uninstall only removes this profile's commands.
+      const managed = (h: unknown): boolean =>
+        ours(h) &&
+        (mode === 'install' ||
+          (isObject(h) &&
+            typeof h.command === 'string' &&
+            h.command.includes(
+              quoteShell('--state-dir') + ' ' + quoteShell(stateDir) + ' ',
+            )))
+      const command = commandPrefix + ' ' + quoteShell(event) + ' ' + owned
       for (const entry of current) {
         if (
           !isObject(entry) ||
           !Array.isArray(entry.hooks) ||
-          !entry.hooks.some(ours)
+          !entry.hooks.some(managed)
         ) {
           entries.push(entry)
           continue
         }
-        const kept = entry.hooks.filter((h) => !ours(h))
+        const kept = entry.hooks.filter((h) => !managed(h))
         if (kept.length) entries.push({ ...entry, hooks: kept })
       }
       if (mode === 'install')
@@ -161,6 +149,14 @@ export async function configureHooks(
     if (Object.keys(hooks).length) settings.hooks = hooks
     else delete settings.hooks
     if (JSON.stringify(settings) === original) return { changed: false, file }
+    const staged = await open(tmp, 'wx', perms)
+    try {
+      await staged.writeFile(JSON.stringify(settings, null, 2) + '\n')
+      await staged.sync()
+    } finally {
+      await staged.close()
+    }
+    await chmod(tmp, perms)
     // Detect concurrent edits made by Claude or an editor while preparing the update.
     const current = await readFile(file, 'utf8').catch(
       (err: NodeJS.ErrnoException) => {
@@ -172,19 +168,10 @@ export async function configureHooks(
       throw new Error(
         'Claude settings changed. Retry the command against the newer file.',
       )
-    const staged = await open(tmp, 'wx', perms)
-    try {
-      await staged.writeFile(JSON.stringify(settings, null, 2) + '\n')
-      await staged.sync()
-    } finally {
-      await staged.close()
-    }
-    await chmod(tmp, perms)
     await rename(tmp, file)
     return { changed: true, file }
   } finally {
-    await lock.close()
-    await rm(file + '.break-delegate.lock', { force: true })
+    lock.close()
     await rm(tmp, { force: true })
   }
 }

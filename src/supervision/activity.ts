@@ -11,6 +11,7 @@ import {
   RolloutDetector,
   rolloutMeta,
   type DetectorResult,
+  type VerifiedReply,
 } from './codex-rollout.js'
 import type { Supervision } from './coordinator.js'
 import type { Activity, Observation } from './workload.js'
@@ -247,6 +248,7 @@ export class LocalActivityProbe {
   readonly #options: LocalActivityOptions
   readonly #env: NodeJS.ProcessEnv
   readonly #home: string
+  readonly #pendingReplies = new Map<string, VerifiedReply>()
   readonly #detector: RolloutDetector
   readonly #now: () => number
   readonly #timeout: number
@@ -347,6 +349,13 @@ export class LocalActivityProbe {
       ['codex-rollouts', this.#writers()],
     ]
     const results = await Promise.allSettled(sources.map(([, read]) => read))
+    // Readers have advanced their offsets. Retain every witnessed reply before a snapshot can fail.
+    for (const result of results) {
+      if (result.status === 'fulfilled')
+        for (const reply of result.value.replies ?? [])
+          if (!this.#pendingReplies.get(reply.originId)?.observedLive)
+            this.#pendingReplies.set(reply.originId, reply)
+    }
     for (const [i, result] of results.entries()) {
       const source = sources[i][0]
       if (result.status === 'rejected') {
@@ -358,14 +367,17 @@ export class LocalActivityProbe {
         })
         continue
       }
-      const { observations, replies, partial, detail } = result.value
+      const { observations, partial, detail } = result.value
       supervision.snapshot(source, observations, {
         at,
         status: partial ? 'partial' : 'available',
         detail,
       })
-      for (const reply of replies ?? [])
-        supervision.humanReply({ provider: 'codex', ...reply })
+    }
+    for (const [id, reply] of this.#pendingReplies) {
+      supervision.humanReply({ provider: 'codex', ...reply })
+      // An idempotent duplicate or an expired response is also fully processed.
+      this.#pendingReplies.delete(id)
     }
   }
 }

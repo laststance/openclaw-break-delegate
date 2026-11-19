@@ -8,6 +8,8 @@ import {
 import {
   normalizeLabel,
   normalizeQuestionCard,
+  isTypedReply,
+  typedOptionIndex,
   type QuestionCard,
 } from './policy.js'
 import { canonicalRepository, digest } from './repository.js'
@@ -133,6 +135,7 @@ interface Brief {
   tool: string
   question: string
   labels: string[]
+  messageId?: string
 }
 export interface ParseState {
   session?: string
@@ -221,7 +224,7 @@ function answerCall(
   counts: ParseCounts,
 ): void {
   const questions = questionsFor(db, origin, at)
-  if (!questions.length || db.isExcluded(origin)) return
+  if (!questions.length || db.isPermanentlyExcluded(origin)) return
   const answers = record(raw.answers)
   if (!Object.keys(answers).length || automated(raw)) {
     counts.unverified++
@@ -309,6 +312,7 @@ function rememberBrief(
   state: ParseState,
   text: string,
   at: number,
+  messageId?: string,
 ): void {
   delete state.brief
   if (!state.session) return
@@ -320,10 +324,11 @@ function rememberBrief(
         tool: 'text-' + digest(at + '\0' + text),
         question: '',
         labels: [],
+        messageId,
       }
     return
   }
-  state.brief = parsed.brief
+  state.brief = { ...parsed.brief, messageId }
   if (state.repo)
     db.offer({
       source,
@@ -344,12 +349,16 @@ function humanText(
   confirmed: boolean,
   clientId: string,
   counts: ParseCounts,
+  replyTo?: string,
 ): void {
   const pending = state.brief
   delete state.brief
   if (!state.session || !text) return
   const session = { source, sessionId: state.session }
-  if (!pending) {
+  if (
+    !pending ||
+    !isTypedReply(text, pending.labels, pending.messageId, replyTo)
+  ) {
     // Role-only records must join independent input history. A response to one question is not a standing instruction.
     if (confirmed) db.instruction(session, text, at)
     else db.typedInstructionCandidate(session, text, at)
@@ -357,16 +366,16 @@ function humanText(
   }
   const origin = { ...session, toolUseId: pending.tool }
   const typed = text.trim()
-  const ordinal = /^([A-E])[.)]?$/iu.exec(typed)
-  const matching = ordinal
-    ? pending.labels[ordinal[1]!.toUpperCase().charCodeAt(0) - 65]
-    : pending.labels.find(
-        (label) => normalizeLabel(label) === normalizeLabel(typed),
-      )
+  const ordinal = typedOptionIndex(typed)
+  const matching =
+    ordinal !== undefined
+      ? pending.labels[ordinal]
+      : pending.labels.find(
+          (label) => normalizeLabel(label) === normalizeLabel(typed),
+        )
   const responseId = typedResponseId(typed, at, clientId)
   if (confirmed) {
-    db.humanResponse(origin, responseId, at)
-    db.answer(origin, pending.question, matching ?? '', at, true)
+    db.directText(origin, responseId, pending.question, matching ?? '', at)
     if (!matching) db.instruction(session, text, at)
   } else {
     if (
@@ -434,7 +443,14 @@ function claudeRow(
         ['text', 'thinking', 'redacted_thinking'].includes(str(block.type)),
       )
     )
-      rememberBrief(db, 'claude', state, str(texts[0]!.text), at)
+      rememberBrief(
+        db,
+        'claude',
+        state,
+        str(texts[0]!.text),
+        at,
+        str(row.uuid) || str(msg.id),
+      )
     for (const block of blocks) {
       if (
         block.type !== 'tool_use' ||
@@ -501,7 +517,20 @@ function claudeRow(
     delete state.brief
     return
   }
-  humanText(db, 'claude', state, content, at, human, str(row.promptId), counts)
+  humanText(
+    db,
+    'claude',
+    state,
+    content,
+    at,
+    human,
+    str(row.promptId),
+    counts,
+    str(row.reply_to) ||
+      str(row.in_reply_to) ||
+      str(row.replyTo) ||
+      str(msg.reply_to),
+  )
 }
 
 function codexText(
@@ -514,6 +543,8 @@ function codexText(
   human: boolean,
   clientId: string,
   counts: ParseCounts,
+  messageId?: string,
+  replyTo?: string,
 ): void {
   const hash = digest(text)
   const previous = state.lastText
@@ -526,12 +557,25 @@ function codexText(
     Math.abs(at - previous.at) <= 2000
   ) {
     if (speaker === 'user' && human)
-      db.typedReceipt({ source: 'codex', sessionId: state.session! }, text, at)
+      db.typedReceipt(
+        { source: 'codex', sessionId: state.session! },
+        text,
+        at,
+        clientId,
+      )
+    if (
+      speaker === 'agent' &&
+      state.brief &&
+      !state.brief.messageId &&
+      messageId
+    )
+      state.brief.messageId = messageId
     return
   }
   state.lastText = { speaker, format, hash, at }
-  if (speaker === 'agent') rememberBrief(db, 'codex', state, text, at)
-  else humanText(db, 'codex', state, text, at, human, clientId, counts)
+  if (speaker === 'agent')
+    rememberBrief(db, 'codex', state, text, at, messageId)
+  else humanText(db, 'codex', state, text, at, human, clientId, counts, replyTo)
 }
 
 function codexRow(
@@ -671,6 +715,7 @@ function codexRow(
         false,
         '',
         counts,
+        str(payload.id) || str(payload.message_id),
       )
     if (payload.type === 'user_message') {
       const human =
@@ -686,6 +731,8 @@ function codexRow(
         human,
         str(payload.client_id),
         counts,
+        undefined,
+        str(payload.reply_to) || str(payload.in_reply_to),
       )
     }
     if (payload.type === 'item_completed') {
@@ -723,6 +770,11 @@ function codexRow(
           verified,
           clientId,
           counts,
+          str(item.id),
+          str(item.reply_to) ||
+            str(item.in_reply_to) ||
+            str(payload.reply_to) ||
+            str(payload.in_reply_to),
         )
       } else if (item.type === 'HookPrompt') delete state.brief
     }
@@ -780,7 +832,12 @@ export function parseHistoryRow(
           : null,
     )
     if (at !== null && !automated(row))
-      db.typedReceipt(session, str(claude ? row.display : row.text), at)
+      db.typedReceipt(
+        session,
+        str(claude ? row.display : row.text),
+        at,
+        str(claude ? row.promptId : row.client_id),
+      )
     return
   }
   const session = str(row.session_id)

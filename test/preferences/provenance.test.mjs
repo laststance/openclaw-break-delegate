@@ -1,13 +1,21 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, appendFileSync, rmSync } from 'node:fs'
+import {
+  mkdtempSync,
+  mkdirSync,
+  appendFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { DatabaseSync } from 'node:sqlite'
 import {
   PreferenceStore,
+  canonicalRepository,
   hasAnswerNotes,
+  isTypedReply,
 } from '../../dist/preferences/index.js'
 
 const card = {
@@ -408,4 +416,319 @@ test('a truncated instruction holds a qualified proposal even when its retained 
   // Assert
   assert.equal(before.eligibleLabel, 'Fix in this PR')
   assert.equal(store.evaluate(card, context).reason, 'current-instructions')
+})
+
+const brief =
+  'D1 — How should we handle an unrelated bug?\nA) Fix in this PR\nB) Open a separate issue\n<gstack-qid:scope>'
+const question = (id, t, message = brief) =>
+  event('event_msg', { type: 'agent_message', id, message }, t)
+const typed = (client_id, message, t, details = {}) =>
+  event(
+    'event_msg',
+    { type: 'user_message', client_id, message, ...details },
+    t,
+  )
+const receipt = (t, client_id) => ({
+  session_id: 'root',
+  ts: (base + t) / 1000,
+  text: 'A',
+  client_id,
+})
+
+test('a zero-byte delivery releases the verified human answer received during its claim, while actual automation remains excluded', async (t) => {
+  // Arrange
+  const { store, repo, file, codex } = fixture(t)
+  store.excludeDelegated('codex', 'root', 'zero')
+  store.excludeDelegated('codex', 'root', 'automated')
+  store.excludeDelegated('claude', 'live', 'zero-live')
+  store.excludeDelegated('claude', 'live', 'ambiguous')
+  const live = {
+    source: 'claude',
+    sessionId: 'live',
+    cwd: repo,
+    card,
+    label: 'Fix in this PR',
+    askedAt: base,
+    answeredAt: base + 1,
+  }
+  store.recordHumanSelection({ ...live, toolUseId: 'zero-live' })
+  store.recordHumanSelection({ ...live, toolUseId: 'ambiguous' })
+  append(file, [
+    ask('zero'),
+    reply('zero'),
+    ask('automated'),
+    reply('automated'),
+    reply('automated', { timedOut: true }, 30),
+  ])
+  const before = await store.importHistory({ codex })
+
+  // Act
+  const hidden = store.humanResponsesSince(0)
+  const withdrawals = store.excludedResponsesSince(0).map((r) => r.responseId)
+  const restored = store.releaseUndelivered('codex', 'root', 'zero')
+  const again = store.releaseUndelivered('codex', 'root', 'zero')
+  const neverReleased = store.releaseUndelivered('codex', 'root', 'automated')
+  const liveRestored = store.releaseUndelivered('claude', 'live', 'zero-live')
+  const after = await store.importHistory({ codex })
+  store.excludeDelegated('claude', 'live', 'later')
+  store.releaseUndelivered('claude', 'live', 'later')
+  store.recordHumanSelection({ ...live, toolUseId: 'later' })
+
+  // Assert
+  assert.equal(before.observations, 0)
+  assert.deepEqual(hidden, [])
+  assert.deepEqual(withdrawals, ['tool:automated'])
+  assert.deepEqual(
+    [restored, again, neverReleased, liveRestored],
+    [true, false, false, true],
+  )
+  assert.equal(after.observations, 2)
+  assert.equal(after.bytesRead, 0)
+  assert.equal(store.isDelegated('claude', 'live', 'ambiguous'), true)
+  assert.deepEqual(
+    store
+      .humanResponsesSince(0)
+      .map((r) => r.responseId)
+      .sort(),
+    ['tool:later', 'tool:zero', 'tool:zero-live'],
+  )
+  assert.equal(store.evaluate(card, { cwd: repo }).summary.currentTotal, 3)
+})
+
+test('questions about tests, documentation and approval leave later decisions eligible while a request to obtain approval holds them', (t) => {
+  // Arrange
+  const { store, repo } = fixture(t)
+  for (let i = 0; i < 25; i++)
+    store.recordHumanSelection({
+      source: 'claude',
+      sessionId: 'training',
+      toolUseId: 'decision-' + i,
+      cwd: repo,
+      card,
+      label: 'Fix in this PR',
+      askedAt: base + i * 10,
+      answeredAt: base + i * 10 + 1,
+    })
+  store.replay()
+  const decision = (sessionId) =>
+    store.evaluate(card, {
+      cwd: repo,
+      session: { source: 'claude', sessionId },
+    })
+
+  // Act
+  for (const note of [
+    'Why did the tests fail?',
+    'Where should the documentation live?',
+    'What does approval mean?',
+    'Approval was already recorded.',
+  ])
+    store.recordInstruction('claude', 'normal', note, base + 500)
+  store.recordInstruction(
+    'claude',
+    'approval',
+    'Ask me for approval.',
+    base + 500,
+  )
+  store.recordInstruction(
+    'claude',
+    'polite',
+    'Could you ask me for approval?',
+    base + 500,
+  )
+  store.recordInstruction(
+    'claude',
+    'ja',
+    '変更前に私に確認してください。',
+    base + 500,
+  )
+
+  // Assert
+  assert.equal(decision('normal').eligibleLabel, 'Fix in this PR')
+  assert.equal(decision('approval').reason, 'current-instructions')
+  assert.equal(decision('polite').reason, 'current-instructions')
+  assert.equal(decision('ja').reason, 'current-instructions')
+})
+
+test('a new task following a question earns no response or Other, while linked replies and choices with qualifications do', async (t) => {
+  // Arrange
+  const { store, repo, codex, file } = fixture(t)
+  const fromHuman = { prompt_source: 'typed' }
+  append(file, [
+    question('q1', 100),
+    typed('new-task', 'Build a calendar page', 200, fromHuman),
+    question('q2', 300, 'Which detail should I explain?'),
+    typed(
+      'new-task-2',
+      'Only inspect the code. Do not edit it.',
+      400,
+      fromHuman,
+    ),
+    question('q3', 500),
+    typed('linked', 'My own wording for this choice', 600, {
+      ...fromHuman,
+      reply_to: 'q3',
+    }),
+    question('q4', 700),
+    typed('wrong-link', 'A', 800, { ...fromHuman, reply_to: 'q3' }),
+    question('q5', 900),
+    typed('qualified', 'A, if the owner approves later', 1000, fromHuman),
+    question('q6', 1100),
+    typed('number', 'option 2', 1200, fromHuman),
+  ])
+
+  // Act
+  const report = await store.importHistory({ codex })
+  const summary = store.evaluate(card, { cwd: repo }).summary
+
+  // Assert
+  assert.equal(report.observations, 3)
+  assert.deepEqual(
+    store.humanResponsesSince(0).map((r) => r.responseId),
+    ['prompt:linked', 'prompt:qualified', 'prompt:number'],
+  )
+  assert.deepEqual(summary.choices, [
+    { meaning: 'current-change', current: 0, other: 0 },
+    { meaning: 'separate-issue', current: 1, other: 0 },
+    { meaning: 'other-response', current: 2, other: 0 },
+  ])
+  assert.equal(
+    isTypedReply(
+      'Build a calendar page',
+      card.options.map((o) => o.label),
+    ),
+    false,
+  )
+  assert.equal(isTypedReply('A', ['a', 'b'], 'q2', 'q1'), false)
+  assert.equal(isTypedReply('Only inspect the code.', [], 'q2', 'q2'), true)
+  assert.equal(isTypedReply('A、ただし確認した後で', ['直す', '次回']), true)
+})
+
+test('a receipt arriving first loses its provisional credit when two replies qualify, until a native submission identifies one answer', async (t) => {
+  // Arrange
+  const { store, codex, file } = fixture(t)
+  const input = join(codex, 'history.jsonl')
+  append(input, [receipt(1000)])
+  append(file, [question('first', 100), typed('first', 'A', 500)])
+  const unique = await store.importHistory({ codex })
+  const uniqueIds = store.humanResponsesSince(0).map((r) => r.responseId)
+  append(file, [question('second', 800), typed('second', 'A', 1200)])
+
+  // Act
+  const ambiguous = await store.importHistory({ codex })
+  const ambiguousIds = store.humanResponsesSince(0)
+  const withdrawn = store
+    .unmatchedTypedResponsesSince(0)
+    .map((r) => r.responseId)
+  append(input, [receipt(1250, 'second'), receipt(1270, 'second')])
+  const identified = await store.importHistory({ codex })
+
+  // Assert
+  assert.equal(unique.observations, 1)
+  assert.deepEqual(uniqueIds, ['prompt:first'])
+  assert.equal(ambiguous.observations, 0)
+  assert.deepEqual(ambiguousIds, [])
+  assert.deepEqual(withdrawn, ['prompt:first'])
+  assert.deepEqual(store.excludedResponsesSince(0), [])
+  assert.equal(identified.observations, 1)
+  assert.deepEqual(
+    store.humanResponsesSince(0).map((r) => r.responseId),
+    ['prompt:second'],
+  )
+})
+
+test('a late anonymous receipt cannot certify either of two existing candidates, while their separate native submission IDs certify each once', async (t) => {
+  // Arrange
+  const { store, codex, file } = fixture(t)
+  const input = join(codex, 'history.jsonl')
+  append(file, [
+    question('first', 100),
+    typed('first', 'A', 500),
+    question('second', 800),
+    typed('second', 'A', 1200),
+  ])
+  const noReceipts = await store.importHistory({ codex })
+  append(input, [receipt(1000)])
+
+  // Act
+  const anonymous = await store.importHistory({ codex })
+  const anonymousIds = store.humanResponsesSince(0)
+  append(input, [receipt(1030, 'second'), receipt(1080, 'first')])
+  const identified = await store.importHistory({ codex })
+
+  // Assert
+  assert.equal(noReceipts.observations, 0)
+  assert.equal(anonymous.observations, 0)
+  assert.deepEqual(anonymousIds, [])
+  assert.equal(identified.observations, 2)
+  assert.deepEqual(
+    store.humanResponsesSince(0).map((r) => r.responseId),
+    ['prompt:first', 'prompt:second'],
+  )
+})
+
+test('a history rewritten and regrown during a yielded import replays the replacement prefix and resumes at its correct end', async (t) => {
+  // Arrange
+  const { store, repo, file, codex } = fixture(t)
+  const pad = { type: 'padding', value: 'X'.repeat(145000) }
+  const leading = { type: 'padding', value: 'same prefix '.repeat(36) }
+  const rows = (id, questions) =>
+    [
+      leading,
+      event('session_meta', { id, cwd: repo, source: 'cli' }),
+      ...questions,
+      pad,
+      pad,
+      pad,
+    ]
+      .map((r) => JSON.stringify(r))
+      .join('\n') + '\n'
+  writeFileSync(file, rows('original', []))
+  const replacing = rows('replacement', [
+    ask('from-prefix'),
+    reply('from-prefix'),
+  ])
+
+  // Act
+  const scanning = store.importHistory({ codex })
+  await new Promise((resolve) =>
+    setImmediate(() => {
+      writeFileSync(file, replacing)
+      resolve()
+    }),
+  )
+  const first = await scanning
+  const second = await store.importHistory({ codex })
+
+  // Assert
+  assert.equal(first.observations, 1)
+  assert.equal(first.unreadable, 0)
+  assert.deepEqual(
+    store.humanResponsesSince(0).map((r) => [r.sessionId, r.responseId]),
+    [['replacement', 'tool:from-prefix']],
+  )
+  assert.equal(second.bytesRead, 0)
+})
+
+test('absolute SCP paths share an SSH repository across clones and home-relative repositories remain specific to their login', () => {
+  // Arrange
+  const key = (remote) => canonicalRepository('', remote)
+
+  // Act
+  const absolute = key('git@git.example:/srv/git/project.git')
+  const uri = key('ssh://git@git.example/srv/git/project.git')
+  const alice = key('alice@git.example:team/project.git')
+  const bob = key('bob@git.example:team/project.git')
+
+  // Assert
+  assert.match(absolute, /^remote:/u)
+  assert.equal(absolute, uri)
+  assert.notEqual(alice, bob)
+  assert.notEqual(alice, key('alice@git.example:/team/project.git'))
+  assert.equal(key('alice@git.example:~/team/project.git'), null)
+  assert.equal(key('ssh://alice@git.example/~alice/team/project.git'), null)
+  assert.equal(
+    key('git@github.com:Org/Repo.git'),
+    key('https://github.com/org/repo.git'),
+  )
 })

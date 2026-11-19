@@ -86,6 +86,42 @@ enum SurfaceChecks {
         precondition(NotificationProfile(key: "") == nil)
         precondition(NotificationProfile(key: String(repeating: "z", count: 64)) == nil)
 
+        // Late delivery confirmation revises the original review without issuing another presentation ID.
+        let settled = BreakReview(answered: [.init(question: "Which option?", answer: "First")], held: [],
+                                  answeredTotal: 1, heldTotal: 0)
+        let update = GatewayCommand(request: 5, kind: .refreshSummary, id: "break-one", endsAt: nil, review: settled)
+        var returned = ReturnedReview(id: "break-one", review: review)
+        precondition(returned.refresh(from: update))
+        precondition(returned.review.answered.first?.answer == "First")
+        var displayed = digest
+        displayed.refresh(returned)
+        precondition(displayed.requestID == digest.requestID)
+        precondition(displayed.notification.content.body == "1 answered · 0 held. Open the review to read them.")
+        var nextBreak = active
+        nextBreak.refresh(returned)
+        precondition(nextBreak.kind == .active && nextBreak.requestID == active.requestID)
+        var newerReview = ReturnedReview(id: "break-two", review: review)
+        precondition(!newerReview.refresh(from: update))
+        precondition(newerReview.review.heldTotal == 6)
+
+        // KERN_PROCARGS2 stores argv and environment separately. Only whole CLI switches control mode.
+        func arguments(_ executable: String, _ argv: [String]) -> [UInt8] {
+            var count = Int32(argv.count)
+            var bytes = withUnsafeBytes(of: &count) { Array($0) }
+            bytes += Array(executable.utf8) + [0, 0, 0]
+            for arg in argv { bytes += Array(arg.utf8) + [0] }
+            return bytes + Array("--print".utf8) + [0]
+        }
+        let binary = "/Users/demo/.local/share/claude/versions/2.1.328"
+        precondition(classifyClaudeArguments(arguments(binary, ["claude", "Explain how --print works"])) == .interactive)
+        precondition(classifyClaudeArguments(arguments(binary, ["claude", "--print", "any question"])) == .headless)
+        precondition(classifyClaudeArguments(arguments(binary, ["claude", "--", "--print"])) == .interactive)
+        let cli = "/tmp/node_modules/@anthropic-ai/claude-code/cli.js"
+        precondition(classifyClaudeArguments(arguments("/usr/local/bin/node", ["node", cli, "Explain how -p works"])) == .interactive)
+        precondition(classifyClaudeArguments(arguments("/usr/local/bin/node", ["node", cli, "--output-format=json"])) == .headless)
+        precondition(classifyClaudeArguments(arguments("/usr/local/bin/node", ["node", "/tmp/tool.js", cli, "--print"])) == .unrelated)
+        precondition(classifyClaudeArguments([2, 0, 0, 0]) == .unknown)
+
         if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--render-review" {
             try captureReview(review, directory: URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true))
         }

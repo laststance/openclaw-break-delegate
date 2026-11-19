@@ -19,7 +19,7 @@ import { canonicalRepository } from './repository.js'
 
 export { typedResponseId } from './database.js'
 export { canonicalRepository } from './repository.js'
-export { classifyCard, normalizeQuestionCard } from './policy.js'
+export { classifyCard, normalizeQuestionCard, isTypedReply } from './policy.js'
 export { hasAnswerNotes } from './records.js'
 export type {
   EvidenceSource,
@@ -113,7 +113,7 @@ export class PreferenceStore {
       return false
     const repo = canonicalRepository(selection.cwd)
     return this.evidence.transaction(() => {
-      if (this.evidence.isExcluded(selection)) return false
+      if (this.evidence.isPermanentlyExcluded(selection)) return false
       this.evidence.humanResponse(
         selection,
         'tool:' + selection.toolUseId,
@@ -122,13 +122,14 @@ export class PreferenceStore {
       for (const line of selection.instructions ?? [])
         this.evidence.instruction(selection, line, selection.askedAt, true)
       if (!repo || !this.evidence.offer({ ...selection, repo })) return false
-      return this.evidence.answer(
+      const recorded = this.evidence.answer(
         selection,
         selection.card.question,
         selection.conditional ? '' : selection.label,
         selection.answeredAt,
         true,
       )
+      return recorded && !this.evidence.isExcluded(selection)
     })
   }
 
@@ -154,7 +155,21 @@ export class PreferenceStore {
     toolUseId: string,
   ): void {
     this.evidence.transaction(() =>
-      this.evidence.exclude({ source, sessionId, toolUseId }),
+      this.evidence.claimDelivery({ source, sessionId, toolUseId }),
+    )
+  }
+
+  /** Restore eligible human evidence once the caller verifies that the issuing hook wrote zero answer bytes.
+   * The supervisor retains ownership of the consumed delivery claim.
+   * @example store.releaseUndelivered('claude',sessionId,toolUseId)
+   */
+  releaseUndelivered(
+    source: EvidenceSource,
+    sessionId: string,
+    toolUseId: string,
+  ): boolean {
+    return this.evidence.transaction(() =>
+      this.evidence.releaseClaim({ source, sessionId, toolUseId }),
     )
   }
 
@@ -181,5 +196,12 @@ export class PreferenceStore {
    */
   excludedResponsesSince(since: number): HumanResponse[] {
     return this.evidence.withdrawalsSince(since)
+  }
+
+  /** Report reversible typed correlations that lost their unique submission evidence to the local workload owner.
+   * @example store.unmatchedTypedResponsesSince(Date.now()-3_600_000)
+   */
+  unmatchedTypedResponsesSince(since: number): HumanResponse[] {
+    return this.evidence.unmatchedSince(since)
   }
 }

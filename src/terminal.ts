@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process'
+import { nativeHelperExecutable } from './native/index.js'
 
 /** Identify the interactive Claude process above a piped hook, including its start epoch.
  * A headless Claude invocation can inherit a TTY, so check its launch arguments too.
@@ -35,27 +36,22 @@ export function claudeTerminal(): string | undefined {
           command,
         )
       ) {
-        // Arguments stay inside this process. Only the instance identifier is sent.
-        const args = execFileSync(
-          '/bin/ps',
-          ['-ww', '-p', String(pid), '-o', 'command='],
-          { encoding: 'utf8', timeout: 800, maxBuffer: 256_000 },
+        // Darwin provides the original argv boundaries; prompt prose cannot create a print-mode flag.
+        const mode = execFileSync(
+          nativeHelperExecutable,
+          ['--classify-claude-process', String(pid)],
+          {
+            encoding: 'utf8',
+            timeout: 1000,
+            maxBuffer: 100,
+            stdio: ['ignore', 'pipe', 'ignore'],
+          },
         ).trim()
-        if (
-          /(?:^|[\s/])claude(?:\s|$)|@anthropic-ai\/claude-code|\/share\/claude\/versions\//.test(
-            args,
-          )
-        ) {
-          if (
-            tty === '??' ||
-            tty === '?' ||
-            /(?:^|\s)(?:-p|--print|--input-format|--output-format)(?:\s|=|$)/.test(
-              args,
-            )
-          )
-            return
-          return pid + ':' + started.replace(/\s+/g, ' ')
-        }
+        if (mode === 'headless') return
+        if (mode === 'interactive')
+          return tty === '??' || tty === '?'
+            ? undefined
+            : pid + ':' + started.replace(/\s+/g, ' ')
       }
       pid = Number(parent)
     } catch {

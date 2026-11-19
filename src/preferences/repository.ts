@@ -12,12 +12,23 @@ export function digest(value: string): string {
 
 function remoteIdentity(value: string): string | null {
   let remote: URL
+  let relativeSsh = false
   try {
-    // SCP-style SSH and HTTPS clones share a repository even when their login differs.
-    const scp = /^([^@/:]+@)?([^/:]+):([^/].*)$/u.exec(value)
-    remote = new URL(
-      !value.includes('://') && scp ? 'ssh://' + scp[2] + '/' + scp[3] : value,
-    )
+    const scp =
+      !value.includes('://') &&
+      /^(?:([^@/:\s]+)@)?([^/:\s]+):(.+)$/u.exec(value)
+    if (scp) {
+      const path = scp[3]!
+      if (path.startsWith('~')) return null
+      relativeSsh = !path.startsWith('/')
+      remote = new URL(
+        'ssh://' +
+          (scp[1] ? scp[1] + '@' : '') +
+          scp[2] +
+          (relativeSsh ? '/' : '') +
+          path,
+      )
+    } else remote = new URL(value)
   } catch {
     return null
   }
@@ -29,10 +40,28 @@ function remoteIdentity(value: string): string | null {
   )
     return null
   const host = remote.hostname.toLowerCase()
+  if (remote.protocol === 'ssh:' && remote.pathname.startsWith('/~'))
+    return null
   const path = remote.pathname
     .replace(/^\/+|\/+$/gu, '')
     .replace(/\.git$/iu, '')
   if (!path || !path.includes('/')) return null
+  // Generic SSH servers interpret a relative SCP path inside the named account's home. GitHub owner/repository paths have host-wide meaning.
+  if (host !== 'github.com' && remote.protocol === 'ssh:') {
+    if (relativeSsh && !remote.username) return null
+    return (
+      'remote:' +
+      digest(
+        JSON.stringify([
+          'ssh',
+          remote.host.toLowerCase(),
+          remote.username,
+          relativeSsh ? 'home' : 'absolute',
+          path,
+        ]),
+      )
+    )
+  }
   return (
     'remote:' +
     digest(

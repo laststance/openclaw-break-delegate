@@ -29,6 +29,14 @@ const entry = defineToolPlugin({
           description: 'Configured agent for tool-free confirmation.',
         }),
       ),
+      maxConfirmationsPerBreak: Type.Optional(
+        Type.Integer({
+          minimum: 1,
+          maximum: 10000,
+          description:
+            'Maximum model confirmation requests during one delegated break (default 60).',
+        }),
+      ),
       workload: Type.Optional(
         Type.Object(
           {
@@ -97,6 +105,10 @@ entry.register = (api) => {
         : undefined
       stop = await startService({
         workload,
+        maxConfirmationsPerBreak:
+          typeof api.pluginConfig?.maxConfirmationsPerBreak === 'number'
+            ? api.pluginConfig.maxConfirmationsPerBreak
+            : undefined,
         directory: dataDirectory(ctx.stateDir),
         roots,
         judge: createJudge(api, agentId),

@@ -27,6 +27,7 @@ export interface NativeBreakUi {
   invite(invitationId: string): Promise<NativeStatus>
   active(breakId: string, endsAtEpochMs: number): Promise<NativeStatus>
   summary(breakId: string, review: NativeReview): Promise<NativeStatus>
+  refreshSummary?(breakId: string, review: NativeReview): Promise<void>
   clear(): Promise<NativeStatus>
   close(): void
 }
@@ -36,10 +37,17 @@ type ReviewPreview = NativeReview & { answeredTotal: number; heldTotal: number }
 type Presentation =
   | { kind: 'invite'; id: string }
   | { kind: 'active'; id: string; endsAt: number }
-  | { kind: 'summary'; id: string; review: ReviewPreview }
-type Command = StatusCommand | Presentation
+  | { kind: 'summary'; id: string; review: ReviewPreview; silent?: boolean }
+type Summary = Extract<Presentation, { kind: 'summary' }>
+type Command =
+  | StatusCommand
+  | Presentation
+  | { kind: 'refreshSummary'; id: string; review: ReviewPreview }
 type Helper = ChildProcessByStdio<Writable, Readable, null>
-type ActionHandler = (action: NativeAction) => void | Promise<void>
+type ActionResult = void | 'restore-invitation'
+type ActionHandler = (
+  action: NativeAction,
+) => ActionResult | Promise<ActionResult>
 type LaunchOptions = {
   profileDirectory?: string
   launch?: (profileKey: string) => Helper
@@ -48,7 +56,7 @@ type LaunchOptions = {
 }
 type Pending = { finish: (status: NativeStatus) => void; timer: NodeJS.Timeout }
 
-const executable = fileURLToPath(
+export const nativeHelperExecutable = fileURLToPath(
   new URL(
     '../../native/generated/BreakDelegate.app/Contents/MacOS/BreakDelegate',
     import.meta.url,
@@ -76,7 +84,7 @@ function launchHelper(profileKey: string): Helper {
   if (process.platform !== 'darwin')
     throw new Error('Native notifications require a macOS desktop session.')
   try {
-    accessSync(executable, constants.X_OK)
+    accessSync(nativeHelperExecutable, constants.X_OK)
   } catch {
     throw new Error(
       'The signed Break Delegate app is missing or cannot be executed. Install a package containing the native helper.',
@@ -95,7 +103,7 @@ function launchHelper(profileKey: string): Helper {
   ]) {
     if (process.env[key]) env[key] = process.env[key]
   }
-  return spawn(executable, ['--bridge', profileKey], {
+  return spawn(nativeHelperExecutable, ['--bridge', profileKey], {
     stdio: ['pipe', 'pipe', 'ignore'],
     env,
   })
@@ -161,8 +169,10 @@ export function createNativeBreakUi(
 ): NativeBreakUi {
   let child: Helper | undefined
   let desired: Presentation | undefined
+  let latestReview: Summary | undefined
   let closed = false
   let sequence = 0
+  let presentationVersion = 0
   let failures = 0
   let retry: NodeJS.Timeout | undefined
   const pending = new Map<number, Pending>()
@@ -247,11 +257,24 @@ export function createNativeBreakUi(
       kind === 'return' &&
       desired.endsAt > Date.now()
     if (!inviteChoice && !earlyReturn) return
-    const id = desired.id
+    const chosen = desired
+    const version = presentationVersion
     desired = undefined
     // Consume synchronously before handing off so duplicate frames cannot start a second break.
     void Promise.resolve()
-      .then(() => onAction({ kind, id }))
+      .then(() => onAction({ kind, id: chosen.id }))
+      .then((result) => {
+        // Only the coordinator knows whether a rejected invitation still exists. Present a new choice.
+        if (
+          result === 'restore-invitation' &&
+          kind === 'start' &&
+          chosen.kind === 'invite' &&
+          !closed &&
+          !desired &&
+          presentationVersion === version
+        )
+          return present(chosen)
+      })
       .catch(() => {
         // A failed owner callback has an unknown outcome and must never be replayed automatically.
       })
@@ -330,6 +353,15 @@ export function createNativeBreakUi(
     try {
       const fresh = !child
       const instance = connect()
+      // Keep the last review accessible from the menu if a later break's helper reconnects.
+      if (
+        fresh &&
+        latestReview &&
+        desired?.kind !== 'summary' &&
+        command.kind !== 'summary'
+      ) {
+        void write(instance, latestReview)
+      }
       // A status query can reconnect before the scheduled retry. Restore its outstanding surface first.
       if (fresh && desired && command !== desired) void write(instance, desired)
       return write(instance, command)
@@ -368,6 +400,7 @@ export function createNativeBreakUi(
         unavailable('This break has already ended or has an invalid deadline.'),
       )
     }
+    presentationVersion++
     desired = surface
     return dispatch(surface)
   }
@@ -377,16 +410,45 @@ export function createNativeBreakUi(
     authorize: () => dispatch({ kind: 'authorize' }),
     invite: (id) => present({ kind: 'invite', id }),
     active: (id, endsAt) => present({ kind: 'active', id, endsAt }),
-    summary: (id, review) =>
-      present({ kind: 'summary', id, review: previewReview(review) }),
+    summary(id, review) {
+      const first: Summary = {
+        kind: 'summary',
+        id,
+        review: previewReview(review),
+      }
+      const result = present(first)
+      if (desired === first) {
+        // Only the original summary posts a banner. Restoring the menu is silent.
+        latestReview = { ...first, silent: true }
+        desired = latestReview
+      }
+      return result
+    },
+    async refreshSummary(id, review) {
+      if (closed || !latestReview || latestReview.id !== id) return
+      latestReview = { ...latestReview, review: previewReview(review) }
+      if (desired?.kind === 'summary' && desired.id === id)
+        desired = latestReview
+      // Never start a helper or replace the active presentation for a late receipt.
+      if (child)
+        await write(child, {
+          kind: 'refreshSummary',
+          id,
+          review: latestReview.review,
+        })
+    },
     clear() {
+      presentationVersion++
       desired = undefined
+      latestReview = undefined
       if (retry) clearTimeout(retry)
       return dispatch({ kind: 'clear' })
     },
     close() {
+      presentationVersion++
       closed = true
       desired = undefined
+      latestReview = undefined
       if (retry) clearTimeout(retry)
       if (child) {
         const instance = child

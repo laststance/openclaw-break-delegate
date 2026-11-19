@@ -64,6 +64,20 @@ interface Matches {
 export class ExecutionApprovals {
   readonly #groups = new Map<string, Group>()
 
+  /** Keep earlier native event ordering comparable to new hooks after the wall clock moves. */
+  rebaseClock(delta: number): void {
+    for (const group of this.#groups.values()) {
+      group.lastSeen += delta
+      for (const attempt of group.attempts.values()) attempt.at += delta
+      for (const wait of group.approvals.values()) wait.at += delta
+    }
+  }
+
+  /** A confirmed terminal exit makes all its outstanding native correlation records obsolete. */
+  close(generation: string): void {
+    this.#groups.delete(generation)
+  }
+
   observe(
     generation: string,
     input: ExecutionObservation,

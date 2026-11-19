@@ -3,7 +3,14 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import {
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+  symlink,
+  mkdir,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { configureHooks } from '../dist/settings.js'
@@ -77,7 +84,7 @@ test('the review command prints all locally held questions across multiple bound
     cursors.push(offset)
     return {
       breakId: 'break-1',
-      rows: [{ id: offset, question: body }],
+      rows: [{ id: offset, at: [30, 10, 20][offset], question: body }],
       nextCursor: offset < 2 ? String(offset + 1) : null,
     }
   })
@@ -95,7 +102,80 @@ test('the review command prints all locally held questions across multiple bound
   assert.deepEqual(cursors, [0, 1, 2])
   assert.deepEqual(
     JSON.parse(stdout).map((row) => row.id),
-    [0, 1, 2],
+    [1, 2, 0],
   )
   assert.equal(JSON.parse(stdout)[2].question.length, 120000)
+})
+
+test("removing hooks from a second profile preserves the profile that owns Claude's settings", async (t) => {
+  // Arrange
+  const root = await mkdtemp(join(tmpdir(), 'bd-ownership-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const settings = join(root, 'claude.json')
+  await configureHooks('install', join(root, 'alpha'), settings)
+  const original = await readFile(settings, 'utf8')
+
+  // Act
+  const removed = await configureHooks('remove', join(root, 'beta'), settings)
+  const afterRemove = await readFile(settings, 'utf8')
+  await configureHooks('install', join(root, 'beta'), settings)
+  const switched = JSON.parse(await readFile(settings, 'utf8'))
+
+  // Assert
+  assert.equal(removed.changed, false)
+  assert.equal(afterRemove, original)
+  assert.equal(switched.hooks.UserPromptSubmit.length, 1)
+  assert.equal(
+    switched.hooks.UserPromptSubmit[0].hooks[0].command.includes(
+      join(root, 'beta'),
+    ),
+    true,
+  )
+})
+
+test('aliases to the same parent share one Gateway and one socket', async (t) => {
+  // Arrange
+  const root = await mkdtemp(join(tmpdir(), 'bd-alias-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const real = join(root, 'physical')
+  await mkdir(real)
+  await symlink(real, join(root, 'alias'))
+  const close = await listenGateway(join(real, 'profile'), async () => ({
+    owner: 'first',
+  }))
+  t.after(close)
+
+  // Act
+  const aliased = join(root, 'alias', 'profile')
+  await assert.rejects(
+    listenGateway(aliased, async () => ({ owner: 'second' })),
+    { code: 'EADDRINUSE' },
+  )
+  const owner = await requestGateway(aliased, { op: 'ping' })
+
+  // Assert
+  assert.deepEqual(owner, { owner: 'first' })
+})
+
+test('the CLI chooses the same named OpenClaw profile as the Gateway', async () => {
+  // Arrange
+  const env = { ...process.env, OPENCLAW_PROFILE: 'work' }
+  delete env.BREAK_DELEGATE_STATE_DIR
+  delete env.OPENCLAW_STATE_DIR
+  const moduleUrl = new URL('../dist/ipc.js', import.meta.url).href
+
+  // Act
+  const { stdout } = await promisify(execFile)(
+    process.execPath,
+    [
+      '--input-type=module',
+      '-e',
+      'const {dataDirectory}=await import(process.argv[1]);console.log(dataDirectory());',
+      moduleUrl,
+    ],
+    { env },
+  )
+
+  // Assert
+  assert.equal(stdout.trim().endsWith('/.openclaw-work/break-delegate'), true)
 })

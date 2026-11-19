@@ -10,6 +10,7 @@ export interface VerifiedReply {
   responseId: string
   originId: string
   at: number
+  observedLive: boolean
 }
 export interface DetectorResult {
   observations: Observation[]
@@ -201,6 +202,7 @@ function applyEvent(
   sessionId: string,
   turn: Turn,
   replies: VerifiedReply[],
+  observedLive: boolean,
 ) {
   const payload = object(value.payload)
   if (!payload || (payload.thread_id && payload.thread_id !== sessionId)) return
@@ -214,6 +216,7 @@ function applyEvent(
         responseId,
         originId: 'codex:' + sessionId + ':' + responseId,
         at,
+        observedLive,
       })
   }
   if (value.type === 'event_msg') {
@@ -375,12 +378,15 @@ export class RolloutDetector {
             continue
           }
           let tail = this.#tails.get(path)
+          let observedLive = true
           if (
             !tail ||
             tail.ino !== stat.ino ||
             tail.offset > stat.size ||
             stat.size - tail.offset > tailLimit
           ) {
+            // A first read can reconstruct a reply, but only a continuing native writer witnesses new bytes.
+            observedLive = false
             const meta = await rolloutMeta(path, this.#home)
             const client = meta && nativeClient(meta)
             if (!meta || !client || typeof meta.id !== 'string') {
@@ -395,14 +401,14 @@ export class RolloutDetector {
               client,
             }
             this.#tails.set(path, tail)
-            // The first partial record in a bounded tail cannot establish a turn boundary.
+            // Include the preceding byte: a newline there makes the record at the cutoff complete.
             if (tail.offset > 0) {
-              const block = Buffer.alloc(
-                Math.min(tailLimit, stat.size - tail.offset),
-              )
-              const read = await file.read(block, 0, block.length, tail.offset)
+              const preceding = tail.offset - 1
+              const block = Buffer.alloc(stat.size - preceding)
+              const read = await file.read(block, 0, block.length, preceding)
               const newline = block.subarray(0, read.bytesRead).indexOf(10)
-              tail.offset += newline < 0 ? read.bytesRead : newline + 1
+              tail.offset =
+                preceding + (newline < 0 ? read.bytesRead : newline + 1)
             }
           }
           const buffer = Buffer.alloc(stat.size - tail.offset)
@@ -415,7 +421,14 @@ export class RolloutDetector {
               .split('\n')) {
               if (!line) continue
               const event = jsonValue(line)
-              if (event) applyEvent(event, tail.sessionId, tail.state, replies)
+              if (event)
+                applyEvent(
+                  event,
+                  tail.sessionId,
+                  tail.state,
+                  replies,
+                  observedLive,
+                )
               else {
                 tail.state = { state: 'unknown', pending: new Map() }
                 misses++
@@ -443,7 +456,9 @@ export class RolloutDetector {
     return {
       observations,
       replies,
-      partial: misses > 0,
+      partial:
+        misses > 0 ||
+        observations.some((observation) => observation.status === 'unknown'),
       detail:
         'Live native rollout writers. Unattributed or automatically resolved replies receive no points.',
     }

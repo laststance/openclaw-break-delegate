@@ -13,6 +13,11 @@ func writeFrame(_ message: [String: Any]) {
 // A notification delivered after gateway shutdown may relaunch the bundle without its pipe.
 // Ignore that launch before registering delegates, showing a window or handling any action.
 let arguments = CommandLine.arguments
+if arguments.count >= 2, arguments[1] == "--classify-claude-process" {
+    let kind = arguments.count == 3 ? Int32(arguments[2]).map(classifyClaudeProcess) : nil
+    print((kind ?? .unknown).rawValue)
+    exit(0)
+}
 guard arguments.count == 3, arguments[1] == "--bridge",
       let profile = NotificationProfile(key: arguments[2]) else { exit(0) }
 guard Bundle.main.bundleIdentifier == "io.laststance.openclaw-break-delegate",

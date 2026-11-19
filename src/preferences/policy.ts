@@ -192,6 +192,52 @@ export function normalizeLabel(label: string): string {
     .toLowerCase()
 }
 
+const simpleReply =
+  /^(?:yes|no|y|n|sure|okay|ok|go ahead|please do|do it|not now|neither|both|other|the (?:first|second|third|last) one(?:,? please)?|はい|いいえ|お願いします|お願い|進めて(?:ください)?|どちらでも|どちらも|その他)[.!。！]?$/iu
+const qualification =
+  /(?:\s*[,;:、，—]\s*|\s+)(?=(?:but|if|only|unless|provided|except|after|before|because|as long as)\b|ただし|但し|もし|条件|その場合)/iu
+const replyOrdinal = /^(?:option\s+)?([a-e1-5])(?:[.)]|番(?:目)?)?$/iu
+
+/** Return the offered option index when a typed answer explicitly names its letter or number.
+ * @example typedOptionIndex('option 2')
+ */
+export function typedOptionIndex(text: string): number | undefined {
+  const ordinal = replyOrdinal
+    .exec(text.normalize('NFKC').trim())?.[1]
+    ?.toUpperCase()
+  if (!ordinal) return undefined
+  return /\d/u.test(ordinal) ? Number(ordinal) - 1 : ordinal.charCodeAt(0) - 65
+}
+
+/** Correlate independently verified human input with the preceding question. An ordinary new task remains a standalone instruction.
+ * @example isTypedReply('A, if the tests pass', ['Fix now','Defer'])
+ */
+export function isTypedReply(
+  text: string,
+  labels: readonly string[] = [],
+  questionId?: string,
+  replyTo?: string,
+): boolean {
+  if (replyTo) return !!questionId && replyTo === questionId
+  const typed = text.normalize('NFKC').trim()
+  if (!typed || typed.length > 2000) return false
+  const recognizable = (candidate: string) => {
+    const normalized = normalizeLabel(candidate)
+    if (
+      labels.some((label) => normalizeLabel(label) === normalized) ||
+      simpleReply.test(candidate)
+    )
+      return true
+    const index = typedOptionIndex(candidate)
+    if (index === undefined) return false
+    return labels.length === 0 || index < labels.length
+  }
+  if (recognizable(typed) || /^(?:other|その他)\s*[:：]\s*\S/iu.test(typed))
+    return true
+  const split = qualification.exec(typed)
+  return !!split && recognizable(typed.slice(0, split.index).trim())
+}
+
 function questionText(value: string): string {
   return value
     .normalize('NFKC')
@@ -395,6 +441,20 @@ export function instructionConstraints(
 ): Constraint[] {
   const text = questionText(value)
   if (!text) return []
+  const approvalInstruction =
+    /(?:^|[.!?。！？]\s*)(?:(?:can|could|would|will) you\s+)?(?:please\s+)?(?:(?:ask|consult|check with)\s+(?:me|the (?:user|owner))\s+(?:for (?:approval|permission|confirmation)|before\b|first\b)|(?:ask for|obtain|get|require|wait for) (?:my|the (?:user's|owner's)) (?:approval|permission|confirmation))|(?:承認|許可|確認)を(?:取って|求めて|得て|待って|取ること|求めること)|(?:私|本人|ユーザー)に(?:必ず)?確認して/u.test(
+      text,
+    )
+  if (approvalInstruction) return [{ kind: '*', required: '*' }]
+  // A question asking for information does not impose a standing constraint. Polite requests can still contain an explicit limit.
+  if (
+    !explicit &&
+    /^[^.!?。！？]*[?？]$/u.test(text) &&
+    !/^(?:please |(?:can|could|would|will) you (?!explain|tell me|describe))|ください|お願いします/u.test(
+      text,
+    )
+  )
+    return []
   // A negation, exception, second instruction or unparsed text must never be reduced to an affirmative choice.
   if (!operation.test(text)) {
     const normalized = text
@@ -410,9 +470,7 @@ export function instructionConstraints(
     })
     if (result.length === 1) return result
   }
-  return explicit ||
-    restriction.test(text) ||
-    decisionTypes.some((type) => type.topic.test(text))
+  return explicit || restriction.test(text)
     ? [{ kind: '*', required: '*' }]
     : []
 }

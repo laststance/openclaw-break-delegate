@@ -1,6 +1,11 @@
 import { resolve } from 'node:path'
 import { configureHooks } from './settings.js'
-import { dataDirectory, requestGateway, isObject } from './ipc.js'
+import {
+  dataDirectory,
+  requestGateway,
+  isObject,
+  type ObjectValue,
+} from './ipc.js'
 import { runHook } from './hooks.js'
 
 export const commandDescription =
@@ -20,19 +25,25 @@ export const usage =
   commandNames.join('|') +
   '> [--state-dir PATH] [--settings PATH]'
 
-async function stdinJson(): Promise<unknown> {
+/** Bound the input from the installed hook and signal oversized or unreadable tasks to the consent gate.
+ * @example
+ * const body = await readHookInput(process.stdin)
+ */
+export async function readHookInput(
+  input: AsyncIterable<Buffer | string>,
+): Promise<unknown> {
   const chunks: Buffer[] = []
   let size = 0
-  for await (const part of process.stdin) {
+  for await (const part of input) {
     const b = Buffer.isBuffer(part) ? part : Buffer.from(part)
     size += b.length
-    if (size > 256 * 1024) return null
+    if (size > 256 * 1024) return undefined
     chunks.push(b)
   }
   try {
     return JSON.parse(Buffer.concat(chunks, size).toString('utf8'))
   } catch {
-    return null
+    return undefined
   }
 }
 
@@ -60,11 +71,13 @@ export async function runCommand(
   if (op === 'hook') {
     await runHook(
       directory,
-      await stdinJson(),
+      await readHookInput(process.stdin),
       (value) =>
         new Promise((ok, reject) =>
           process.stdout.write(value, (e) => (e ? reject(e) : ok())),
         ),
+      undefined,
+      extra,
     )
     return
   }
@@ -106,8 +119,8 @@ export async function runCommand(
 export async function requestReview(
   directory: string,
   breakId?: string,
-): Promise<unknown[]> {
-  const rows: unknown[] = []
+): Promise<ObjectValue[]> {
+  const rows: ObjectValue[] = []
   let cursor: string | undefined
   do {
     const page = await requestGateway(directory, {
@@ -122,11 +135,16 @@ export async function requestReview(
       (page.nextCursor !== null && typeof page.nextCursor !== 'string')
     )
       throw Error('Invalid break review page.')
-    rows.push(...page.rows)
+    for (const receipt of page.rows) {
+      if (!isObject(receipt) || typeof receipt.at !== 'number')
+        throw Error('Invalid break review receipt.')
+      rows.push(receipt)
+    }
     breakId = page.breakId ?? undefined
     if (page.nextCursor && page.nextCursor === cursor)
       throw Error('Review cursor did not advance.')
     cursor = page.nextCursor ?? undefined
   } while (cursor)
-  return rows
+  // Pagination pins insertion order while a question can settle after a later card.
+  return rows.sort((first, second) => Number(first.at) - Number(second.at))
 }

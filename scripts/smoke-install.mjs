@@ -2,7 +2,6 @@ import { execFileSync, spawn } from 'node:child_process'
 import {
   mkdtempSync,
   mkdirSync,
-  readdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
@@ -17,16 +16,15 @@ import { requestGateway } from '../dist/ipc.js'
 import { fileURLToPath } from 'node:url'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
+const expectedArchive =
+  manifest.name.replace(/^@/, '').replaceAll('/', '-') +
+  '-' +
+  manifest.version +
+  '.tgz'
 const archive = process.argv[2]
   ? resolve(process.argv[2])
-  : join(
-      root,
-      'release',
-      readdirSync(join(root, 'release'))
-        .filter((x) => x.endsWith('.tgz'))
-        .sort()
-        .at(-1) ?? 'missing',
-    )
+  : join(root, 'release', expectedArchive)
 const tmp = mkdtempSync(join(tmpdir(), 'bd-openclaw-'))
 const state = join(tmp, 'state'),
   config = join(state, 'openclaw.json')

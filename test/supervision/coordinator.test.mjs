@@ -530,3 +530,109 @@ test('consent expiring while answer provenance is being written rolls back both 
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM an_answer').get().n, 0)
   assert.equal(supervisor.review(breakId)[0].outcome, 'held')
 })
+
+test('a backward wall-clock jump fences consent and immediately measures fresh hooks and lower-timestamp snapshots', (t) => {
+  // Arrange
+  const { supervisor, observe, advance, clock } = setup(t, {
+    threshold: 4,
+    observationTtlMs: 2 * minute,
+  })
+  observe('a')
+  advance(20 * minute)
+  observe('a')
+  supervisor.snapshot(
+    'app-server',
+    [{ provider: 'codex', sessionId: 'other', status: 'running' }],
+    { at: clock(), status: 'available', detail: 'old clock' },
+  )
+  const id = invite(supervisor)
+  // Act
+  advance(-20 * minute)
+  supervisor.snapshot(
+    'app-server',
+    [{ provider: 'codex', sessionId: 'other', status: 'running' }],
+    { at: clock(), status: 'available', detail: 'corrected clock' },
+  )
+  assert.equal(supervisor.status().score, 0)
+  observe('a')
+  advance(minute)
+  // Assert
+  const status = supervisor.status()
+  assert.equal(status.activeBreakId, null)
+  assert.equal(supervisor.action(id, 'return'), false)
+  assert.equal(status.score, 1.1)
+  assert.equal(
+    status.coverage.find((row) => row.source === 'app-server').detail,
+    'corrected clock',
+  )
+  advance(20 * minute)
+  assert.equal(supervisor.status().score, 2.2)
+})
+
+test('after a failed SQLite checkpoint, retry credits the full original running interval and discards the failed wait', (t) => {
+  // Arrange
+  const { supervisor, observe, advance, db } = setup(t, {
+    threshold: 1,
+    observationTtlMs: 5 * minute,
+  })
+  observe('a')
+  advance(minute)
+  db.exec(
+    "CREATE TEMP TRIGGER fail_invite BEFORE INSERT ON sv_invitations BEGIN SELECT RAISE(ABORT,'injected failure'); END",
+  )
+  // Act
+  assert.throws(() => observe('a', 'waiting'), /injected failure/)
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM sv_runs').get().n, 0)
+  db.exec('DROP TRIGGER fail_invite')
+  advance(30_000)
+  // Assert
+  const status = supervisor.status()
+  assert.equal(status.score, 1.5)
+  assert.equal(status.sessions[0].status, 'running')
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM sv_runs').get().n, 1)
+})
+
+test('an ambiguous settlement after a completed card never makes a later unidentified wait appear tracked', (t) => {
+  // Arrange
+  const { supervisor, observe, advance } = setup(t, { threshold: 4 })
+  observe('a')
+  const first = invite(supervisor)
+  supervisor.question({
+    sessionId: 'a',
+    questionId: 'finished',
+    question: 'Which?',
+  })
+  assert.equal(
+    supervisor.commitAnswer(
+      {
+        sessionId: 'a',
+        questionId: 'finished',
+        breakId: first,
+        answer: 'First',
+      },
+      () => true,
+    ),
+    true,
+  )
+  supervisor.resolveQuestion('a', 'finished')
+  supervisor.settleAnswer('a', 'finished', 'ambiguous')
+  supervisor.action(first, 'return')
+  advance(1)
+  observe('a', 'waiting')
+  supervisor.humanReply({
+    provider: 'claude',
+    sessionId: 'a',
+    responseId: 'prompt:second',
+  })
+  const next = supervisor.takeEffects().find((e) => e.kind === 'invitation')
+  assert.equal(supervisor.action(next.id, 'accept'), true)
+  // Act
+  const gate = supervisor.question({
+    sessionId: 'a',
+    questionId: 'unidentified',
+    question: 'Already on screen?',
+  })
+  // Assert
+  assert.equal(gate.eligible, false)
+  assert.match(gate.reason, /already pending/)
+})

@@ -7,6 +7,7 @@ import { toolInputFingerprint } from './supervision/index.js'
 import {
   normalizeQuestionCard,
   hasAnswerNotes,
+  isTypedReply,
   type QuestionCard,
 } from './preferences/index.js'
 
@@ -113,7 +114,23 @@ export async function runHook(
   body: unknown,
   output: (value: string) => Promise<void>,
   incarnation = claudeTerminal(),
+  expectedEvent?: string,
 ): Promise<void> {
+  if (
+    !body &&
+    incarnation &&
+    (expectedEvent === 'UserPromptSubmit' ||
+      expectedEvent === undefined ||
+      expectedEvent.startsWith('openclaw-break-delegate-hook-'))
+  ) {
+    // An oversized or unreadable task still places a veto on this exact interactive process.
+    await requestGateway(
+      directory,
+      { op: 'incomplete-instruction', incarnation },
+      1800,
+    ).catch(() => undefined)
+    return
+  }
   if (
     !incarnation ||
     !isObject(body) ||
@@ -139,7 +156,13 @@ export async function runHook(
     if (body.hook_event_name === 'UserPromptSubmit') {
       if (typeof body.prompt !== 'string') return
       const rows = await recentTranscript(body.transcript_path)
-      const prior = previousQuestion(rows, sessionId, body.prompt_id)
+      const previous = previousQuestion(rows, sessionId, body.prompt_id)
+      const explicit =
+        typeof body.in_reply_to === 'string' ? body.in_reply_to : undefined
+      const prior =
+        previous && isTypedReply(body.prompt, [], previous, explicit)
+          ? previous
+          : undefined
       await requestGateway(directory, {
         ...common,
         prompt: body.prompt.slice(0, 16_384),
@@ -180,7 +203,16 @@ export async function runHook(
         !isObject(body.tool_input)
       )
         return
-      const cards = decodeCards(body.tool_input.questions)
+      const prefilled =
+        event === 'PreToolUse' &&
+        [body.tool_input.answers, body.tool_input.annotations].some(
+          (value) =>
+            value !== undefined &&
+            (!isObject(value) || Object.keys(value).length > 0),
+        )
+      const cards = prefilled
+        ? undefined
+        : decodeCards(body.tool_input.questions)
       // Unsupported cards must still pause the workload clock and appear in the local return review.
       const fallback = Array.isArray(body.tool_input.questions)
         ? body.tool_input.questions

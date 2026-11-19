@@ -2,7 +2,7 @@ import Foundation
 import UserNotifications
 
 enum CommandKind: String, Decodable {
-    case status, authorize, invite, active, summary, clear
+    case status, authorize, invite, active, summary, refreshSummary, clear
 }
 
 struct GatewayCommand: Decodable {
@@ -11,6 +11,7 @@ struct GatewayCommand: Decodable {
     let id: String?
     let endsAt: Double?
     let review: BreakReview?
+    var silent: Bool? = nil
 }
 
 struct BreakReview: Decodable {
@@ -19,6 +20,23 @@ struct BreakReview: Decodable {
     let answered: [Answered]
     let held: [Held]
     let answeredTotal, heldTotal: Int
+
+    var isValid: Bool {
+        answered.count <= 40 && held.count <= 40 && answeredTotal >= answered.count && heldTotal >= held.count
+    }
+}
+
+/// Associates private review contents with the break whose receipts may still settle.
+struct ReturnedReview {
+    let id: String
+    private(set) var review: BreakReview
+
+    mutating func refresh(from command: GatewayCommand) -> Bool {
+        guard command.kind == .refreshSummary, command.id == id,
+              let updated = command.review, updated.isValid else { return false }
+        review = updated
+        return true
+    }
 }
 
 /// Scopes the application-wide Notification Center request store to one gateway data directory.
@@ -105,7 +123,7 @@ struct Surface {
     }
 
     let subject: String
-    let content: Content
+    private(set) var content: Content
     let requestID: String
 
     init?(command: GatewayCommand, profile: NotificationProfile) {
@@ -119,10 +137,7 @@ struct Surface {
             guard let ms = command.endsAt, ms.isFinite, ms > 0, ms <= 8.64e15 else { return nil }
             content = .active(until: Date(timeIntervalSince1970: ms / 1000))
         case .summary:
-            guard let review = command.review,
-                  review.answered.count <= 40, review.held.count <= 40,
-                  review.answeredTotal >= review.answered.count,
-                  review.heldTotal >= review.held.count else { return nil }
+            guard let review = command.review, review.isValid else { return nil }
             content = .summary(review)
         default: return nil
         }
@@ -138,6 +153,10 @@ struct Surface {
 
     func menuChoice(_ button: Button) -> NativeChoice {
         NativeChoice(request: requestID, category: kind.id, action: button.actionID, subject: subject)
+    }
+
+    mutating func refresh(_ returned: ReturnedReview) {
+        if kind == .summary, subject == returned.id { content = .summary(returned.review) }
     }
 
     /// Supplies the actual operating-system request. Only counts appear in a return banner.

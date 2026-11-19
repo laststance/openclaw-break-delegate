@@ -97,12 +97,52 @@ export class Workload {
   readonly #db: DatabaseSync
   readonly #freshMs: number
   readonly #weights: Weights
-  readonly #sessions = new Map<string, Session>()
+  #sessions = new Map<string, Session>()
 
   constructor(db: DatabaseSync, freshMs: number, weights: Weights) {
     this.#db = db
     this.#freshMs = freshMs
     this.#weights = weights
+  }
+
+  /**
+   * Stage the live cursors, run IDs and session observations with the SQLite write.
+   * Samples are immutable values. Each staged session owns its mutable maps and sets.
+   * A statement or commit failure restores the whole previous view for a safe retry.
+   * @example workload.transaction(() => commitMeasuredIntervals())
+   */
+  transaction<T>(write: () => T): T {
+    const committed = this.#sessions
+    this.#sessions = new Map(
+      Array.from(committed, ([key, session]) => [
+        key,
+        {
+          ...session,
+          samples: new Map(session.samples),
+          waiting: new Set(session.waiting),
+        },
+      ]),
+    )
+    try {
+      return write()
+    } catch (error) {
+      this.#sessions = committed
+      throw error
+    }
+  }
+
+  /** A clock rollback starts a fresh measured window; old absolute times cannot be recredited later. */
+  resetClock(now: number): void {
+    this.#db.exec(
+      'DELETE FROM sv_runs; UPDATE sv_replies SET credited=0 WHERE credited=1',
+    )
+    for (const session of this.#sessions.values()) {
+      session.accountedAt = now
+      session.runId = undefined
+      session.lastHook = -Infinity
+      session.missingFromRosterAt = undefined
+      session.samples.clear()
+    }
   }
 
   #key(provider: Provider, sessionId: string) {
@@ -113,8 +153,9 @@ export class Workload {
   checkpoint(now: number): void {
     for (const [key, session] of this.#sessions) {
       this.#account(session, now)
-      // Forget inactive process identities once their entire scoring window has elapsed.
+      // Keep the incarnation for a live card until its terminal confirms closure.
       if (
+        !session.waiting.size &&
         [...session.samples.values()].every(
           (sample) => sample.until < now - 60 * minute,
         )
@@ -182,7 +223,22 @@ export class Workload {
         return
       if (session.closed && !event.newSession) return
     }
-    if (!session || (source === 'hook' && event.newSession)) {
+    const starting = source === 'hook' && event.newSession === true
+    const sameTerminal =
+      session &&
+      !session.closed &&
+      !!event.incarnation &&
+      session.incarnation === event.incarnation &&
+      (session.missingFromRosterAt ?? -Infinity) < session.lastHook
+    // A duplicate or delayed SessionStart cannot erase a newer workload state or a live card.
+    if (
+      starting &&
+      session &&
+      sameTerminal &&
+      statusAt(session, now) !== 'unknown'
+    )
+      return
+    if (!session || (starting && !sameTerminal)) {
       session = {
         provider: event.provider,
         sessionId: event.sessionId,

@@ -1,18 +1,143 @@
 import { strict as assert } from 'node:assert'
 import { spawn, spawnSync } from 'node:child_process'
 import { EventEmitter, once } from 'node:events'
-import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { createNativeBreakUi } from '../../dist/native/index.js'
+import {
+  createNativeBreakUi,
+  nativeHelperExecutable,
+} from '../../dist/native/index.js'
 
 const fixture = fileURLToPath(new URL('./pipe-fixture.mjs', import.meta.url))
 const repo = fileURLToPath(new URL('../../', import.meta.url))
 
+test(
+  'the packaged process classifier reads exact argv boundaries from live Darwin Node launchers',
+  {
+    skip: process.platform !== 'darwin' || !existsSync(nativeHelperExecutable),
+    timeout: 10_000,
+  },
+  async (t) => {
+    // Arrange
+    const directory = mkdtempSync(join(tmpdir(), 'break-delegate-argv-'))
+    t.after(() => rmSync(directory, { recursive: true, force: true }))
+    const install = join(directory, 'node_modules/@anthropic-ai/claude-code')
+    mkdirSync(install, { recursive: true })
+    const cli = join(install, 'cli.js')
+    writeFileSync(cli, 'process.on("message",()=>{});process.send("ready")')
+    const launch = (arg) => {
+      const child = spawn(process.execPath, [cli, arg], {
+        stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+      })
+      t.after(() => child.kill())
+      return child
+    }
+    const interactive = launch('Explain how --print works')
+    const headless = launch('--print')
+    await Promise.all([once(interactive, 'message'), once(headless, 'message')])
+
+    // Act
+    const classify = (pid) =>
+      spawnSync(
+        nativeHelperExecutable,
+        ['--classify-claude-process', String(pid)],
+        { encoding: 'utf8' },
+      )
+    const actual = [
+      classify(interactive.pid),
+      classify(headless.pid),
+      classify(-1),
+    ]
+
+    // Assert
+    assert.deepEqual(
+      actual.map((r) => [r.status, r.stdout, r.stderr]),
+      [
+        [0, 'interactive\n', ''],
+        [0, 'headless\n', ''],
+        [0, 'unknown\n', ''],
+      ],
+    )
+  },
+)
+
+test('late receipts silently refresh only their returned review while later break actions remain available', async (t) => {
+  // Arrange
+  const { ui, commands, children, actions, events } = gateway(t)
+  const waiting = {
+    answered: [],
+    held: [{ question: 'Which option?', reason: 'Awaiting delivery' }],
+  }
+  const sent = {
+    answered: [{ question: 'Which option?', answer: 'First' }],
+    held: [],
+  }
+  await ui.summary('first-break', waiting)
+  await ui.active('later-break', Date.now() + 900_000)
+
+  // Act
+  await ui.refreshSummary('first-break', sent)
+  await ui.refreshSummary('unknown-break', waiting)
+  const accepted = once(events, 'action')
+  children[0].send({
+    frames: [{ type: 'action', id: 'later-break', kind: 'return' }],
+  })
+  await accepted
+  await ui.summary('later-break', waiting)
+  while (commands.length < 4) await once(events, 'command')
+  await ui.refreshSummary('first-break', waiting)
+
+  // Assert
+  assert.deepEqual(
+    commands.map(({ kind, id }) => [kind, id]),
+    [
+      ['summary', 'first-break'],
+      ['active', 'later-break'],
+      ['refreshSummary', 'first-break'],
+      ['summary', 'later-break'],
+    ],
+  )
+  assert.equal(commands[2].review.answered[0].answer, 'First')
+  assert.deepEqual(actions, [{ kind: 'return', id: 'later-break' }])
+})
+
+test('reconnecting after a settled receipt restores the corrected review without a second banner', async (t) => {
+  // Arrange
+  const { ui, children, events } = gateway(t, { retryMs: 10 })
+  await Promise.all([
+    once(events, 'command'),
+    ui.summary('returned', { answered: [], held: [] }),
+  ])
+  await Promise.all([
+    once(events, 'command'),
+    ui.refreshSummary('returned', {
+      answered: [],
+      held: [{ question: 'Which option?', reason: 'Delivery failed' }],
+    }),
+  ])
+  const reconnected = once(events, 'command')
+
+  // Act
+  children[0].kill('SIGKILL')
+  const [restored] = await reconnected
+
+  // Assert
+  assert.equal(restored.kind, 'summary')
+  assert.equal(restored.silent, true)
+  assert.equal(restored.review.held[0].reason, 'Delivery failed')
+})
+
 /** Runs an isolated helper process and records both ends of its pipe for assertions. */
-function gateway(t, options = {}) {
+function gateway(t, { onChoice, ...options } = {}) {
   const children = []
   const commands = []
   const profileKeys = []
@@ -22,6 +147,7 @@ function gateway(t, options = {}) {
     (action) => {
       actions.push(action)
       events.emit('action', action)
+      return onChoice?.(action)
     },
     {
       ...options,
@@ -46,6 +172,34 @@ function gateway(t, options = {}) {
   t.after(() => ui.close())
   return { children, commands, actions, events, ui, profileKeys }
 }
+
+test('rejected consent requires a second explicit action on a restored invitation', async (t) => {
+  // Arrange
+  const { ui, children, actions, events } = gateway(t, {
+    onChoice: (action) =>
+      action.kind === 'start' ? 'restore-invitation' : undefined,
+  })
+  await Promise.all([once(events, 'command'), ui.invite('still-open')])
+  const restored = once(events, 'command')
+
+  // Act
+  children[0].send({
+    frames: [{ type: 'action', kind: 'start', id: 'still-open' }],
+  })
+  const [invitation] = await restored
+  const second = once(events, 'action')
+  children[0].send({
+    frames: [{ type: 'action', kind: 'dismiss', id: 'still-open' }],
+  })
+  await second
+
+  // Assert
+  assert.deepEqual([invitation.kind, invitation.id], ['invite', 'still-open'])
+  assert.deepEqual(actions, [
+    { kind: 'start', id: 'still-open' },
+    { kind: 'dismiss', id: 'still-open' },
+  ])
+})
 
 test('independent gateways launch their helpers with distinct stable profile scopes', async (t) => {
   // Arrange
@@ -128,11 +282,14 @@ test(
   { timeout: 5000 },
   async (t) => {
     // Arrange
-    const { ui, commands } = gateway(t)
+    const { ui, commands, events } = gateway(t)
 
     // Act
-    const before = await ui.status()
-    const after = await ui.authorize()
+    const [, before] = await Promise.all([once(events, 'command'), ui.status()])
+    const [, after] = await Promise.all([
+      once(events, 'command'),
+      ui.authorize(),
+    ])
 
     // Assert
     assert.deepEqual(before, { status: 'not-determined' })
@@ -149,7 +306,7 @@ test(
   { timeout: 5000 },
   async (t) => {
     // Arrange
-    const { ui, commands } = gateway(t)
+    const { ui, events } = gateway(t)
     const answered = Array.from({ length: 100 }, () => ({
       question: '🍎'.repeat(2500),
       answer: 'Selected option A',
@@ -160,8 +317,10 @@ test(
     }))
 
     // Act
-    await ui.summary('break-review', { answered, held })
-    const frame = commands[0]
+    const [[frame]] = await Promise.all([
+      once(events, 'command'),
+      ui.summary('break-review', { answered, held }),
+    ])
 
     // Assert
     assert.equal(frame.review.answeredTotal, 100)
@@ -184,7 +343,10 @@ test(
     // Arrange
     const { ui, children, events } = gateway(t, { retryMs: 10 })
     const deadline = Date.now() + 900_000
-    await ui.active('interrupted-break', deadline)
+    await Promise.all([
+      once(events, 'command'),
+      ui.active('interrupted-break', deadline),
+    ])
     const restored = once(events, 'command')
 
     // Act
@@ -253,6 +415,7 @@ test(
         '5',
         'native/macos/Surface.swift',
         'native/macos/ReviewWindow.swift',
+        'native/macos/ProcessClassifier.swift',
         'test/native/SurfaceChecks.swift',
         '-o',
         check,

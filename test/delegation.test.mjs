@@ -59,17 +59,26 @@ test('an accepted break answers the original Claude card once and keeps its repl
   let onAction, invite, active
   let seeded = false
   let supersede = false
+  let judgeCalls = 0
   const pass = async () => ({ status: 'authorized' })
   const stop = await startService({
     directory,
     now: () => now,
     tickMs: 60000,
+    maxConfirmationsPerBreak: 2,
     roots: {},
     log: () => {},
     judge: async (payload) => {
+      judgeCalls++
       assert.equal(payload[0].candidate, 'Fix in this PR')
       assert.equal(payload[0].header, 'Bug')
       if (supersede) {
+        await runHook(
+          directory,
+          { ...hook, tool_use_id: 'over-allowance' },
+          async (value) => sent.push(JSON.parse(value)),
+          'instance-A',
+        )
         const updates = new DatabaseSync(join(directory, 'state.sqlite'))
         new PreferenceStore(updates).recordInstruction(
           'claude',
@@ -151,6 +160,21 @@ test('an accepted break answers the original Claude card once and keeps its repl
     async (value) => sent.push(JSON.parse(value)),
     'instance-A',
   )
+  const beforeClaudeResult = await requestReview(directory, active)
+  assert.equal(
+    beforeClaudeResult.find((row) => row.questionId === 'live-card')?.outcome,
+    'pending',
+  )
+  await runHook(
+    directory,
+    {
+      ...hook,
+      hook_event_name: 'PostToolUse',
+      tool_response: { answers: { [card.question]: 'Fix in this PR' } },
+    },
+    async (value) => sent.push(JSON.parse(value)),
+    'instance-A',
+  )
   const unsupported = {
     ...card,
     options: [
@@ -168,6 +192,19 @@ test('an accepted break answers the original Claude card once and keeps its repl
     async (value) => sent.push(JSON.parse(value)),
     'instance-A',
   )
+  await runHook(
+    directory,
+    {
+      ...hook,
+      tool_use_id: 'prefilled',
+      tool_input: {
+        questions: [card],
+        answers: { [card.question]: 'Open a separate issue' },
+      },
+    },
+    async (value) => sent.push(JSON.parse(value)),
+    'instance-A',
+  )
   supersede = true
   await runHook(
     directory,
@@ -180,6 +217,15 @@ test('an accepted break answers the original Claude card once and keeps its repl
   const state = await requestGateway(directory, { op: 'status' })
   // Assert
   assert.equal(sent.length, 1, JSON.stringify(review))
+  assert.equal(judgeCalls, 2)
+  assert.equal(
+    review.find((row) => row.questionId === 'over-allowance')?.outcome,
+    'held',
+  )
+  assert.equal(
+    review.find((row) => row.questionId === 'prefilled')?.outcome,
+    'held',
+  )
   assert.deepEqual(sent[0].hookSpecificOutput.updatedInput.questions, [card])
   assert.deepEqual(sent[0].hookSpecificOutput.updatedInput.answers, {
     'How should we handle an unrelated bug?': 'Fix in this PR',

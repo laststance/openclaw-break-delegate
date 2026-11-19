@@ -1,6 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { chmod, lstat, mkdir, unlink } from 'node:fs/promises'
-import { homedir, tmpdir } from 'node:os'
+import { DatabaseSync } from 'node:sqlite'
+import { realpathSync } from 'node:fs'
+import { resolveStateDir } from 'openclaw/plugin-sdk/state-paths'
+import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { createConnection, createServer, type Socket } from 'node:net'
 
@@ -22,18 +25,13 @@ export function isObject(value: unknown): value is ObjectValue {
 export function dataDirectory(stateDir?: string): string {
   return resolve(
     process.env.BREAK_DELEGATE_STATE_DIR ||
-      join(
-        stateDir ||
-          process.env.OPENCLAW_STATE_DIR ||
-          join(homedir(), '.openclaw'),
-        'break-delegate',
-      ),
+      join(stateDir || resolveStateDir(), 'break-delegate'),
   )
 }
 
 function socketAddress(directory: string): string {
   const key = createHash('sha256')
-    .update(resolve(directory))
+    .update(realpathSync(directory))
     .digest('hex')
     .slice(0, 20)
   return join(tmpdir(), 'bd-' + (process.getuid?.() ?? 'user') + '-' + key, 's')
@@ -125,8 +123,8 @@ export async function listenGateway(
   directory: string,
   handler: Handler,
 ): Promise<() => Promise<void>> {
-  const address = socketAddress(directory)
   await privateDirectory(directory)
+  const address = socketAddress(directory)
   await privateDirectory(resolve(address, '..'))
   const clients = new Set<Socket>()
   const server = createServer((socket) => {
@@ -184,28 +182,54 @@ export async function listenGateway(
       server.once('listening', ready)
       server.listen(address)
     })
+  // The OS releases this SQLite file lock when its owner exits, including after a crash.
+  const owner = new DatabaseSync(join(resolve(address, '..'), 'owner.sqlite'))
   try {
-    await bind()
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'EADDRINUSE') throw err
-    // A live peer owns this profile; only a refused, unchanged socket may be removed.
-    const old = await lstat(address)
-    if (!old.isSocket() || (process.getuid && old.uid !== process.getuid()))
-      throw err
-    try {
-      await requestGateway(directory, { op: 'ping', nonce: randomUUID() }, 1000)
-      throw err
-    } catch (probe) {
-      if ((probe as NodeJS.ErrnoException).code !== 'ECONNREFUSED') throw err
-    }
-    const current = await lstat(address)
-    if (current.ino !== old.ino || current.dev !== old.dev) throw err
-    await unlink(address)
-    await bind()
+    owner.exec('BEGIN EXCLUSIVE')
+  } catch (error) {
+    owner.close()
+    if ((error as { errcode?: number }).errcode === 5)
+      throw Object.assign(
+        new Error('This profile already has a live Gateway owner.'),
+        { code: 'EADDRINUSE' },
+      )
+    throw error
   }
-  await chmod(address, 0o600)
+  try {
+    try {
+      await bind()
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EADDRINUSE') throw err
+      // A live peer owns this profile; only a refused, unchanged socket may be removed.
+      const old = await lstat(address)
+      if (!old.isSocket() || (process.getuid && old.uid !== process.getuid()))
+        throw err
+      try {
+        await requestGateway(
+          directory,
+          { op: 'ping', nonce: randomUUID() },
+          1000,
+        )
+        throw err
+      } catch (probe) {
+        if ((probe as NodeJS.ErrnoException).code !== 'ECONNREFUSED') throw err
+      }
+      const current = await lstat(address)
+      if (current.ino !== old.ino || current.dev !== old.dev) throw err
+      await unlink(address)
+      await bind()
+    }
+    await chmod(address, 0o600)
+  } catch (error) {
+    owner.close()
+    throw error
+  }
   return async () => {
     for (const socket of clients) socket.destroy()
-    await new Promise<void>((done) => server.close(() => done()))
+    try {
+      await new Promise<void>((done) => server.close(() => done()))
+    } finally {
+      owner.close()
+    }
   }
 }

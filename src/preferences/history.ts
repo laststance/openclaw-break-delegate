@@ -152,10 +152,29 @@ function checkpointHash(fd: number, offset: number): string {
   return createHash('sha256').update(first).update(last).digest('hex')
 }
 
+function rangeHash(fd: number, start: number, stop: number): string {
+  const hash = createHash('sha256')
+  const buf = Buffer.allocUnsafe(Math.min(chunkSize, stop - start))
+  while (start < stop) {
+    const bytes = readSync(
+      fd,
+      buf,
+      0,
+      Math.min(buf.length, stop - start),
+      start,
+    )
+    if (!bytes) break
+    hash.update(buf.subarray(0, bytes))
+    start += bytes
+  }
+  return hash.digest('hex')
+}
+
 async function importFile(
   db: EvidenceDatabase,
   file: SourceFile,
   report: ImportReport,
+  retries = 0,
 ): Promise<void> {
   const fd = openSync(file.path, constants.O_RDONLY | constants.O_NOFOLLOW)
   try {
@@ -180,6 +199,21 @@ async function importFile(
     )
     if (offset >= size) return
     report.changedFiles++
+    const addSegment = db.db.prepare(
+      'INSERT OR REPLACE INTO pref_file_segments VALUES(?,?,?,?)',
+    )
+    if (!resume)
+      db.db.prepare('DELETE FROM pref_file_segments WHERE path=?').run(key)
+    else if (
+      saved &&
+      !db.db
+        .prepare('SELECT 1 FROM pref_file_segments WHERE path=? LIMIT 1')
+        .get(key)
+    ) {
+      // Populate a prefix fingerprint once when resuming a checkpoint written by an older decoder.
+      addSegment.run(key, 0, saved, rangeHash(fd, 0, saved))
+    }
+    let stat = info
     let pending: Buffer[] = []
     let length = 0
     while (offset < size) {
@@ -232,6 +266,7 @@ async function importFile(
           skipAtCommit = false
         }
         if (commit > saved) {
+          addSegment.run(key, saved, commit, rangeHash(fd, saved, commit))
           save.run(
             key,
             identity,
@@ -246,6 +281,53 @@ async function importFile(
       offset += received
       // The synchronous SQLite transaction has committed before live hooks or other source readers can run.
       await yieldToGateway()
+      const current = fstatSync(fd, { bigint: true })
+      if (
+        current.size !== stat.size ||
+        current.mtimeNs !== stat.mtimeNs ||
+        current.ctimeNs !== stat.ctimeNs
+      ) {
+        // Append-only writers keep the same prefix. A replacement must never inherit parser state or an offset from the prior file.
+        const segments = db.db
+          .prepare(
+            'SELECT start,stop,hash FROM pref_file_segments WHERE path=? AND stop<=? ORDER BY start',
+          )
+          .iterate(key, saved)
+        const priorChunkMatches =
+          rangeHash(fd, offset - received, offset) ===
+          createHash('sha256').update(chunk.subarray(0, received)).digest('hex')
+        const partialMatches =
+          offset === saved ||
+          rangeHash(fd, saved, offset) ===
+            createHash('sha256')
+              .update(Buffer.concat(pending, length))
+              .digest('hex')
+        let unchanged =
+          Number(current.size) >= offset && priorChunkMatches && partialMatches
+        if (unchanged)
+          for (const segment of segments) {
+            if (
+              rangeHash(fd, Number(segment.start), Number(segment.stop)) !==
+              segment.hash
+            ) {
+              unchanged = false
+              break
+            }
+          }
+        if (!unchanged) {
+          db.transaction(() => {
+            db.db.prepare('DELETE FROM pref_files WHERE path=?').run(key)
+            db.db
+              .prepare('DELETE FROM pref_file_segments WHERE path=?')
+              .run(key)
+          })
+          // A continuously rewritten source can be retried by the next import without monopolizing the gateway.
+          if (retries < 2) await importFile(db, file, report, retries + 1)
+          else report.unreadable++
+          return
+        }
+        stat = current
+      }
     }
   } finally {
     closeSync(fd)

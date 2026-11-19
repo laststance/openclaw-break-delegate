@@ -2,7 +2,8 @@ import AppKit
 
 /// Builds the same selectable, scrollable review for a user-opened window and offscreen verification.
 /// Construction never orders the window onscreen or changes the application's activation policy.
-func makeReviewWindow(_ review: BreakReview, reusing existing: NSWindow? = nil) -> NSWindow {
+func makeReviewWindow(_ review: BreakReview, reusing existing: NSWindow? = nil, preservingScroll: Bool = false) -> NSWindow {
+    let previousOrigin = preservingScroll ? (existing?.contentView as? NSScrollView)?.contentView.bounds.origin : nil
     let size = NSRect(x: 0, y: 0, width: 590, height: 430)
     let window = existing ?? NSWindow(contentRect: size, styleMask: [.titled, .closable, .resizable],
                                      backing: .buffered, defer: false)
@@ -59,5 +60,10 @@ func makeReviewWindow(_ review: BreakReview, reusing existing: NSWindow? = nil) 
     window.layoutIfNeeded()
     if let container = text.textContainer { text.layoutManager?.ensureLayout(for: container) }
     text.sizeToFit()
+    if let origin = previousOrigin {
+        let bottom = max(0, text.bounds.height - scroll.contentView.bounds.height)
+        scroll.contentView.scroll(to: NSPoint(x: 0, y: min(origin.y, bottom)))
+        scroll.reflectScrolledClipView(scroll.contentView)
+    }
     return window
 }

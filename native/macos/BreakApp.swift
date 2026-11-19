@@ -13,9 +13,10 @@ final class BreakApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
     private let center = UNUserNotificationCenter.current()
     private let profile: NotificationProfile
     private var current: Surface?
-    private var latestReview: BreakReview?
+    private var latestReview: ReturnedReview?
     private var statusItem: NSStatusItem?
     private var reviewWindow: NSWindow?
+    private var windowReviewID: String?
     private var expiry: Timer?
     private var permission = NotificationStatus("not-determined")
 
@@ -84,9 +85,19 @@ final class BreakApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
         case .clear:
             removeCurrent()
             latestReview = nil
+            windowReviewID = nil
             reviewWindow?.close()
             refreshMenu()
             readPermission { self.reply(command.request, $0) }
+        case .refreshSummary:
+            if latestReview?.refresh(from: command) == true, let latestReview {
+                current?.refresh(latestReview)
+                if windowReviewID == latestReview.id, let window = reviewWindow, window.isVisible {
+                    _ = makeReviewWindow(latestReview.review, reusing: window, preservingScroll: true)
+                }
+            }
+            // A receipt changes local review text. Leave banners, focus and later breaks alone.
+            reply(command.request, permission)
         case .invite, .active, .summary:
             guard let surface = Surface(command: command, profile: profile) else {
                 reply(command.request, NotificationStatus("unavailable", "Invalid native presentation."))
@@ -94,7 +105,7 @@ final class BreakApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
             }
             removeCurrent()
             current = surface
-            if case .summary(let review) = surface.content { latestReview = review }
+            if case .summary(let review) = surface.content { latestReview = ReturnedReview(id: surface.subject, review: review) }
             if case .active(let end) = surface.content {
                 guard end > Date() else {
                     removeCurrent()
@@ -111,6 +122,10 @@ final class BreakApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
                 expiry = timer
             }
             refreshMenu()
+            if command.kind == .summary, command.silent == true {
+                reply(command.request, permission)
+                return
+            }
             readPermission { permission in
                 self.post(surface, permission: permission) { self.reply(command.request, $0) }
             }
@@ -157,8 +172,8 @@ final class BreakApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
     }
 
     private func post(_ surface: Surface, permission: NotificationStatus, done: @escaping (NotificationStatus) -> Void) {
-        guard current?.requestID == surface.requestID, permission.code == "authorized" else { done(permission); return }
-        center.add(surface.notification) { error in
+        guard let current, current.requestID == surface.requestID, permission.code == "authorized" else { done(permission); return }
+        center.add(current.notification) { error in
             DispatchQueue.main.async {
                 // An authorization check or delivery may finish after return or replacement.
                 if self.current?.requestID != surface.requestID { self.removeNotification(surface) }
@@ -269,9 +284,10 @@ final class BreakApp: NSObject, NSApplicationDelegate, UNUserNotificationCenterD
     }
 
     @objc private func openReview() {
-        guard let review = latestReview else { return }
-        let window = makeReviewWindow(review, reusing: reviewWindow)
+        guard let latestReview else { return }
+        let window = makeReviewWindow(latestReview.review, reusing: reviewWindow)
         reviewWindow = window
+        windowReviewID = latestReview.id
         // Only an explicit review click opens a window or activates this accessory app.
         if #available(macOS 14.0, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
         window.makeKeyAndOrderFront(nil)

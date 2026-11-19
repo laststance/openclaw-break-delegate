@@ -261,8 +261,57 @@ test('a direct human reply to the preceding native question counts while a new p
       responseId: 'prompt:reply-7',
       originId: 'codex:desktop:prompt:reply-7',
       at: now,
+      observedLive: false,
     },
   ])
+})
+
+test('only a newly witnessed native reply survives rotation of the history that initially proved both typed answers', async (t) => {
+  // Arrange
+  const { home, file } = await isolated(t)
+  const question = event('agent_message', {
+    message: 'Use the compact layout?',
+  })
+  const response = (id) =>
+    event('user_message', { message: 'yes', client_id: id })
+  await writeFile(file, jsonl(session('cli'), question, response('replayed')))
+  const db = new DatabaseSync(':memory:')
+  t.after(() => db.close())
+  const supervisor = new Supervision(db, { now: () => now })
+  const probe = new LocalActivityProbe({
+    codexHome: home,
+    now: () => now,
+    readClaude: empty,
+    readCodex: empty,
+    readWriters: async () => [file],
+  })
+  await probe.poll(supervisor)
+  await appendFile(file, jsonl(question, response('witnessed')))
+  await probe.poll(supervisor)
+  assert.equal(supervisor.status().score, 8)
+
+  // Act
+  const withdraw = (id) =>
+    supervisor.retractHumanReply({
+      provider: 'codex',
+      sessionId: 'cli',
+      responseId: 'prompt:' + id,
+      permanent: false,
+    })
+  withdraw('replayed')
+  withdraw('witnessed')
+
+  // Assert
+  assert.equal(supervisor.status().score, 4)
+  assert.equal(
+    supervisor.humanReply({
+      provider: 'codex',
+      sessionId: 'cli',
+      responseId: 'prompt:replayed',
+    }),
+    true,
+  )
+  assert.equal(supervisor.status().score, 8)
 })
 
 test('an incomplete or corrupted rollout stays unknown until a new turn boundary arrives', async (t) => {
@@ -358,12 +407,13 @@ test('the Codex Unix WebSocket uses metadata-only methods, pages loaded IDs, and
   const db = new DatabaseSync(':memory:')
   t.after(() => db.close())
   const supervisor = new Supervision(db, { now: () => now })
+  let writerVisible = false
   const probe = new LocalActivityProbe({
     codexHome: home,
     codexSocket: socket,
     now: () => now,
     readClaude: empty,
-    readWriters: async () => [file],
+    readWriters: async () => (writerVisible ? [file] : []),
   })
   // Act
   await probe.poll(supervisor)
@@ -371,11 +421,11 @@ test('the Codex Unix WebSocket uses metadata-only methods, pages loaded IDs, and
   assert.deepEqual(
     supervisor
       .status()
-      .sessions.map((s) => [s.sessionId, s.status])
+      .sessions.map((s) => [s.sessionId, s.client, s.status])
       .sort(),
     [
-      ['desktop', 'running'],
-      ['stored', 'unknown'],
+      ['desktop', 'desktop', 'running'],
+      ['stored', 'cli', 'unknown'],
     ],
   )
   assert.deepEqual(
@@ -393,6 +443,19 @@ test('the Codex Unix WebSocket uses metadata-only methods, pages loaded IDs, and
     requests
       .filter((r) => r.method === 'thread/read')
       .every((r) => r.params.includeTurns === false),
+  )
+  // A second view of the same native Desktop thread must not add another session.
+  writerVisible = true
+  await probe.poll(supervisor)
+  assert.deepEqual(
+    supervisor
+      .status()
+      .sessions.map((s) => [s.sessionId, s.client, s.status])
+      .sort(),
+    [
+      ['desktop', 'desktop', 'running'],
+      ['stored', 'cli', 'unknown'],
+    ],
   )
 })
 
@@ -434,4 +497,106 @@ test("the native terminal's completed user item counts once when it answers the 
     result.replies.map((reply) => reply.originId),
     ['codex:cli:prompt:n1'],
   )
+})
+
+test('a live writer with no observed turn boundary reports partial coverage until activity becomes known', async (t) => {
+  // Arrange
+  const { home, file } = await isolated(t)
+  await writeFile(file, jsonl(session('term')))
+  const db = new DatabaseSync(':memory:')
+  t.after(() => db.close())
+  const supervisor = new Supervision(db, { now: () => now })
+  const probe = new LocalActivityProbe({
+    codexHome: home,
+    now: () => now,
+    readClaude: empty,
+    readCodex: empty,
+    readWriters: async () => [file],
+  })
+  const coverage = () =>
+    supervisor.status().coverage.find((c) => c.source === 'codex-rollouts')
+      ?.status
+  // Act
+  await probe.poll(supervisor)
+  // Assert
+  assert.equal(coverage(), 'partial')
+  await appendFile(file, jsonl(event('task_started')))
+  await probe.poll(supervisor)
+  assert.equal(coverage(), 'available')
+})
+
+test('the bounded writer tail preserves a complete turn boundary and drops only a partial first record', async (t) => {
+  // Arrange
+  const { home, file, sessions } = await isolated(t)
+  const second = join(sessions, 'rollout-inside.jsonl')
+  const header = jsonl(session('cli'))
+  const boundary = jsonl(event('task_started'))
+  const padding = { type: 'ignored', payload: { padding: '' } }
+  const occupied = Buffer.byteLength(boundary + jsonl(padding))
+  padding.payload.padding = 'x'.repeat(2 * 1024 * 1024 - occupied)
+  await writeFile(file, header + boundary + jsonl(padding))
+  padding.payload.padding += 'x'
+  await writeFile(second, header + boundary + jsonl(padding))
+  // Act
+  const detector = new RolloutDetector(home)
+  const aligned = await detector.read([file])
+  const interior = await detector.read([second])
+  // Assert
+  assert.equal(aligned.observations[0].status, 'running')
+  assert.equal(interior.observations[0].status, 'unknown')
+})
+
+test('verified rollout replies retry after an interrupted snapshot or credit and a duplicate consumes the retry', async (t) => {
+  // Arrange
+  const { home, file } = await isolated(t)
+  await writeFile(
+    file,
+    jsonl(
+      session('term'),
+      event('task_started'),
+      input('one'),
+      answer('one'),
+      input('two'),
+      answer('two'),
+    ),
+  )
+  const db = new DatabaseSync(':memory:')
+  t.after(() => db.close())
+  const supervisor = new Supervision(db, { now: () => now })
+  const probe = new LocalActivityProbe({
+    codexHome: home,
+    now: () => now,
+    readClaude: empty,
+    readCodex: empty,
+    readWriters: async () => [file],
+  })
+  let failSnapshot = true,
+    failCredit = true
+  const attempts = []
+  const interrupted = {
+    snapshot(...args) {
+      if (failSnapshot) {
+        failSnapshot = false
+        throw Error('snapshot interrupted')
+      }
+      supervisor.snapshot(...args)
+    },
+    humanReply(reply) {
+      attempts.push(reply.responseId)
+      const credited = supervisor.humanReply(reply)
+      if (reply.responseId === 'tool:two' && failCredit) {
+        failCredit = false
+        throw Error('after credit')
+      }
+      return credited
+    },
+  }
+  // Act
+  await assert.rejects(probe.poll(interrupted), /snapshot interrupted/)
+  await assert.rejects(probe.poll(interrupted), /after credit/)
+  await probe.poll(interrupted)
+  await probe.poll(interrupted)
+  // Assert
+  assert.deepEqual(attempts, ['tool:one', 'tool:two', 'tool:two'])
+  assert.equal(supervisor.status().score, 8)
 })

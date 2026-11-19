@@ -108,6 +108,7 @@ CREATE TABLE IF NOT EXISTS sv_runs(id INTEGER PRIMARY KEY, start INTEGER NOT NUL
 CREATE INDEX IF NOT EXISTS sv_runs_finish ON sv_runs(finish);
 CREATE TABLE IF NOT EXISTS sv_replies(id TEXT PRIMARY KEY, at INTEGER NOT NULL, credited INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS sv_replies_at ON sv_replies(at);
+CREATE TABLE IF NOT EXISTS sv_live_replies(id TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS sv_resolved(sessionId TEXT NOT NULL, questionId TEXT NOT NULL, PRIMARY KEY(sessionId,questionId));
 CREATE TABLE IF NOT EXISTS sv_invitations(id TEXT PRIMARY KEY, expiresAt INTEGER NOT NULL, state TEXT NOT NULL);
 CREATE UNIQUE INDEX IF NOT EXISTS sv_one_invitation ON sv_invitations(state) WHERE state='open';
@@ -149,7 +150,7 @@ export class Supervision {
   readonly #snoozeMs: number
   readonly #invitationMs: number
   readonly #approvals = new ExecutionApprovals()
-  readonly #coverage = new Map<string, Coverage>()
+  #coverage = new Map<string, Coverage>()
   #lastAt: number
 
   constructor(db: DatabaseSync, options: SupervisionOptions = {}) {
@@ -188,12 +189,22 @@ export class Supervision {
 
   #transaction<T>(apply: () => T): T {
     this.#db.exec('BEGIN IMMEDIATE')
+    const lastAt = this.#lastAt,
+      coverage = this.#coverage
+    this.#coverage = new Map(coverage)
     try {
-      const result = apply()
-      this.#db.exec('COMMIT')
+      const result = this.#work.transaction(() => {
+        const result = apply()
+        this.#db.exec('COMMIT')
+        return result
+      })
+      if (this.#lastAt < lastAt)
+        this.#approvals.rebaseClock(this.#lastAt - lastAt)
       return result
     } catch (error) {
-      this.#db.exec('ROLLBACK')
+      this.#lastAt = lastAt
+      this.#coverage = coverage
+      if (this.#db.isTransaction) this.#db.exec('ROLLBACK')
       throw error
     }
   }
@@ -265,10 +276,20 @@ export class Supervision {
     // Clock regression invalidates consent instead of extending its wall-clock lifetime.
     if (now < this.#lastAt) {
       const old = this.#active()
-      if (old) this.#finish(old, now, 'Clock changed')
+      if (old)
+        this.#finish(
+          old,
+          Math.min(this.#lastAt, old.expiresAt),
+          'Clock changed',
+        )
       this.#db.exec(
         "UPDATE sv_invitations SET state='clock-changed' WHERE state='open'",
       )
+      this.#work.resetClock(now)
+      this.#coverage.clear()
+      this.#db
+        .prepare('UPDATE sv_control SET resetAt=?,armed=1,snoozeAt=NULL')
+        .run(now)
     }
     this.#lastAt = now
     this.#work.checkpoint(now)
@@ -328,10 +349,37 @@ export class Supervision {
     this.#transaction(() => {
       const now = this.#now()
       this.#advance(now)
+      const lifecycle =
+        observation.provider === 'claude' &&
+        (observation.source ?? 'hook') === 'hook'
+      const previous =
+        lifecycle && (observation.status === 'closed' || observation.newSession)
+          ? this.#work.claude(observation.sessionId, undefined, now)
+          : undefined
       this.#work.observe(observation, now, randomUUID())
       if (
-        observation.provider === 'claude' &&
-        (observation.source ?? 'hook') === 'hook' &&
+        previous &&
+        previous.generation !==
+          this.#work.claude(observation.sessionId, undefined, now)?.generation
+      ) {
+        // Only a confirmed end or replacement can retire this particular terminal's original cards.
+        const live = this.#db
+          .prepare(
+            'SELECT questionId FROM sv_questions WHERE sessionId=? AND generation=? AND live=1',
+          )
+          .all(observation.sessionId, previous.generation)
+        for (const row of live)
+          this.#resolveQuestion(
+            observation.sessionId,
+            String(row.questionId),
+            'Original terminal closed',
+            now,
+          )
+        this.#approvals.close(previous.generation)
+      }
+      if (
+        lifecycle &&
+        !observation.newSession &&
         (observation.status === 'running' || observation.status === 'idle')
       ) {
         const active = this.#active()
@@ -363,8 +411,12 @@ export class Supervision {
   ): void {
     this.#transaction(() => {
       const now = this.#now()
-      if ((this.#coverage.get(source)?.at ?? -Infinity) > coverage.at) return
       this.#advance(now)
+      if (
+        coverage.at > now ||
+        (this.#coverage.get(source)?.at ?? -Infinity) > coverage.at
+      )
+        return
       this.#work.replaceSource(
         source,
         observations,
@@ -379,8 +431,9 @@ export class Supervision {
   }
 
   /**
-   * Score a positively identified human response once. Independent readers can pass the
-   * canonical origin ID for a mirrored event; ordinary new prompts never call this method.
+   * Score a positively identified human response once. A live witness also confirms a prior
+   * history import when the original provider independently identifies the human reply.
+   * @example supervisor.humanReply({provider:'codex',sessionId:'s',responseId:'prompt:p',observedLive:true})
    */
   humanReply(input: {
     provider: Provider
@@ -390,6 +443,7 @@ export class Supervision {
     originId?: string
     incarnation?: string
     at?: number
+    observedLive?: boolean
   }): boolean {
     return this.#transaction(() => {
       const now = this.#now(),
@@ -417,10 +471,7 @@ export class Supervision {
         input.provider === 'claude' && questionId
           ? this.#card(input.sessionId, questionId)
           : undefined
-      if (
-        card &&
-        ['pending', 'sent', 'ambiguous', 'human'].includes(card.disposition)
-      )
+      if (card && ['pending', 'sent', 'ambiguous'].includes(card.disposition))
         return false
       const responseId = questionId ? 'tool:' + questionId : input.responseId
       const key = replyKey({ ...input, responseId })
@@ -430,6 +481,12 @@ export class Supervision {
           .get(key)
       )
         return false
+      // Remember the independent witness even if history already credited the same reply.
+      if (input.observedLive)
+        this.#db
+          .prepare('INSERT OR IGNORE INTO sv_live_replies VALUES(?)')
+          .run(key)
+      if (card?.disposition === 'human') return false
       const added = this.#db
         .prepare('INSERT OR IGNORE INTO sv_replies VALUES(?,?,?)')
         .run(key, at, this.#active() || at < this.#control().resetAt ? 0 : 1)
@@ -456,15 +513,26 @@ export class Supervision {
   }
 
   /**
-   * Withdraw points when later provenance identifies an automated or mirrored response.
-   * A durable exclusion wins even when an importer repeats the event or arrives out of order.
+   * Withdraw a history credit when its question disappears or later provenance identifies automation.
+   * A temporary withdrawal preserves independent live proof and permits a later verified import.
+   * Confirmed automation permanently excludes the response, including future live or mirrored events.
    * @example supervisor.retractHumanReply({provider:'codex',sessionId:'s',responseId:'tool:q'})
    */
-  retractHumanReply(input: ReplyOrigin): void {
+  retractHumanReply(input: ReplyOrigin & { permanent?: boolean }): void {
     this.#transaction(() => {
       const now = this.#now()
       this.#advance(now)
       const key = replyKey(input)
+      if (input.permanent === false) {
+        // Only recent workload credit can be withdrawn; reset and excluded replies keep their prior state.
+        this.#db
+          .prepare(
+            'DELETE FROM sv_replies WHERE id=? AND credited=1 AND NOT EXISTS (SELECT 1 FROM sv_live_replies WHERE id=sv_replies.id)',
+          )
+          .run(key)
+        this.#considerInvitation(now)
+        return
+      }
       this.#db
         .prepare(
           'INSERT INTO sv_replies VALUES(?,?,-1) ON CONFLICT(id) DO UPDATE SET credited=-1',
@@ -503,6 +571,7 @@ export class Supervision {
       at > now
     )
       return false
+    if (now < this.#lastAt) this.tick()
     const base = {
       provider: 'claude' as const,
       sessionId: input.sessionId,
@@ -742,20 +811,44 @@ export class Supervision {
   }
 
   /** A matching post-tool event can prove a card closed even when its answer's author is unknown. */
-  resolveQuestion(sessionId: string, questionId: string): void {
-    this.#transaction(() => {
-      const now = this.#now()
-      this.#hold(sessionId, questionId, 'Original request completed', now)
-      this.#db
-        .prepare('INSERT OR IGNORE INTO sv_resolved VALUES(?,?)')
-        .run(sessionId, questionId)
-      this.#db
-        .prepare(
-          'UPDATE sv_questions SET live=0 WHERE sessionId=? AND questionId=?',
-        )
-        .run(sessionId, questionId)
-      this.#work.setWaiting(sessionId, questionId, false, now)
-    })
+  resolveQuestion(
+    sessionId: string,
+    questionId: string,
+    outcome: 'completed' | 'failed' = 'completed',
+  ): void {
+    this.#transaction(() =>
+      this.#resolveQuestion(
+        sessionId,
+        questionId,
+        outcome === 'failed'
+          ? 'Original request failed or was canceled'
+          : 'Original request completed',
+        this.#now(),
+      ),
+    )
+  }
+
+  #resolveQuestion(
+    sessionId: string,
+    questionId: string,
+    reason: string,
+    now: number,
+  ): void {
+    this.#db
+      .prepare('INSERT OR IGNORE INTO sv_resolved VALUES(?,?)')
+      .run(sessionId, questionId)
+    // Provider completion closes the card, while delivery and human provenance have independent outcomes.
+    this.#db
+      .prepare(
+        "UPDATE sv_questions SET live=0,disposition=CASE WHEN disposition IN ('open','held') THEN 'resolved' ELSE disposition END WHERE sessionId=? AND questionId=?",
+      )
+      .run(sessionId, questionId)
+    this.#db
+      .prepare(
+        "UPDATE sv_reviews SET outcome='resolved',reason=?,at=? WHERE sessionId=? AND questionId=? AND outcome='held'",
+      )
+      .run(reason, now, sessionId, questionId)
+    this.#work.setWaiting(sessionId, questionId, false, now)
   }
 
   /**
@@ -866,15 +959,20 @@ export class Supervision {
     this.#transaction(() => {
       const now = this.#now(),
         card = this.#card(sessionId, questionId)
-      if (card?.disposition !== 'pending') return
+      if (
+        !card ||
+        (card.disposition !== 'pending' &&
+          !(outcome === 'sent' && card.disposition === 'ambiguous'))
+      )
+        return
       this.#db
         .prepare(
-          'UPDATE sv_questions SET disposition=?,live=? WHERE sessionId=? AND questionId=?',
+          "UPDATE sv_questions SET disposition=?,live=CASE WHEN ?='sent' THEN 0 ELSE live END WHERE sessionId=? AND questionId=?",
         )
-        .run(outcome, outcome === 'sent' ? 0 : 1, sessionId, questionId)
+        .run(outcome, outcome, sessionId, questionId)
       this.#db
         .prepare(
-          "UPDATE sv_reviews SET outcome=?,reason=?,at=? WHERE breakId=? AND sessionId=? AND questionId=? AND outcome='pending'",
+          "UPDATE sv_reviews SET outcome=?,reason=?,at=? WHERE breakId=? AND sessionId=? AND questionId=? AND outcome IN ('pending','ambiguous')",
         )
         .run(
           outcome,
@@ -897,17 +995,30 @@ export class Supervision {
   discardUndelivered(sessionId: string, questionId: string): void {
     this.#transaction(() => {
       const card = this.#card(sessionId, questionId)
-      if (card?.disposition !== 'pending') return
+      if (!card || !['pending', 'ambiguous'].includes(card.disposition)) return
+      const closed = this.#db
+        .prepare('SELECT 1 FROM sv_resolved WHERE sessionId=? AND questionId=?')
+        .get(sessionId, questionId)
+      const outcome = closed ? 'resolved' : 'held'
       this.#db
         .prepare(
-          "UPDATE sv_questions SET disposition='held' WHERE sessionId=? AND questionId=? AND disposition='pending'",
+          "UPDATE sv_questions SET disposition=? WHERE sessionId=? AND questionId=? AND disposition IN ('pending','ambiguous')",
         )
-        .run(sessionId, questionId)
+        .run(outcome, sessionId, questionId)
       this.#db
         .prepare(
-          "UPDATE sv_reviews SET outcome='held',answer=NULL,reason='Original hook confirmed no answer was delivered',at=? WHERE breakId=? AND sessionId=? AND questionId=? AND outcome='pending'",
+          "UPDATE sv_reviews SET outcome=?,answer=NULL,reason=?,at=? WHERE breakId=? AND sessionId=? AND questionId=? AND outcome IN ('pending','ambiguous')",
         )
-        .run(this.#now(), card.candidate, sessionId, questionId)
+        .run(
+          outcome,
+          closed
+            ? 'Original request ended without a delegated answer'
+            : 'Original hook confirmed no answer was delivered',
+          this.#now(),
+          card.candidate,
+          sessionId,
+          questionId,
+        )
     })
   }
 

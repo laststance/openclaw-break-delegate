@@ -4,6 +4,8 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { runHook } from '../dist/hooks.js'
+import { Readable } from 'node:stream'
+import { readHookInput } from '../dist/commands.js'
 import { listenGateway } from '../dist/ipc.js'
 
 const card = {
@@ -98,4 +100,36 @@ test('Claude conveys an incomplete instruction and a qualified answer without co
   assert.deepEqual(observed[1].conditional, [card.question])
   assert.equal(observed[1].human, true)
   assert.equal(JSON.stringify(observed).includes(note), false)
+})
+
+test('an oversized terminal task still places an instruction hold on its originating process', async (t) => {
+  // Arrange
+  const directory = await mkdtemp(join(tmpdir(), 'bd-overflow-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const requests = []
+  const close = await listenGateway(directory, async (request) => {
+    requests.push(request)
+    return true
+  })
+  t.after(close)
+  const wire = JSON.stringify({
+    prompt: 'a'.repeat(300_000) + ' Do not change the code.',
+    session_id: 'terminal-A',
+    hook_event_name: 'UserPromptSubmit',
+  })
+
+  // Act
+  const body = await readHookInput(Readable.from([Buffer.from(wire)]))
+  await runHook(
+    directory,
+    body,
+    async () => {},
+    'process-A',
+    'UserPromptSubmit',
+  )
+
+  // Assert
+  assert.deepEqual(requests, [
+    { op: 'incomplete-instruction', incarnation: 'process-A' },
+  ])
 })

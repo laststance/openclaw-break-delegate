@@ -23,7 +23,7 @@ openclaw break-delegate authorize-notifications
 openclaw break-delegate status
 ```
 
-`setup` preserves existing Claude settings and registers the hook executable from this install. Run it again after moving or updating the installation. A custom settings file can be selected with `setup --settings /absolute/path/to/settings.json`. Start an interactive Claude session to establish an identifiable terminal instance. Notification permission can also be granted from the Break Delegate menu.
+`setup` preserves existing Claude settings and registers the hook executable from this install. Run it again after moving or updating the installation. A custom settings file can be selected with `setup --settings /absolute/path/to/settings.json`. Installing against a settings file hands its Break Delegate hooks to that profile. Removal affects hooks owned by the selected profile. Setup compares the file immediately before replacing it; another editor writing at that exact instant cannot share its lock. Start an interactive Claude session to establish an identifiable terminal instance. Notification permission can also be granted from the Break Delegate menu.
 
 ## Take a break
 

@@ -483,6 +483,7 @@ test('linked worktrees and HTTPS/SSH clones of the same origin share evidence wh
     '-c',
     'user.email=fixture@example.invalid',
     'commit',
+    '--no-gpg-sign',
     '--allow-empty',
     '-m',
     'fixture',

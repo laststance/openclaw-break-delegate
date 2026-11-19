@@ -181,6 +181,53 @@ test('later automation provenance retracts the exact four points and suppresses 
   assert.equal(reopened.status().score, 4)
 })
 
+test('a missing typed question withdraws the history credit until a later verified import restores it once', (t) => {
+  // Arrange
+  const { db, s } = setup(t)
+  const reply = {
+    provider: 'claude',
+    sessionId: 'terminal',
+    responseId: 'prompt:first',
+  }
+  s.humanReply(reply)
+  assert.equal(s.status().score, 4)
+
+  // Act
+  s.retractHumanReply({ ...reply, permanent: false })
+  s.retractHumanReply({ ...reply, permanent: false })
+
+  // Assert
+  assert.equal(s.status().score, 0)
+  assert.equal(s.status().invitationId, null)
+  const restarted = new Supervision(db, { now: () => Date.UTC(2026, 0, 1) })
+  assert.equal(restarted.humanReply(reply), true)
+  assert.equal(restarted.humanReply(reply), false)
+  assert.equal(restarted.status().score, 4)
+})
+
+test('a live typed reply confirmed after history survives temporary loss and restart while definitive automation still wins', (t) => {
+  // Arrange
+  const { db, s } = setup(t)
+  const reply = {
+    provider: 'claude',
+    sessionId: 'terminal',
+    responseId: 'prompt:live',
+  }
+  s.humanReply(reply)
+  assert.equal(s.humanReply({ ...reply, observedLive: true }), false)
+  const restarted = new Supervision(db, { now: () => Date.UTC(2026, 0, 1) })
+
+  // Act
+  restarted.retractHumanReply({ ...reply, permanent: false })
+
+  // Assert
+  assert.equal(restarted.status().score, 4)
+  restarted.retractHumanReply(reply)
+  restarted.retractHumanReply({ ...reply, permanent: false })
+  assert.equal(restarted.humanReply({ ...reply, observedLive: true }), false)
+  assert.equal(restarted.status().score, 0)
+})
+
 test('multi-frame local review returns every original receipt exactly once after the latest break changes', (t) => {
   // Arrange
   const { s, start, context, advance } = setup(t)
@@ -230,5 +277,179 @@ test('multi-frame local review returns every original receipt exactly once after
         p.rows.length <= 40 &&
         Buffer.byteLength(JSON.stringify({ ok: true, value: p })) < 256 * 1024,
     ),
+  )
+})
+
+test('duplicate SessionStart preserves the original live membership and pending card but reopening after SessionEnd never rejoins', (t) => {
+  // Arrange
+  const { s, context, start, status } = setup(t)
+  const begin = () =>
+    s.observe({
+      provider: 'claude',
+      ...context,
+      status: 'idle',
+      canDelegate: true,
+      newSession: true,
+    })
+  begin()
+  s.observe({
+    provider: 'claude',
+    ...context,
+    status: 'running',
+    canDelegate: true,
+  })
+  const breakId = start()
+  const generation = s.status().sessions[0].generation
+  s.question({ ...context, questionId: 'waiting', question: 'Which?' })
+  // Act
+  begin()
+  // Assert
+  assert.equal(status(), 'waiting')
+  assert.equal(s.status().sessions[0].generation, generation)
+  assert.equal(
+    s.commitAnswer(
+      { ...context, questionId: 'waiting', breakId, answer: 'First' },
+      () => true,
+    ),
+    true,
+  )
+  s.observe({ provider: 'claude', ...context, status: 'closed' })
+  begin()
+  assert.notEqual(s.status().sessions[0].generation, generation)
+  assert.equal(
+    s.question({ ...context, questionId: 'reopened', question: 'Which?' })
+      .eligible,
+    false,
+  )
+})
+
+test('positive original-hook evidence reconciles timed-out receipts after restart and never retransmits', (t) => {
+  // Arrange
+  const { s, db, context, start } = setup(t)
+  const breakId = start()
+  for (const id of ['unwritten', 'written', 'ended']) {
+    s.question({ ...context, questionId: id, question: 'Which?' })
+    assert.equal(
+      s.commitAnswer(
+        { ...context, questionId: id, breakId, answer: 'First' },
+        () => true,
+      ),
+      true,
+    )
+    s.settleAnswer(context.sessionId, id, 'ambiguous')
+  }
+  s.resolveQuestion(context.sessionId, 'ended', 'failed')
+  const restarted = new Supervision(db)
+  // Act
+  restarted.discardUndelivered(context.sessionId, 'unwritten')
+  restarted.settleAnswer(context.sessionId, 'written', 'sent')
+  restarted.discardUndelivered(context.sessionId, 'ended')
+  restarted.settleAnswer(context.sessionId, 'unwritten', 'sent')
+  restarted.discardUndelivered(context.sessionId, 'written')
+  // Assert
+  assert.deepEqual(
+    restarted
+      .review(breakId)
+      .map((row) => [row.questionId, row.outcome, row.answer]),
+    [
+      ['unwritten', 'held', null],
+      ['written', 'sent', 'First'],
+      ['ended', 'resolved', null],
+    ],
+  )
+  assert.equal(
+    restarted.commitAnswer(
+      { ...context, questionId: 'unwritten', breakId, answer: 'First' },
+      () => true,
+    ),
+    false,
+  )
+})
+
+test('failed, canceled or completed Claude cards disappear from outstanding held review without attributing a human answer', (t) => {
+  // Arrange
+  const { s, context, start } = setup(t)
+  s.question({
+    ...context,
+    questionId: 'before',
+    question: 'Already displayed?',
+  })
+  const breakId = start()
+  for (const id of ['failed', 'done', 'human']) {
+    s.question({ ...context, questionId: id, question: 'Which?' })
+    s.hold(context.sessionId, id, 'Waiting for the person')
+  }
+  s.humanReply({
+    provider: 'claude',
+    ...context,
+    questionId: 'human',
+    responseId: 'tool:human',
+  })
+  // Act
+  s.resolveQuestion(context.sessionId, 'failed', 'failed')
+  s.resolveQuestion(context.sessionId, 'before', 'failed')
+  s.resolveQuestion(context.sessionId, 'done')
+  s.resolveQuestion(context.sessionId, 'human')
+  // Assert
+  const rows = s.review(breakId)
+  assert.deepEqual(
+    rows.map((row) => [row.questionId, row.outcome]),
+    [
+      ['before', 'resolved'],
+      ['failed', 'resolved'],
+      ['done', 'resolved'],
+      ['human', 'human'],
+    ],
+  )
+  assert.match(rows[0].reason, /failed or was canceled/)
+  assert.equal(rows[2].reason, 'Original request completed')
+})
+
+test('SessionEnd retires only live held cards and approvals in the exiting incarnation and preserves delivery receipts', (t) => {
+  // Arrange
+  const { s, context, start, event } = setup(t)
+  const other = { sessionId: 'other', incarnation: 'two' }
+  s.observe({
+    provider: 'claude',
+    ...other,
+    status: 'running',
+    canDelegate: true,
+  })
+  const breakId = start()
+  for (const id of ['manual', 'sent', 'pending']) {
+    s.question({ ...context, questionId: id, question: 'Which?' })
+    if (id === 'manual') s.hold(context.sessionId, id, 'Needs the person')
+    else {
+      assert.equal(
+        s.commitAnswer(
+          { ...context, questionId: id, breakId, answer: 'First' },
+          () => true,
+        ),
+        true,
+      )
+      if (id === 'sent') s.settleAnswer(context.sessionId, id, 'sent')
+    }
+  }
+  event('PermissionRequest', 'op', { command: 'fixture' })
+  s.question({ ...other, questionId: 'keep', question: 'Other terminal?' })
+  s.hold(other.sessionId, 'keep', 'Not enough evidence')
+  // Act
+  s.observe({ provider: 'claude', ...context, status: 'closed' })
+  // Assert
+  assert.deepEqual(
+    s.review(breakId).map((row) => [row.questionId, row.outcome]),
+    [
+      ['manual', 'resolved'],
+      ['sent', 'sent'],
+      ['pending', 'pending'],
+      ['approval:op', 'resolved'],
+      ['keep', 'held'],
+    ],
+  )
+  s.settleAnswer(context.sessionId, 'pending', 'ambiguous')
+  s.discardUndelivered(context.sessionId, 'pending')
+  assert.equal(
+    s.review(breakId).find((row) => row.questionId === 'pending').outcome,
+    'resolved',
   )
 })
