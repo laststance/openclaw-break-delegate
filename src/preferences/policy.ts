@@ -501,9 +501,26 @@ export function instructionConstraints(
     /^(?:(?:can|could|would|will) you\b|please\b|explain\b|describe\b|tell me\b)/u.test(
       text,
     )
+  // In "explain why assistants pause and ask", both verbs belong to the subject of the explanation.
+  // A fresh clause or a direct request to the listener can still impose its own constraint.
+  const indirectQuestion =
+    /^(?:(?:can|could|would|will) you\s+)?(?:please\s+)?(?:explain|describe|tell me)\s+(?:why|how|when|whether|what|where|if)\b/u.test(
+      text,
+    )
+  const directives = indirectQuestion
+    ? text
+        .split(
+          /\s*[,;.!?。！？、]\s*|\b(?:and|but)\s+(?=(?:(?:then|also)\s+)?(?:please\b|(?:can|could|would|will) you\b|i (?:need|want) you\b))/u,
+        )
+        .slice(1)
+        .map((clause) =>
+          clause.replace(/^(?:(?:and|but|also|then)\s+)+/u, '').trim(),
+        )
+        .filter(Boolean)
+    : clauses.slice(1)
   if (
     asksForApproval(text) ||
-    (addressedRequest && clauses.slice(1).some(asksForApproval))
+    (addressedRequest && directives.some(asksForApproval))
   )
     return [{ kind: '*', required: '*' }]
   // A question asking for information does not impose a standing constraint. Polite requests can still contain an explicit limit.
@@ -514,10 +531,10 @@ export function instructionConstraints(
       text,
     )
   ) {
-    const directives = clauses
-      .slice(1)
-      .filter((clause) => restriction.test(clause) || asksForApproval(clause))
-    return directives.flatMap((clause) =>
+    const limits = directives.filter(
+      (clause) => restriction.test(clause) || asksForApproval(clause),
+    )
+    return limits.flatMap((clause) =>
       instructionConstraints(clause.replace(/[?？]$/u, ''), true),
     )
   }
@@ -565,21 +582,23 @@ export function instructionConstraints(
       ).map((kind) => ({ kind, required: '*' }))
     }
   }
-  // An explicit preference with an unfamiliar qualifier still blocks a conflicting guess on that topic.
-  const imperative =
-    /^(?:(?:can|could|would|will) you\s+)?(?:please\s+)?(?:run|rerun|use|write|fix|address|repair|file|defer|keep|choose|summarize|provide|reply|answer)\b|(?:してください|でお願いします|をお願いします)[。.!！]?$/u.test(
-      text,
-    )
-  if (imperative && !restriction.test(text) && !operation.test(text)) {
-    const topics = decisionTypes.filter(
-      (type) => type.topic.test(text) && meanings(text, type).length > 0,
-    )
-    if (topics.length)
-      return topics.map((type) => ({ kind: type.kind, required: '*' }))
+  if (explicit || restriction.test(text) || isStandingReplyInstruction(text))
+    return [{ kind: '*', required: '*' }]
+  // Unknown context can narrow a named choice. Hold every applicable topic unless the earlier parser proved its meaning.
+  const uncertain = new Set<string>()
+  for (const type of decisionTypes) {
+    if (!type.topic.test(text) || !meanings(text, type).length) continue
+    if (type.kind === 'response-language') {
+      const targets = languageTargets(text)
+      for (const kind of targets.length
+        ? targets
+        : ['response-language', 'documentation-language'])
+        uncertain.add(kind)
+    } else {
+      uncertain.add(type.kind)
+    }
   }
-  return explicit || restriction.test(text) || isStandingReplyInstruction(text)
-    ? [{ kind: '*', required: '*' }]
-    : []
+  return Array.from(uncertain, (kind) => ({ kind, required: '*' }))
 }
 
 /** Constrain the learned winner to all applicable human instructions when replay or live evaluation selects a label.

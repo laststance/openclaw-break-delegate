@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { PreferenceStore } from '../../dist/preferences/index.js'
+import { EvidenceDatabase } from '../../dist/preferences/database.js'
 
 const base = Date.UTC(2025, 0, 4)
 const event = (type, payload, milliseconds) => ({
@@ -232,9 +233,21 @@ test('upgrading an unowned cache releases a removed Codex transcript instruction
 test('upgrading a prior split-result cache verifies the actual answer file before restoring its previously lost choice and workload', async (t) => {
   // Arrange
   const { db, store, codex, one, two } = fixture(t)
-  rows(one, [meta, request()])
+  rows(two, [
+    meta,
+    event(
+      'event_msg',
+      {
+        type: 'agent_message',
+        id: 'ordinary',
+        message: 'Preparing the request.',
+      },
+      500,
+    ),
+    request(),
+  ])
   await store.importHistory({ codex })
-  rows(two, [meta, response])
+  rows(one, [meta, response])
   await store.importHistory({ codex })
   const prior = db
     .prepare(
@@ -269,7 +282,7 @@ test('upgrading a prior split-result cache verifies the actual answer file befor
   }
   db.exec(`DELETE FROM pref_structured_witnesses; DELETE FROM pref_primary_choices; DELETE FROM pref_responses;
     UPDATE pref_offers SET answered=NULL,selected=NULL; UPDATE pref_state SET dirty=1;
-    DELETE FROM pref_decoder_versions WHERE version='revalidated-native-links-and-structured-witnesses-v1'`)
+    DELETE FROM pref_decoder_versions WHERE version IN ('revalidated-native-links-and-structured-witnesses-v1','native-submission-attribution-v2')`)
 
   // Act
   const upgraded = new PreferenceStore(db)
@@ -279,7 +292,7 @@ test('upgrading a prior split-result cache verifies the actual answer file befor
 
   // Assert
   assert.deepEqual(pending, [])
-  assert.equal(verified.changedFiles, 1)
+  assert.equal(verified.changedFiles, 2)
   assert.equal(verified.observations, 1)
   assert.deepEqual(
     upgraded.humanResponsesSince(0).map((r) => r.responseId),
@@ -367,4 +380,162 @@ test('the decoder upgrade rereads an unchanged Codex transcript to correct an ex
     [],
   )
   assert.equal(stable.bytesRead, 0)
+})
+
+test('a new answer discovered before its request is confirmed once across imports without caching the free-form answer', async (t) => {
+  // Arrange
+  const { db, store, codex, one, two } = fixture(t)
+  const secret = 'synthetic private free-form words'
+  const freeRequest = event(
+    'response_item',
+    {
+      type: 'function_call',
+      name: 'request_user_input',
+      call_id: 'text',
+      arguments: JSON.stringify({
+        questions: [{ id: 'title', question: 'Desired title?' }],
+      }),
+    },
+    1000,
+  )
+  const freeResult = event(
+    'response_item',
+    {
+      type: 'function_call_output',
+      call_id: 'text',
+      output: JSON.stringify({ answers: { title: { answers: [secret] } } }),
+    },
+    2000,
+  )
+  rows(one, [meta, response, freeResult])
+  const waiting = await store.importHistory({ codex })
+  const dormant = db.prepare('SELECT * FROM pref_deferred_outputs').all()
+  const creditsBefore = store.humanResponsesSince(0)
+  rows(two, [meta, request(), freeRequest])
+
+  // Act
+  const verified = await store.importHistory({ codex })
+  const stable = await store.importHistory({ codex })
+
+  // Assert
+  assert.equal(waiting.observations, 0)
+  assert.deepEqual(creditsBefore, [])
+  assert.equal(dormant.length, 2)
+  assert.doesNotMatch(JSON.stringify(dormant), /private|free-form words/)
+  assert.equal(verified.observations, 1)
+  assert.deepEqual(
+    store
+      .humanResponsesSince(0)
+      .map((r) => r.responseId)
+      .sort(),
+    ['tool:form-1', 'tool:text'],
+  )
+  assert.deepEqual(db.prepare('SELECT * FROM pref_deferred_outputs').all(), [])
+  assert.equal(stable.bytesRead, 0)
+})
+
+test('an outstanding result reread cannot validate a different question in the same answer file or cross a conflicting repository', async (t) => {
+  // Arrange
+  const { store, codex, one, two } = fixture(t)
+  const renameCall = (row, id) => ({
+    ...row,
+    payload: { ...row.payload, call_id: id },
+  })
+  rows(two, [meta, request()])
+  await store.importHistory({ codex })
+  rows(one, [meta, response, renameCall(response, 'new')])
+  const original = await store.importHistory({ codex })
+  const changed = {
+    ...card,
+    options: [{ label: 'Full suite' }, { label: 'Focused tests' }],
+  }
+  rows(two, [meta, request(changed), renameCall(request(), 'new')])
+
+  // Act
+  const after = await store.importHistory({ codex })
+  const supported = store.humanResponsesSince(0).map((r) => r.responseId)
+  rows(one, [
+    {
+      ...meta,
+      payload: {
+        ...meta.payload,
+        git: { repository_url: 'https://github.com/fixture/other.git' },
+      },
+    },
+    renameCall(response, 'new'),
+  ])
+  const wrongRepo = await store.importHistory({ codex })
+
+  // Assert
+  assert.equal(original.observations, 1)
+  assert.equal(after.observations, 1)
+  assert.deepEqual(supported, ['tool:new'])
+  assert.equal(wrongRepo.observations, 0)
+  assert.deepEqual(store.humanResponsesSince(0), [])
+})
+
+test('conflicting provider targets withdraw only their native submission and restore the surviving direct source when the other account of the target is rewritten', (t) => {
+  // Arrange
+  const { db } = fixture(t)
+  const evidence = new EvidenceDatabase(db)
+  const session = { source: 'codex', sessionId: 'thread' }
+  const origin = { ...session, toolUseId: 'offer' }
+  evidence.transaction(() => {
+    evidence.offer({ ...origin, card, repo: 'fixture', askedAt: 1000 })
+    assert.equal(
+      evidence.observeNativeTarget(session, 'prompt:shared', 'first'),
+      true,
+    )
+    evidence.directText(
+      origin,
+      'prompt:shared',
+      card.question,
+      'Focused tests',
+      2000,
+      'Ask me for approval.',
+    )
+    evidence.directText(
+      origin,
+      'prompt:independent',
+      card.question,
+      'Focused tests',
+      2000,
+    )
+  }, 'first-copy')
+  const before = evidence
+    .responsesSince(0)
+    .map((row) => row.responseId)
+    .sort()
+
+  // Act
+  const authentic = evidence.transaction(
+    () => evidence.observeNativeTarget(session, 'prompt:shared', 'second'),
+    'second-copy',
+  )
+  const contested = evidence.responsesSince(0).map((row) => row.responseId)
+  const remaining = evidence.replay().observations
+  const constraints = db.prepare('SELECT required FROM pref_constraints').all()
+  evidence.transaction(() => evidence.withdrawSource('second-copy'))
+
+  // Assert
+  assert.deepEqual(before, ['prompt:independent', 'prompt:shared'])
+  assert.equal(authentic, false)
+  assert.deepEqual(contested, ['prompt:independent'])
+  assert.equal(remaining, 1)
+  assert.deepEqual(constraints, [])
+  assert.equal(evidence.replay().observations, 1)
+  assert.deepEqual(
+    evidence
+      .responsesSince(0)
+      .map((row) => row.responseId)
+      .sort(),
+    ['prompt:independent', 'prompt:shared'],
+  )
+  assert.deepEqual(
+    db
+      .prepare('SELECT required FROM pref_constraints')
+      .all()
+      .map((row) => row.required),
+    ['*'],
+  )
 })

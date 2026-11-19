@@ -159,6 +159,8 @@ type FactValue = string | number
 export class EvidenceDatabase {
   private owner = 'live'
   private deriving = false
+  private frameEnd = 0
+  private directSubmission?: { id: string; tool: string; rejected: boolean }
 
   constructor(readonly db: DatabaseSync) {
     db.exec(`
@@ -212,6 +214,19 @@ export class EvidenceDatabase {
       CREATE TABLE IF NOT EXISTS pref_structured_witnesses(owner TEXT,source TEXT,session TEXT,tool TEXT,shape TEXT,
         question TEXT,repo TEXT,selected TEXT,at INTEGER,PRIMARY KEY(owner,source,session,tool,shape,question,repo,selected,at));
       CREATE INDEX IF NOT EXISTS pref_structured_call ON pref_structured_witnesses(source,session,tool,shape,question,repo,at);
+      CREATE TABLE IF NOT EXISTS pref_deferred_outputs(owner TEXT, source TEXT, session TEXT, tool TEXT, at INTEGER, frame INTEGER,
+        PRIMARY KEY(owner,source,session,tool,at,frame));
+      CREATE TABLE IF NOT EXISTS pref_direct_submissions(owner TEXT,source TEXT,session TEXT,response_id TEXT,tool TEXT,table_name TEXT,row_data TEXT,
+        PRIMARY KEY(owner,source,session,response_id,tool,table_name,row_data));
+      CREATE INDEX IF NOT EXISTS pref_direct_submission_id ON pref_direct_submissions(source,session,response_id,tool);
+      CREATE TABLE IF NOT EXISTS pref_refuted_submissions(owner TEXT,source TEXT,session TEXT,response_id TEXT,PRIMARY KEY(owner,source,session,response_id));
+      CREATE INDEX IF NOT EXISTS pref_refuted_submission_id ON pref_refuted_submissions(source,session,response_id);
+      CREATE TABLE IF NOT EXISTS pref_native_targets(owner TEXT,source TEXT,session TEXT,response_id TEXT,target TEXT,PRIMARY KEY(owner,source,session,response_id,target));
+      CREATE INDEX IF NOT EXISTS pref_native_target_id ON pref_native_targets(source,session,response_id,target);
+      CREATE VIEW IF NOT EXISTS pref_ambiguous_submissions AS
+        SELECT source,session,response_id FROM pref_refuted_submissions UNION ALL
+        SELECT source,session,response_id FROM pref_native_targets GROUP BY source,session,response_id HAVING MIN(target)<>MAX(target) UNION ALL
+        SELECT source,session,response_id FROM pref_direct_submissions GROUP BY source,session,response_id HAVING MIN(tool)<>MAX(tool);
       CREATE TABLE IF NOT EXISTS pref_primary_choices(source TEXT,session TEXT,tool TEXT,question TEXT,selected TEXT,at INTEGER,
         PRIMARY KEY(source,session,tool,question,selected,at));
       CREATE TABLE IF NOT EXISTS pref_shape_conflicts(source TEXT,session TEXT,tool TEXT,question TEXT,PRIMARY KEY(source,session,tool,question));
@@ -453,6 +468,30 @@ export class EvidenceDatabase {
           })
         for (const session of affected.values()) this.restoreSession(session)
       })
+    })
+    this.transaction(() => {
+      if (
+        !db
+          .prepare('INSERT OR IGNORE INTO pref_decoder_versions VALUES(?)')
+          .run('native-submission-attribution-v2').changes
+      )
+        return
+      // Older native IDs were not tied to each choice and standing instruction they produced.
+      // An older result-first scan left no indication of its ignored frames. Schedule every interactive Codex transcript once.
+      const files = db
+        .prepare(
+          `SELECT path,identity, (json_type(state,'$.lastText') IS NOT NULL OR EXISTS(SELECT 1 FROM pref_source_facts f
+        WHERE f.owner=pref_files.path||'/'||pref_files.identity AND f.table_name='pref_direct_text')) AS typed
+        FROM pref_files WHERE json_extract(state,'$.interactive')=1`,
+        )
+        .all()
+      for (const row of files) {
+        db.prepare('INSERT OR IGNORE INTO pref_legacy_refresh VALUES(?)').run(
+          row.path,
+        )
+        if (row.typed)
+          this.withdrawSource(String(row.path) + '/' + String(row.identity))
+      }
     })
   }
 
@@ -745,6 +784,80 @@ export class EvidenceDatabase {
     })
   }
 
+  /** Keep the exact byte boundary of a decoded frame so only that authenticated result is revisited later.
+   * @example evidence.decodeFrame(end, () => parseHistoryRow(evidence, format, state, row, counts))
+   */
+  decodeFrame(end: number, decode: () => void): void {
+    const old = this.frameEnd
+    this.frameEnd = end
+    try {
+      decode()
+    } finally {
+      this.frameEnd = old
+    }
+  }
+
+  /** Remember which local source to revisit after a matching Codex question arrives, without retaining the unbound answer text.
+   * @example evidence.deferStructuredResult(origin, answeredAt)
+   */
+  deferStructuredResult(origin: Origin, at: number): void {
+    if (
+      !this.frameEnd ||
+      origin.source !== 'codex' ||
+      !validId(origin.sessionId) ||
+      !validId(origin.toolUseId) ||
+      !time(at) ||
+      this.isPermanentlyExcluded(origin)
+    )
+      return
+    this.db
+      .prepare(
+        'INSERT OR IGNORE INTO pref_deferred_outputs VALUES(?,?,?,?,?,?)',
+      )
+      .run(this.owner, ...fields(origin), at, this.frameEnd)
+  }
+
+  /** Settle the exact source frame when the importer can validate its offer, including a known repository mismatch.
+   * @example evidence.settleStructuredResult(origin, answeredAt, repo)
+   */
+  settleStructuredResult(
+    origin: Origin,
+    at: number,
+    repo?: string | null,
+  ): boolean {
+    this.db
+      .prepare(
+        'DELETE FROM pref_deferred_outputs WHERE owner=? AND source=? AND session=? AND tool=? AND at=? AND frame=?',
+      )
+      .run(this.owner, ...fields(origin), at, this.frameEnd)
+    return (
+      !repo ||
+      !this.db
+        .prepare(
+          'SELECT 1 FROM pref_offers WHERE source=? AND session=? AND tool=? AND repo<>? LIMIT 1',
+        )
+        .get(...fields(origin), repo)
+    )
+  }
+
+  /** Locate only committed local files whose previously unbound outputs now have an eligible earlier question.
+   * @example evidence.readyResultFiles()
+   */
+  readyResultFiles(): Map<string, Set<number>> {
+    const ready = new Map<string, Set<number>>()
+    const query = this.db
+      .prepare(`SELECT f.path,d.frame FROM pref_deferred_outputs d JOIN pref_calls c USING(source,session,tool)
+      JOIN pref_files f ON d.owner=f.path||'/'||f.identity WHERE c.asked<=d.at AND NOT EXISTS(SELECT 1 FROM pref_exclusions x
+      WHERE (x.source,x.session,x.tool)=(d.source,d.session,d.tool) AND NOT EXISTS(SELECT 1 FROM pref_provisional_claims p WHERE (p.source,p.session,p.tool)=(x.source,x.session,x.tool)))`)
+    for (const row of query.iterate()) {
+      const path = String(row.path),
+        ends = ready.get(path) ?? new Set<number>()
+      ends.add(Number(row.frame))
+      ready.set(path, ends)
+    }
+    return ready
+  }
+
   /** Attach an independently decoded record even when another file or live hook has already supplied the same canonical row.
    * @example evidence.primary('pref_calls', origin, ['claude','s','t','[]',1])
    */
@@ -755,6 +868,22 @@ export class EvidenceDatabase {
     owner = this.owner,
   ): void {
     if (this.deriving) return
+    if (this.directSubmission) {
+      this.db
+        .prepare(
+          'INSERT OR IGNORE INTO pref_direct_submissions VALUES(?,?,?,?,?,?,?)',
+        )
+        .run(
+          owner,
+          session.source,
+          session.sessionId,
+          this.directSubmission.id,
+          this.directSubmission.tool,
+          table,
+          JSON.stringify(values),
+        )
+      return
+    }
     if (this.rememberStructured(table, session, values, owner)) return
     // The decoder supplies this validated request before writing its materialized row; workload needs no policy-classifiable option.
     if (table === 'pref_calls')
@@ -780,6 +909,7 @@ export class EvidenceDatabase {
     values: readonly FactValue[],
   ) {
     this.primary(table, session, values)
+    if (!this.deriving && this.directSubmission?.rejected) return { changes: 0 }
     const placeholders = values.map(() => '?').join(',')
     return this.db
       .prepare(
@@ -799,15 +929,24 @@ export class EvidenceDatabase {
    * @example evidence.withdrawSource(sourceKey)
    */
   withdrawSource(owner: string): void {
+    const tables = [
+      'pref_source_facts',
+      'pref_structured_witnesses',
+      'pref_direct_submissions',
+      'pref_refuted_submissions',
+      'pref_native_targets',
+    ]
     const sessions = this.db
       .prepare(
-        'SELECT source,session FROM pref_source_facts WHERE owner=? UNION SELECT source,session FROM pref_structured_witnesses WHERE owner=?',
+        tables
+          .map(
+            (table) => 'SELECT source,session FROM ' + table + ' WHERE owner=?',
+          )
+          .join(' UNION '),
       )
-      .all(owner, owner)
-    this.db.prepare('DELETE FROM pref_source_facts WHERE owner=?').run(owner)
-    this.db
-      .prepare('DELETE FROM pref_structured_witnesses WHERE owner=?')
-      .run(owner)
+      .all(...tables.map(() => owner))
+    for (const table of [...tables, 'pref_deferred_outputs'])
+      this.db.prepare('DELETE FROM ' + table + ' WHERE owner=?').run(owner)
     this.derived(() => {
       for (const row of sessions)
         this.restoreSession({
@@ -853,10 +992,12 @@ export class EvidenceDatabase {
           .run(...args)
     }
     const load = this.db.prepare(
-      'SELECT DISTINCT row_data FROM pref_source_facts WHERE source=? AND session=? AND table_name=? ORDER BY rowid',
+      `SELECT row_data FROM pref_source_facts WHERE source=? AND session=? AND table_name=?
+       UNION SELECT d.row_data FROM pref_direct_submissions d WHERE d.source=? AND d.session=? AND d.table_name=? AND NOT EXISTS
+       (SELECT 1 FROM pref_ambiguous_submissions r WHERE (r.source,r.session,r.response_id)=(d.source,d.session,d.response_id))`,
     )
     for (const table of tables) {
-      for (const fact of load.iterate(...args, table)) {
+      for (const fact of load.iterate(...args, table, ...args, table)) {
         const values = JSON.parse(String(fact.row_data)) as FactValue[]
         if (table === 'pref_offers') this.noteShape(values)
         this.insertPrimary(table, session, values)
@@ -1157,7 +1298,8 @@ export class EvidenceDatabase {
       const values = [...args, meaning, answeredAt]
       this.insertPrimary('pref_primary_choices', origin, values)
     }
-    if (offer.conflict) return false
+    if (offer.conflict || (!this.deriving && this.directSubmission?.rejected))
+      return false
     if (offer.selected === meaning) {
       // A direct result may later establish an earlier response time than the copy's capture timestamp.
       if (answeredAt < offer.answered!) {
@@ -1491,7 +1633,7 @@ export class EvidenceDatabase {
     const query = [session.source, session.sessionId, hash] as const
     const candidates = this.db
       .prepare(
-        `SELECT c.tool,c.question,c.label,c.at,c.response_id, EXISTS(SELECT 1 FROM pref_misdirected_typed x WHERE (x.source,x.session,x.tool,x.question,x.hash,x.at)=(c.source,c.session,c.tool,c.question,c.hash,c.at)) AS misdirected,
+        `SELECT c.tool,c.question,c.label,c.at,c.response_id, EXISTS(SELECT 1 FROM pref_misdirected_typed x WHERE (x.source,x.session,x.tool,x.question,x.hash,x.at)=(c.source,c.session,c.tool,c.question,c.hash,c.at)) OR EXISTS(SELECT 1 FROM pref_ambiguous_submissions r WHERE (r.source,r.session,r.response_id)=(c.source,c.session,c.response_id)) AS misdirected,
          EXISTS(SELECT 1 FROM pref_fallback_links f WHERE (f.source,f.session,f.tool,f.question,f.at)=(c.source,c.session,c.tool,c.question,c.at)) AS linked
          FROM pref_typed_candidates c WHERE c.source=? AND c.session=? AND c.hash=?`,
       )
@@ -1643,6 +1785,59 @@ export class EvidenceDatabase {
       this.reconcileTyped(origin, hash, at)
   }
 
+  /** Check an authenticated provider target across file copies and restarts, even when its question is outside the recent transcript window.
+   * @example evidence.observeNativeTarget(session,'prompt:submitted-id','provider-question-id')
+   */
+  observeNativeTarget(
+    session: Session,
+    responseId: string,
+    targetId: string,
+  ): boolean {
+    if (
+      session.source !== 'codex' ||
+      !validId(session.sessionId) ||
+      !responseId.startsWith('prompt:') ||
+      !validId(responseId.slice(7)) ||
+      !validId(targetId)
+    )
+      return false
+    const key = [session.source, session.sessionId, responseId] as const
+    const added = this.db
+      .prepare('INSERT OR IGNORE INTO pref_native_targets VALUES(?,?,?,?,?)')
+      .run(this.owner, ...key, targetId)
+    const conflict = !!this.db
+      .prepare(
+        'SELECT 1 FROM pref_ambiguous_submissions WHERE source=? AND session=? AND response_id=? LIMIT 1',
+      )
+      .get(...key)
+    if (conflict && added.changes)
+      this.derived(() => this.restoreSession(session))
+    return !conflict
+  }
+
+  /** Quarantine the single native submission whose authenticated links disagree, leaving other witnesses in the session available.
+   * @example evidence.rejectDirectText(origin,'prompt:native-id',question,answeredAt)
+   */
+  rejectDirectText(
+    origin: Origin,
+    responseId: string,
+    question: string,
+    at: number,
+  ): void {
+    if (
+      origin.source !== 'codex' ||
+      !responseId.startsWith('prompt:') ||
+      !validId(responseId.slice(7)) ||
+      !time(at) ||
+      typeof question !== 'string'
+    )
+      return
+    const added = this.db
+      .prepare('INSERT OR IGNORE INTO pref_refuted_submissions VALUES(?,?,?,?)')
+      .run(this.owner, origin.source, origin.sessionId, responseId)
+    if (added.changes) this.derived(() => this.restoreSession(origin))
+  }
+
   /** Preserve an independently human-authored text reply when a separate role-only mirror later becomes ambiguous.
    * @example evidence.directText(origin, responseId, question, label, answeredAt)
    */
@@ -1652,22 +1847,54 @@ export class EvidenceDatabase {
     question: string,
     label: string,
     at: number,
+    standingInstruction?: string,
   ): void {
-    this.insertPrimary('pref_direct_text', origin, [
-      ...fields(origin),
-      responseId,
-    ])
-    this.humanResponse(origin, responseId, at)
-    if (this.answer(origin, question, label, at, true)) {
-      // A validated direct answer has its own chronology even if an earlier fallback currently owns the observation.
-      this.db
+    const previous = this.directSubmission
+    const scoped =
+      origin.source === 'codex' &&
+      responseId.startsWith('prompt:') &&
+      validId(responseId.slice(7))
+    const different =
+      scoped &&
+      !!this.db
         .prepare(
-          `INSERT INTO pref_direct_answers
+          'SELECT 1 FROM pref_direct_submissions WHERE source=? AND session=? AND response_id=? AND tool<>? LIMIT 1',
+        )
+        .get(origin.source, origin.sessionId, responseId, origin.toolUseId)
+    if (scoped) {
+      const refuted = !!this.db
+        .prepare(
+          'SELECT 1 FROM pref_ambiguous_submissions WHERE source=? AND session=? AND response_id=? LIMIT 1',
+        )
+        .get(origin.source, origin.sessionId, responseId)
+      this.directSubmission = {
+        id: responseId,
+        tool: origin.toolUseId,
+        rejected: refuted || different,
+      }
+    }
+    try {
+      this.insertPrimary('pref_direct_text', origin, [
+        ...fields(origin),
+        responseId,
+      ])
+      this.humanResponse(origin, responseId, at)
+      if (this.answer(origin, question, label, at, true)) {
+        // A validated direct answer has its own chronology even if an earlier fallback currently owns the observation.
+        this.db
+          .prepare(
+            `INSERT INTO pref_direct_answers
         SELECT source,session,tool,question,selected,? FROM pref_offers WHERE source=? AND session=? AND tool=? AND question=?
         ON CONFLICT(source,session,tool,question) DO UPDATE SET selected=excluded.selected,at=MIN(at,excluded.at)`,
-        )
-        .run(at, ...fields(origin), cleanQuestion(question))
+          )
+          .run(at, ...fields(origin), cleanQuestion(question))
+      }
+      if (standingInstruction)
+        this.instruction(origin, standingInstruction, at, true)
+    } finally {
+      this.directSubmission = previous
     }
+    if (different) this.derived(() => this.restoreSession(origin))
   }
 
   /** Expose temporary loss of typed-reply attribution separately from durable automation exclusions.

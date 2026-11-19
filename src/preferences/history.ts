@@ -234,6 +234,7 @@ async function importFile(
   file: SourceFile,
   report: ImportReport,
   retries = 0,
+  revisit?: ReadonlySet<number>,
 ): Promise<void> {
   const fd = openSync(file.path, constants.O_RDONLY | constants.O_NOFOLLOW)
   try {
@@ -243,7 +244,7 @@ async function importFile(
     const key = digest(file.format + '\0' + file.path)
     const old = db.db.prepare('SELECT * FROM pref_files WHERE path=?').get(key)
     const owner = key + '/' + identity
-    const size = Number(info.size)
+    let size = Number(info.size)
     const version = db.db
       .prepare('SELECT stamp FROM pref_file_versions WHERE path=?')
       .get(key)?.stamp
@@ -263,18 +264,27 @@ async function importFile(
     if (resume && !unchanged) {
       resume = await matchesPrefix(db, fd, key, Number(old!.offset), report)
       if (fileVersion(info) !== fileVersion(fstatSync(fd, { bigint: true }))) {
-        if (retries < 2) await importFile(db, file, report, retries + 1)
+        if (retries < 2)
+          await importFile(db, file, report, retries + 1, revisit)
         else report.unreadable++
         return
       }
       if (resume) saveVersion.run(key, fileVersion(info))
     }
-    const state: ParseState = resume
+    // A question in another file can unlock an already committed result. Re-read only that original source without withdrawing its independently verified facts.
+    const replayCommitted = !!revisit && resume
+    if (replayCommitted) {
+      let lastResult = 0
+      for (const end of revisit!) lastResult = Math.max(lastResult, end)
+      size = Math.min(Number(old!.offset), lastResult)
+    }
+    const useCursor = resume && !replayCommitted
+    const state: ParseState = useCursor
       ? (JSON.parse(String(old!.state)) as ParseState)
       : {}
-    let offset = resume ? Number(old!.offset) : 0
+    let offset = useCursor ? Number(old!.offset) : 0
     let saved = offset
-    let skipping = resume && Boolean(old!.skipping)
+    let skipping = useCursor && Boolean(old!.skipping)
     const save = db.db.prepare(
       'INSERT OR REPLACE INTO pref_files VALUES(?,?,?,?,?,?)',
     )
@@ -292,7 +302,7 @@ async function importFile(
       if (!resume && old) report.changedFiles++
       return
     }
-    report.changedFiles++
+    if (!replayCommitted) report.changedFiles++
     const addSegment = db.db.prepare(
       'INSERT OR REPLACE INTO pref_file_segments VALUES(?,?,?,?)',
     )
@@ -301,7 +311,7 @@ async function importFile(
     let length = 0
     const changedDuringParse = Symbol('source changed during parse')
     const retry = async () => {
-      if (retries < 2) await importFile(db, file, report, retries + 1)
+      if (retries < 2) await importFile(db, file, report, retries + 1, revisit)
       else report.unreadable++
     }
     while (offset < size) {
@@ -313,6 +323,10 @@ async function importFile(
       await yieldToGateway()
       const current = fstatSync(fd, { bigint: true })
       if (fileVersion(current) !== fileVersion(stat)) {
+        if (replayCommitted) {
+          await retry()
+          return
+        }
         const bytesMatch =
           rangeHash(fd, offset, offset + received, report) ===
           createHash('sha256').update(chunk.subarray(0, received)).digest('hex')
@@ -370,8 +384,25 @@ async function importFile(
                 counts.malformed++
                 delete state.brief
               }
-              if (parsed !== undefined)
-                parseHistoryRow(db, file.format, state, parsed, counts)
+              if (parsed !== undefined) {
+                const frameEnd = offset + until + 1
+                const type =
+                  typeof parsed === 'object' &&
+                  parsed !== null &&
+                  'type' in parsed
+                    ? parsed.type
+                    : null
+                // Only session metadata, worktree context and the outstanding result may affect this second pass.
+                if (
+                  !replayCommitted ||
+                  revisit!.has(frameEnd) ||
+                  type === 'session_meta' ||
+                  type === 'turn_context'
+                )
+                  db.decodeFrame(frameEnd, () =>
+                    parseHistoryRow(db, file.format, state, parsed, counts),
+                  )
+              }
             }
             pending = []
             length = 0
@@ -380,7 +411,7 @@ async function importFile(
             commit = offset + start
             skipAtCommit = false
           }
-          if (commit > saved) {
+          if (commit > saved && !replayCommitted) {
             addSegment.run(
               key,
               saved,
@@ -441,10 +472,9 @@ export async function importLocalHistory(
     observations: 0,
     replay: { observations: 0, types: [] },
   }
-  for (const file of discover(roots, report)) {
-    report.files++
+  const read = async (file: SourceFile, revisit?: ReadonlySet<number>) => {
     try {
-      await importFile(db, file, report)
+      await importFile(db, file, report, 0, revisit)
     } catch (error) {
       // Files may disappear or become inaccessible while applications rotate them. Database errors must remain visible to the caller.
       if (
@@ -455,6 +485,16 @@ export async function importLocalHistory(
         throw error
       report.unreadable++
     }
+  }
+  const files = new Map<string, SourceFile>()
+  for (const file of discover(roots, report)) {
+    report.files++
+    files.set(digest(file.format + '\0' + file.path), file)
+    await read(file)
+  }
+  for (const [key, frames] of db.readyResultFiles()) {
+    const file = files.get(key)
+    if (file) await read(file, frames)
   }
   report.replay = db.replay()
   report.observations = report.replay.observations

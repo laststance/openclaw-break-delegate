@@ -1,8 +1,14 @@
-import { typedQuestionId, typedResponseId } from '../preferences/index.js'
+import {
+  isTypedReply,
+  typedQuestionId,
+  typedResponseId,
+} from '../preferences/index.js'
 import {
   codexReplyLink,
   fromDecisionBrief,
   linkedBrief,
+  matchNativeSubmission,
+  type NativeTextSubmission,
 } from '../preferences/records.js'
 import { constants } from 'node:fs'
 import { open, realpath, type FileHandle } from 'node:fs/promises'
@@ -125,7 +131,8 @@ interface Request {
 interface ObservedQuestion {
   tool: string
   messageId?: string
-  answered?: true
+  answered?: string
+  labels: string[]
 }
 interface Turn {
   state: Activity
@@ -140,6 +147,8 @@ interface Turn {
   >
   nextPruneAt: number
   recentQuestions: ObservedQuestion[]
+  openOffers: string[]
+  submissions: Record<string, NativeTextSubmission>
   previousQuestion?: {
     question: ObservedQuestion
     text: string
@@ -154,6 +163,8 @@ function unknownTurn(): Turn {
     calls: new Map(),
     nextPruneAt: 0,
     recentQuestions: [],
+    openOffers: [],
+    submissions: {},
   }
 }
 interface Tail {
@@ -263,10 +274,11 @@ function observeQuestion(
   const text = payload.message
   if (
     typeof text !== 'string' ||
-    (payload.phase !== undefined && payload.phase !== 'final_answer') ||
-    (!/[?？]\s*$/u.test(text) && !fromDecisionBrief(text, at))
+    (payload.phase !== undefined && payload.phase !== 'final_answer')
   )
     return
+  const decision = fromDecisionBrief(text, at)
+  if (!decision && !/[?？]\s*$/u.test(text)) return
   const messageId =
     (typeof payload.id === 'string' && payload.id) ||
     (typeof payload.message_id === 'string' && payload.message_id) ||
@@ -288,7 +300,12 @@ function observeQuestion(
   const question: ObservedQuestion = {
     tool: typedQuestionId(text, at),
     messageId,
+    labels: decision?.brief.labels ?? [],
   }
+  turn.openOffers = [
+    ...turn.openOffers.filter((tool) => tool !== question.tool),
+    question.tool,
+  ].slice(-8)
   turn.recentQuestions.push(question)
   if (turn.recentQuestions.length > 8) turn.recentQuestions.shift()
   turn.previousQuestion = { question, text, at, item }
@@ -341,6 +358,8 @@ function applyEvent(
     // Keep tool identities and reordered partial records for the workload window.
     for (const [key, call] of turn.calls)
       if (call.at < at - 3_600_000) turn.calls.delete(key)
+    for (const [key, submitted] of Object.entries(turn.submissions))
+      if (submitted.seen < at - 3_600_000) delete turn.submissions[key]
     turn.nextPruneAt = at + 60_000
   }
   const record = (responseId: string, excluded = false) => {
@@ -504,16 +523,10 @@ function applyEvent(
     } else if (p.type === 'agent_message') {
       observeQuestion(turn, p, at, payload.type === 'item_completed')
     } else if (p.type === 'user_message') {
-      const replyTo = codexReplyLink(payload, object(payload.item) ?? {})
-      const target =
-        replyTo !== undefined
-          ? linkedBrief(turn.recentQuestions, replyTo)
-          : turn.previousQuestion?.question
+      const previous = turn.previousQuestion?.question
       turn.previousQuestion = undefined
       const text = p.message
       if (
-        !target ||
-        target.answered ||
         typeof text !== 'string' ||
         !text.trim() ||
         text.startsWith('<') ||
@@ -525,14 +538,63 @@ function applyEvent(
         (p.author && !['user', 'human'].includes(String(p.author)))
       )
         return
-      if (replyTo === undefined && !ordinaryReply(text)) return
-      target.answered = true
+      const explicit = codexReplyLink(payload, object(payload.item) ?? {})
+      const clientId = typeof p.client_id === 'string' ? p.client_id : ''
+      const submission =
+        explicit !== undefined ||
+        previous ||
+        turn.submissions['prompt:' + clientId]
+          ? matchNativeSubmission(
+              turn.submissions,
+              clientId,
+              text,
+              at,
+              explicit,
+            )
+          : undefined
+      const replyTo = submission ? submission.link : explicit
+      const target =
+        replyTo !== undefined
+          ? linkedBrief(turn.recentQuestions, replyTo)
+          : previous
+      const credited = submission?.credited
+      if (submission && credited) {
+        if (replyTo === undefined || credited.messageId === replyTo) return
+        const old = turn.recentQuestions.find((q) => q.tool === credited.tool)
+        if (old?.answered === credited.responseId) delete old.answered
+        delete submission.credited
+        // A conflicting or unresolvable native identity invalidates even a previous live observation.
+        if (!target) record(credited.responseId, true)
+      }
+      if (!target || target.answered) {
+        turn.openOffers = []
+        return
+      }
+      if (replyTo === undefined && turn.openOffers.length > 1) return
+      if (
+        replyTo === undefined &&
+        !ordinaryReply(text) &&
+        !(target.labels.length && isTypedReply(text, target.labels))
+      ) {
+        turn.openOffers = []
+        return
+      }
+      turn.openOffers = turn.openOffers.filter((tool) => tool !== target.tool)
       const answerKey = typedResponseId(
         text,
         at,
-        typeof p.client_id === 'string' ? p.client_id : undefined,
+        clientId,
         target.messageId || target.tool,
       )
+      target.answered = answerKey
+      if (submission)
+        submission.credited = {
+          tool: target.tool,
+          question: '',
+          messageId: target.messageId,
+          at,
+          responseId: answerKey,
+        }
       record(answerKey)
     } else if (
       [

@@ -530,6 +530,7 @@ test('questions about tests, documentation and approval leave later decisions el
     'Approval was already recorded.',
     'Did you remember to ask me for approval?',
     'Can you explain why I need you to get my approval?',
+    'Can you explain why assistants pause and then ask for my approval when a task is complete?',
     'Can you explain the results?',
     'The guide says to make sure you get my approval.',
   ])
@@ -558,6 +559,10 @@ test('questions about tests, documentation and approval leave later decisions el
     ['need', 'I need you to get my approval.'],
     ['compound', 'Can you explain the results, and ask for my approval?'],
     [
+      'separate-request',
+      'Can you explain why the tests fail, and then ask for my approval?',
+    ],
+    [
       'then-approve',
       'Can you explain the results and then ask for my approval?',
     ],
@@ -574,6 +579,7 @@ test('questions about tests, documentation and approval leave later decisions el
   assert.equal(decision('ensure').reason, 'current-instructions')
   assert.equal(decision('need').reason, 'current-instructions')
   assert.equal(decision('compound').reason, 'current-instructions')
+  assert.equal(decision('separate-request').reason, 'current-instructions')
   assert.equal(decision('then-approve').reason, 'current-instructions')
   assert.equal(decision('direct-approve').reason, 'current-instructions')
 })
@@ -1088,6 +1094,20 @@ test('a restriction inside an explanation request overrides a learned full-suite
     base + 1200,
   )
   assert.equal(decision('qualified').reason, 'current-instructions')
+  store.recordInstruction(
+    'claude',
+    'release',
+    'Run the focused tests for this release.',
+    base + 1200,
+  )
+  store.recordInstruction(
+    'claude',
+    'prefixed',
+    'For this release, run the focused tests.',
+    base + 1200,
+  )
+  assert.equal(decision('release').reason, 'current-instructions')
+  assert.equal(decision('prefixed').reason, 'current-instructions')
 })
 
 test('answer qualifications stay local to the selected option, with a standing rule applied only to an explicitly ongoing instruction', async (t) => {
@@ -1473,12 +1493,20 @@ test('one language instruction can constrain both documents and chat, and chat-o
   assert.equal(evaluate(docs, 'both').reason, 'current-instructions')
   assert.equal(evaluate(chat, 'both').reason, 'current-instructions')
   assert.equal(evaluate(docs, 'chat').eligibleLabel, 'English')
+  store.recordInstruction(
+    'claude',
+    'doc-context',
+    'Provide the documentation in Japanese for this refactor.',
+    base + 2000,
+  )
+  assert.equal(evaluate(docs, 'doc-context').reason, 'current-instructions')
+  assert.equal(evaluate(chat, 'doc-context').eligibleLabel, 'English')
   assert.equal(evaluate(chat, 'chat').reason, 'current-instructions')
   assert.equal(evaluate(docs, 'unknown').reason, 'current-instructions')
   assert.equal(evaluate(chat, 'unknown').reason, 'current-instructions')
 })
 
-test('a native reply link retracts the nearest legacy attribution, credits its actual offer once and holds an unresolved target', async (t) => {
+test('a verified legacy submission stays unattributed between two offers until the native link identifies one, while an unresolved link stays held', async (t) => {
   // Arrange
   const { store, codex, file, repo } = fixture(t)
   const mirror = (client, target, t) =>
@@ -1521,7 +1549,7 @@ test('a native reply link retracts the nearest legacy attribution, credits its a
   const final = await store.importHistory({ codex })
 
   // Assert
-  assert.equal(early.observations, 1)
+  assert.equal(early.observations, 0)
   assert.equal(final.observations, 2)
   assert.deepEqual(store.evaluate(card, { cwd: repo }).summary.choices, [
     { meaning: 'current-change', current: 1, other: 0 },

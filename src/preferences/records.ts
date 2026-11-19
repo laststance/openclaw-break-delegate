@@ -60,8 +60,50 @@ interface Brief {
   labels: string[]
   messageId?: string
   fingerprint?: string
-  answered?: true
+  answered?: true | string
 }
+export interface NativeTextSubmission {
+  hash: string
+  seen: number
+  link?: string | null
+  credited?: {
+    tool: string
+    question: string
+    messageId?: string
+    at: number
+    responseId: string
+  }
+}
+
+/** Combine verified copies of one native submission. Different content or explicit targets make its attribution unusable.
+ * @example matchNativeSubmission(submissions, 'client-id', 'A', at, 'offer-id')
+ */
+export function matchNativeSubmission(
+  submissions: Record<string, NativeTextSubmission>,
+  id: string,
+  text: string,
+  at: number,
+  link?: string | null,
+): NativeTextSubmission | undefined {
+  if (!pairableId(id)) return
+  const hash = digest(text.normalize('NFKC').trim())
+  const key = 'prompt:' + id
+  let previous = submissions[key]
+  if (!previous) {
+    previous = { hash, link, seen: at }
+    submissions[key] = previous
+  } else if (
+    previous.hash !== hash ||
+    (link !== undefined &&
+      previous.link !== undefined &&
+      link !== previous.link)
+  )
+    previous.link = null
+  else if (link !== undefined) previous.link = link
+  previous.seen = Math.max(previous.seen, at)
+  return previous
+}
+
 export interface ParseState {
   session?: string
   cwd?: string
@@ -80,6 +122,8 @@ export interface ParseState {
   }
   brief?: Brief
   recentBriefs?: Brief[]
+  openOffers?: string[]
+  submissions?: Record<string, NativeTextSubmission>
 }
 export interface ParseCounts {
   unverified: number
@@ -161,14 +205,22 @@ function answerCall(
   at: number,
   nativeClaude: boolean,
   counts: ParseCounts,
+  resultRepo?: string | null,
 ): void {
-  const questions = questionsFor(db, origin, at)
-  if (!questions.length || db.isPermanentlyExcluded(origin)) return
+  if (db.isPermanentlyExcluded(origin)) return
   const answers = record(raw.answers)
   if (!Object.keys(answers).length || automated(raw)) {
     counts.unverified++
     return
   }
+  const questions = questionsFor(db, origin, at)
+  if (!questions.length) {
+    // A separately imported Codex transcript may still contain the original request.
+    if (!nativeClaude) db.deferStructuredResult(origin, at)
+    return
+  }
+  if (!nativeClaude && !db.settleStructuredResult(origin, at, resultRepo))
+    return
   const responses = questions.flatMap(({ key, card, freeText }) => {
     const value = answers[nativeClaude ? card.question : key]
     const selected = nativeClaude ? [value] : record(value).answers
@@ -314,7 +366,7 @@ function humanText(
   clientId: string,
   counts: ParseCounts,
   replyTo?: string,
-): void {
+): NativeTextSubmission['credited'] {
   const pending = state.brief
   delete state.brief
   if (!state.session || !text) return
@@ -348,10 +400,22 @@ function humanText(
     const recent = state.recentBriefs?.find(
       (brief) => brief.tool === pending.tool,
     )
-    if (recent) recent.answered = true
-    db.directText(origin, responseId, pending.question, matching ?? '', at)
-    if (!matching && isStandingReplyInstruction(text))
-      db.instruction(session, text, at, true)
+    if (recent) recent.answered = responseId
+    db.directText(
+      origin,
+      responseId,
+      pending.question,
+      matching ?? '',
+      at,
+      !matching && isStandingReplyInstruction(text) ? text : undefined,
+    )
+    return {
+      tool: pending.tool,
+      question: pending.question,
+      messageId: pending.messageId,
+      at,
+      responseId,
+    }
   } else {
     if (
       !db.typedCandidate(
@@ -533,7 +597,7 @@ export function codexReplyLink(...envelopes: Row[]): string | null | undefined {
  * @example linkedBrief(recentQuestions, 'agent-message-id')
  */
 export function linkedBrief<
-  T extends { tool: string; messageId?: string; answered?: true },
+  T extends { tool: string; messageId?: string; answered?: true | string },
 >(
   recent: readonly T[] | undefined,
   replyTo: string | null,
@@ -565,6 +629,57 @@ function codexText(
   const hash = digest(text)
   const previous = state.lastText
   const nativeId = speaker === 'user' ? clientId : messageId
+  const tracked = speaker === 'user' && human && pairableId(clientId)
+  const contestedTarget =
+    tracked &&
+    typeof replyTo === 'string' &&
+    !db.observeNativeTarget(
+      { source: 'codex', sessionId: state.session! },
+      'prompt:' + clientId,
+      replyTo,
+    )
+  const submission =
+    tracked &&
+    (replyTo !== undefined ||
+      state.brief ||
+      state.submissions?.['prompt:' + clientId])
+      ? matchNativeSubmission(
+          (state.submissions ??= {}),
+          clientId,
+          text,
+          at,
+          replyTo,
+        )
+      : undefined
+  if (submission) {
+    replyTo = submission.link
+    const credited = submission.credited
+    if (credited && replyTo !== undefined && credited.messageId !== replyTo) {
+      const origin = {
+        source: 'codex' as const,
+        sessionId: state.session!,
+        toolUseId: credited.tool,
+      }
+      if (!contestedTarget)
+        db.rejectDirectText(
+          origin,
+          credited.responseId,
+          credited.question,
+          credited.at,
+        )
+      const offer = state.recentBriefs?.find(
+        (brief) => brief.tool === credited.tool,
+      )
+      if (offer?.answered === credited.responseId) delete offer.answered
+      delete submission.credited
+    }
+    // The original verified copy already owns this response. An unlinked echo adds no new fact.
+    if (submission.credited && !contestedTarget) return
+  }
+  if (contestedTarget) {
+    delete state.brief
+    return
+  }
   // Some Codex versions fan a completed item out as a legacy event. Never pair that mirror with a later question or treat it as a standing instruction.
   if (
     previous &&
@@ -600,8 +715,11 @@ function codexText(
       delete previous.unmatched
       delete previous.inferred
       if (target) {
+        state.openOffers = state.openOffers?.filter(
+          (tool) => tool !== target.tool,
+        )
         state.brief = target
-        humanText(
+        const credited = humanText(
           db,
           'codex',
           state,
@@ -612,6 +730,7 @@ function codexText(
           counts,
           link ?? undefined,
         )
+        if (submission) submission.credited = credited
       }
       return
     }
@@ -638,6 +757,14 @@ function codexText(
   state.lastText = { speaker, format, hash, at, nativeId, replyTo }
   if (speaker === 'agent') {
     rememberBrief(db, 'codex', state, text, at, messageId)
+    // Two original offers before one submission make an unlinked answer insufficient to select either.
+    if (state.brief)
+      state.openOffers = [
+        ...(state.openOffers ?? []).filter(
+          (tool) => tool !== state.brief!.tool,
+        ),
+        state.brief.tool,
+      ].slice(-8)
     if (state.brief)
       state.recentBriefs = [
         ...(state.recentBriefs ?? []).filter(
@@ -650,11 +777,26 @@ function codexText(
       const target = linkedBrief(state.recentBriefs, replyTo, state.brief)
       delete state.brief
       // Unknown or ambiguous explicit links cannot act as either a reply to the latest brief or a new standing instruction.
-      if (!target) return
+      if (!target) {
+        delete state.openOffers
+        return
+      }
+      state.openOffers = state.openOffers?.filter(
+        (tool) => tool !== target.tool,
+      )
       state.brief = target
     }
+    if (
+      replyTo === undefined &&
+      state.brief &&
+      (state.openOffers?.length ?? 0) > 1
+    ) {
+      delete state.brief
+      return
+    }
+    if (replyTo === undefined) delete state.openOffers
     if (!human && state.brief) state.lastText.inferred = state.brief
-    humanText(
+    const credited = humanText(
       db,
       'codex',
       state,
@@ -665,6 +807,7 @@ function codexText(
       counts,
       replyTo ?? undefined,
     )
+    if (submission) submission.credited = credited
   }
 }
 
@@ -701,6 +844,8 @@ function codexRow(
     delete state.lastText
     delete state.brief
     delete state.recentBriefs
+    delete state.openOffers
+    delete state.submissions
     setCwd(
       state,
       str(payload.cwd),
@@ -783,7 +928,7 @@ function codexRow(
       return
     }
     if (payload.type !== 'item_started')
-      answerCall(db, call, output, at, false, counts)
+      answerCall(db, call, output, at, false, counts, state.repo)
   }
   if (row.type === 'event_msg') {
     if (payload.thread_id && payload.thread_id !== state.session) return
