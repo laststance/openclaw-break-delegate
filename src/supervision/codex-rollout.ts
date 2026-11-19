@@ -1,0 +1,411 @@
+import { createHash } from "node:crypto";
+import { constants } from "node:fs";
+import { open, realpath } from "node:fs/promises";
+import { isAbsolute, relative, resolve, sep } from "node:path";
+import type { Activity, Observation } from "./workload.js";
+
+type Json = Record<string, unknown>;
+export interface VerifiedReply {
+  sessionId: string;
+  responseId: string;
+  originId: string;
+  at: number;
+}
+export interface DetectorResult {
+  observations: Observation[];
+  replies?: VerifiedReply[];
+  partial?: boolean;
+  detail: string;
+}
+
+export function object(value: unknown): Json | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Json)
+    : undefined;
+}
+
+/** Identify native clients without treating a VS Code extension or spawned agent as a Desktop chat. */
+export function nativeClient(meta: Json): "desktop" | "cli" | undefined {
+  if (
+    meta.parent_thread_id ||
+    (meta.threadSource && meta.threadSource !== "user") ||
+    (meta.thread_source && meta.thread_source !== "user")
+  )
+    return;
+  if (meta.source === "cli") return "cli";
+  if (meta.source !== "vscode" && meta.source !== "desktop") return;
+  // The native 0.170 TUI uses the app-server "vscode" source and its own originator.
+  if (meta.source === "vscode" && typeof meta.originator === "string" && /^(?:codex[-_]tui|codex_cli_rs)$/i.test(meta.originator)) return "cli";
+  if (
+    typeof meta.originator === "string" &&
+    /^(?:codex[ _-](?:desktop|app|for macos)|codex_desktop_app)$/i.test(
+      meta.originator,
+    )
+  )
+    return "desktop";
+}
+
+const headerLimit = 1024 * 1024;
+const tailLimit = 2 * 1024 * 1024;
+
+/** Restrict local metadata reads to regular rollout files inside the configured Codex session directory. */
+async function allowedPath(path: string, home: string): Promise<string> {
+  const root = await realpath(resolve(home, "sessions"));
+  const file = await realpath(path);
+  const inside = relative(root, file);
+  if (
+    !inside ||
+    isAbsolute(inside) ||
+    inside.startsWith(".." + sep) ||
+    !/^rollout-[^/]+\.jsonl$/.test(file.split(sep).at(-1) ?? "")
+  ) {
+    throw Error("Outside the local session directory");
+  }
+  return file;
+}
+
+/** Read just the bounded first record when app-server does not expose the originating native client. */
+export async function rolloutMeta(
+  path: string,
+  home: string,
+): Promise<Json | undefined> {
+  const file = await open(
+    await allowedPath(path, home),
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+  );
+  try {
+    const stat = await file.stat();
+    if (!stat.isFile()) return;
+    const buffer = Buffer.alloc(Math.min(stat.size, headerLimit));
+    const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
+    const end = buffer.subarray(0, bytesRead).indexOf(10);
+    if (end < 0) return;
+    const header = object(JSON.parse(buffer.toString("utf8", 0, end)));
+    return header?.type === "session_meta" ? object(header.payload) : undefined;
+  } finally {
+    await file.close();
+  }
+}
+
+interface Request {
+  blocking: boolean;
+  automatic: boolean;
+  questions: Map<string, Set<string>>;
+}
+interface Turn {
+  state: Activity;
+  pending: Map<string, Request | null>;
+  previousQuestion?: { id: string; text: string };
+}
+interface Tail {
+  client: "cli" | "desktop";
+  ino: number;
+  offset: number;
+  state: Turn;
+  sessionId: string;
+}
+
+function jsonValue(value: unknown): Json | undefined {
+  if (typeof value !== "string") return object(value);
+  try {
+    return object(JSON.parse(value));
+  } catch {
+    return undefined;
+  }
+}
+
+/** Read the documented answer format and exclude skipped, defaulted, and unrecognized selections. */
+function selectionsMatch(request: Request, payload: Json): boolean {
+  const answers = object(payload.answers);
+  if (!answers || request.automatic || request.questions.size === 0)
+    return false;
+  if (Object.keys(answers).length !== request.questions.size) return false;
+  for (const [key, choices] of request.questions) {
+    const selected = object(answers[key])?.answers;
+    if (
+      !Array.isArray(selected) ||
+      selected.length === 0 ||
+      !selected.every((v) => typeof v === "string" && choices.has(v))
+    )
+      return false;
+  }
+  return true;
+}
+
+function requestFor(args: Json): Request {
+  const questions = new Map<string, Set<string>>();
+  for (const q of Array.isArray(args.questions) ? args.questions : []) {
+    const row = object(q);
+    if (!row || typeof row.id !== "string" || !Array.isArray(row.options))
+      continue;
+    questions.set(
+      row.id,
+      new Set(
+        row.options
+          .map((o) => object(o)?.label)
+          .filter((s): s is string => typeof s === "string"),
+      ),
+    );
+  }
+  return {
+    questions,
+    blocking: args.isBlocking !== false && args.is_blocking !== false,
+    automatic:
+      (args.autoResolutionMs ?? args.auto_resolution_ms ?? null) !== null,
+  };
+}
+
+function ordinaryReply(text: string): boolean {
+  // An unrelated new task after a question is not a reply. Wider free-form replies need a reply-to ID.
+  return /^(?:yes|no|y|n|sure|okay|ok|go ahead|please do|do it|option [1-9]|[1-9]|はい|いいえ|お願い(?:します)?|進めて(?:ください)?|[1-9１-９](?:番|番目))[.!。！]?$/iu.test(
+    text.trim(),
+  );
+}
+
+/** Consume only typed native protocol events observed on an identifiable, live interactive thread. */
+function applyEvent(
+  value: Json,
+  sessionId: string,
+  turn: Turn,
+  replies: VerifiedReply[],
+) {
+  const p = object(value.payload);
+  if (!p) return;
+  const at =
+    typeof value.timestamp === "string" ? Date.parse(value.timestamp) : NaN;
+  const record = (responseId: string) => {
+    if (Number.isFinite(at))
+      replies.push({
+        sessionId,
+        responseId,
+        originId: "codex:" + sessionId + ":" + responseId,
+        at,
+      });
+  };
+  if (value.type === "event_msg") {
+    if (p.type === "task_started" || p.type === "turn_started") {
+      turn.state = "running";
+      turn.pending.clear();
+    } else if (
+      [
+        "task_complete",
+        "turn_complete",
+        "turn_aborted",
+        "turn_failed",
+      ].includes(String(p.type))
+    ) {
+      turn.state = "idle";
+      turn.pending.clear();
+      if (p.type === "turn_aborted" || p.type === "turn_failed")
+        turn.previousQuestion = undefined;
+    } else if (p.type === "agent_message") {
+      turn.previousQuestion = undefined;
+      // Require a directly preceding completed assistant question, not a tool log or quoted prompt.
+      if (
+        typeof p.message === "string" &&
+        /[?？]\s*$/u.test(p.message) &&
+        (p.phase === "final_answer" || p.phase === undefined)
+      ) {
+        turn.previousQuestion = {
+          text: p.message,
+          id:
+            typeof p.id === "string"
+              ? p.id
+              : createHash("sha256")
+                  .update(String(value.timestamp))
+                  .update(p.message)
+                  .digest("hex"),
+        };
+      }
+    } else if (p.type === "user_message") {
+      const previous = turn.previousQuestion;
+      turn.previousQuestion = undefined;
+      const text = p.message;
+      if (
+        !previous ||
+        typeof text !== "string" ||
+        !text.trim() ||
+        text.startsWith("<") ||
+        text.length > 8192
+      )
+        return;
+      if (
+        (p.source && !["user", "human"].includes(String(p.source))) ||
+        (p.author && !["user", "human"].includes(String(p.author))) ||
+        p.automated === true
+      )
+        return;
+      if (
+        p.reply_to !== previous.id &&
+        p.in_reply_to !== previous.id &&
+        !ordinaryReply(text)
+      )
+        return;
+      const answerKey =
+        typeof p.client_id === "string" && p.client_id
+          ? "prompt:" + p.client_id
+          : "typed:" +
+            createHash("sha256")
+              .update(text.normalize("NFKC").trim())
+              .digest("hex") +
+            ":" +
+            Math.floor(at / 1000);
+      record(answerKey);
+    } else if (
+      [
+        "exec_approval_request",
+        "apply_patch_approval_request",
+        "request_permissions",
+        "request_user_input",
+      ].includes(String(p.type)) &&
+      typeof p.call_id === "string"
+    ) {
+      // The runtime event may add an auto-resolution timer absent from the model's arguments.
+      if (p.type === "request_user_input") {
+        const request = requestFor(p), previous = turn.pending.get(p.call_id);
+        if (previous) {
+          request.automatic ||= previous.automatic;
+          request.blocking &&= previous.blocking;
+          if (!request.questions.size) request.questions = previous.questions;
+        }
+        turn.pending.set(p.call_id,request);
+      } else turn.pending.set(p.call_id,null);
+      turn.previousQuestion = undefined;
+    }
+  } else if (value.type === "response_item") {
+    const id = p.call_id;
+    if (typeof id !== "string") return;
+    if (p.type === "function_call" || p.type === "custom_tool_call") {
+      turn.previousQuestion = undefined;
+      const name =
+        typeof p.name === "string" ? p.name.split(".").at(-1) : undefined;
+      const args = jsonValue(p.arguments ?? p.input);
+      if (name === "request_user_input" && args) turn.pending.set(id,requestFor(args));
+      else if (name === "request_permissions") turn.pending.set(id, null);
+    } else if (
+      p.type === "function_call_output" ||
+      p.type === "custom_tool_call_output"
+    ) {
+      const request = turn.pending.get(id);
+      const result = jsonValue(p.output);
+      // A matching typed answer on an interactive client without an auto-resolution timer is observable.
+      if (
+        request &&
+        result &&
+        result.automated !== true &&
+        !result.timedOut &&
+        !result.timed_out &&
+        selectionsMatch(request, result)
+      )
+        record("tool:" + id);
+      turn.pending.delete(id);
+    }
+  }
+}
+
+/**
+ * Tail only rollouts attested by their native writer or a live app-server read.
+ * A stored file or a recent modification alone supplies no current activity. Missing turn
+ * boundaries after truncation leave the state unknown until a later explicit boundary.
+ *
+ * @example
+ * const result = await detector.read(liveWriterPaths)
+ */
+export class RolloutDetector {
+  readonly #home: string;
+  readonly #tails = new Map<string, Tail>();
+
+  constructor(home: string) {
+    this.#home = home;
+  }
+
+  async read(paths: string[]): Promise<DetectorResult> {
+    const observations: Observation[] = [],
+      replies: VerifiedReply[] = [];
+    const live = new Set(paths.slice(0, 64));
+    let misses = Math.max(0, paths.length - live.size);
+    for (const path of this.#tails.keys())
+      if (!live.has(path)) this.#tails.delete(path);
+    for (const path of live) {
+      try {
+        const file = await open(
+          await allowedPath(path, this.#home),
+          constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+        );
+        try {
+          const stat = await file.stat();
+          if (!stat.isFile()) {
+            misses++;
+            continue;
+          }
+          let tail = this.#tails.get(path);
+          if (
+            !tail ||
+            tail.ino !== stat.ino ||
+            tail.offset > stat.size ||
+            stat.size - tail.offset > tailLimit
+          ) {
+            const meta = await rolloutMeta(path, this.#home);
+            const client=meta && nativeClient(meta);
+            if (!meta || !client || typeof meta.id !== "string") {
+              misses++;
+              continue;
+            }
+            tail = {
+              ino: stat.ino,
+              offset: Math.max(0, stat.size - tailLimit),
+              state: { state: "unknown", pending: new Map() },
+              sessionId: meta.id,
+              client,
+            };
+            this.#tails.set(path, tail);
+            // The first partial record in a bounded tail cannot establish a turn boundary.
+            if (tail.offset > 0) {
+              const block = Buffer.alloc(
+                Math.min(tailLimit, stat.size - tail.offset),
+              );
+              const read = await file.read(block, 0, block.length, tail.offset);
+              const newline = block.subarray(0, read.bytesRead).indexOf(10);
+              tail.offset += newline < 0 ? read.bytesRead : newline + 1;
+            }
+          }
+          const buffer = Buffer.alloc(stat.size - tail.offset);
+          const read = await file.read(buffer, 0, buffer.length, tail.offset);
+          const complete =
+            buffer.subarray(0, read.bytesRead).lastIndexOf(10) + 1;
+          if (complete) {
+            for (const line of buffer
+              .toString("utf8", 0, complete)
+              .split("\n")) {
+              if (!line) continue;
+              const event = jsonValue(line);
+              if (event) applyEvent(event, tail.sessionId, tail.state, replies);
+              else {
+                tail.state = { state: "unknown", pending: new Map() };
+                misses++;
+              }
+            }
+            tail.offset += complete;
+          }
+          observations.push({
+            provider: "codex",
+            sessionId: tail.sessionId,
+            client: tail.client,
+            status: [...tail.state.pending.values()].some(request=>request===null || request.blocking) ? "waiting" : tail.state.state,
+          });
+        } finally {
+          await file.close();
+        }
+      } catch {
+        misses++;
+      }
+    }
+    return {
+      observations,
+      replies,
+      partial: misses > 0,
+      detail:
+        "Live native rollout writers. Unattributed or automatically resolved replies receive no points.",
+    };
+  }
+}

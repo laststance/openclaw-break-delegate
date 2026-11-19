@@ -1,0 +1,9 @@
+node_modules/
+dist/
+release/
+coverage/
+native/generated/
+.gstack/
+.serena/
+.DS_Store
+*.tgz
