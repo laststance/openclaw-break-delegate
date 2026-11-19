@@ -24,6 +24,33 @@ interface Sample {
   at: number
   until: number
 }
+interface MeasuredState {
+  samples: Map<string, Sample>
+  waiting: { size: number }
+  closed: boolean
+  missingFromRosterAt?: number
+}
+interface Change {
+  at: number
+  source?: string
+  sample?: Sample
+  waiting?: number
+  closed?: boolean
+  absent?: boolean
+}
+function emptyMeasurement(): MeasuredState {
+  return { samples: new Map(), waiting: { size: 0 }, closed: false }
+}
+function applyMeasurement(state: MeasuredState, c: Change) {
+  if (c.source) {
+    if (c.sample) state.samples.set(c.source, c.sample)
+    else state.samples.delete(c.source)
+  }
+  if (c.waiting !== undefined) state.waiting = { size: c.waiting }
+  if (c.closed !== undefined) state.closed = c.closed
+  if (c.absent !== undefined)
+    state.missingFromRosterAt = c.absent ? c.at : undefined
+}
 interface Session {
   provider: Provider
   client?: NativeClient
@@ -38,6 +65,10 @@ interface Session {
   accountedAt: number
   lastHook: number
   runId?: number
+  baseline: MeasuredState
+  baselineAt: number
+  changes: Change[]
+  runs: Map<number, { start: number; finish: number }>
 }
 
 export interface SessionView {
@@ -61,7 +92,7 @@ export const minute = 60_000
  * Blocked cards and explicit user waits take precedence over concurrent views reporting work.
  */
 function statusAt(
-  session: Session,
+  session: MeasuredState,
   at: number,
   includeUnconfirmedWaits = true,
 ): Activity {
@@ -125,6 +156,8 @@ export class Workload {
         key,
         {
           ...session,
+          changes: [...session.changes],
+          runs: new Map(session.runs),
           samples: new Map(session.samples),
           waiting: new Set(session.waiting),
         },
@@ -146,6 +179,14 @@ export class Workload {
     for (const session of this.#sessions.values()) {
       session.accountedAt = now
       session.runId = undefined
+      session.baseline = {
+        ...emptyMeasurement(),
+        closed: session.closed,
+        waiting: { size: session.waiting.size },
+      }
+      session.baselineAt = now
+      session.changes = []
+      session.runs.clear()
       session.lastHook = -Infinity
       session.missingFromRosterAt = undefined
       session.samples.clear()
@@ -160,6 +201,7 @@ export class Workload {
   checkpoint(now: number): void {
     for (const [key, session] of this.#sessions) {
       this.#account(session, now)
+      this.#trim(session, now - Math.min(this.#freshMs, 60 * minute))
       // Keep the incarnation for a live card until its terminal confirms closure.
       if (
         !session.waiting.size &&
@@ -174,18 +216,75 @@ export class Workload {
       .run(now - 60 * minute)
   }
 
+  /** Retain transitions only while an accepted provider observation can still correct this interval. */
+  #trim(session: Session, floor: number) {
+    if (floor <= session.baselineAt) return
+    const n = session.changes.findIndex((c) => c.at >= floor)
+    const before = n < 0 ? session.changes.length : n
+    if (before) {
+      const base = {
+        ...session.baseline,
+        samples: new Map(session.baseline.samples),
+      }
+      for (const c of session.changes.splice(0, before))
+        applyMeasurement(base, c)
+      session.baseline = base
+    }
+    session.baselineAt = floor
+    for (const [id, run] of session.runs)
+      if (run.finish < floor) session.runs.delete(id)
+  }
+
+  /** A delayed state change can correct intervals already measured by an intervening gateway tick.
+   * Rewind only this generation's own rows and replay other sources and card transitions in time order.
+   */
+  #measure(session: Session, change: Change, now: number) {
+    const at = Math.max(change.at, session.baselineAt)
+    session.changes.push({ ...change, at })
+    if (at < session.accountedAt) {
+      session.changes.sort((a, b) => a.at - b.at)
+      for (const [id, run] of session.runs) {
+        if (run.finish <= at) continue
+        if (run.start < at) {
+          this.#db.prepare('UPDATE sv_runs SET finish=? WHERE id=?').run(at, id)
+          session.runs.set(id, { start: run.start, finish: at })
+        } else {
+          this.#db.prepare('DELETE FROM sv_runs WHERE id=?').run(id)
+          session.runs.delete(id)
+        }
+      }
+      session.accountedAt = at
+      session.runId = undefined
+    }
+    this.#account(session, now)
+  }
+
   #account(session: Session, now: number) {
     if (now <= session.accountedAt) return
     const cuts = new Set([session.accountedAt, now])
-    for (const sample of session.samples.values()) {
-      if (sample.until > session.accountedAt && sample.until < now)
-        cuts.add(sample.until)
+    const within = (point: number) => {
+      if (point > session.accountedAt && point < now) cuts.add(point)
+    }
+    const state = {
+      ...session.baseline,
+      samples: new Map(session.baseline.samples),
+    }
+    for (const sample of state.samples.values()) within(sample.until)
+    for (const c of session.changes) {
+      within(c.at)
+      if (c.sample) within(c.sample.until)
     }
     const points = [...cuts].sort((a, b) => a - b)
+    let index = 0
     for (let i = 1; i < points.length; i++) {
       const start = points[i - 1],
         end = points[i]
-      if (statusAt(session, start) !== 'running') {
+      while (
+        index < session.changes.length &&
+        session.changes[index].at <= start
+      )
+        applyMeasurement(state, session.changes[index++])
+      if (statusAt(state, start) !== 'running') {
         session.runId = undefined
         continue
       }
@@ -194,25 +293,29 @@ export class Workload {
           .prepare('INSERT INTO sv_runs(start,finish) VALUES(?,?)')
           .run(start, end)
         session.runId = Number(row.lastInsertRowid)
+        session.runs.set(session.runId, { start, finish: end })
       } else {
         this.#db
           .prepare('UPDATE sv_runs SET finish=? WHERE id=?')
           .run(end, session.runId)
+        session.runs.set(session.runId, {
+          start: session.runs.get(session.runId)!.start,
+          finish: end,
+        })
       }
     }
     session.accountedAt = now
   }
 
+  /** A current native observation may reattach an original terminal; a superseded timestamp cannot. */
+  isFresh(at: number, now: number): boolean {
+    return Number.isFinite(at) && at <= now && at + this.#freshMs > now
+  }
+
   /** Accept a trusted lifecycle transition or a dated provider snapshot. */
   observe(event: Observation, now: number, newGeneration: string): void {
     const at = event.at ?? now
-    if (
-      !event.sessionId ||
-      !Number.isFinite(at) ||
-      at > now ||
-      at + this.#freshMs <= now
-    )
-      return
+    if (!event.sessionId || !this.isFresh(at, now)) return
     const source = event.source ?? 'hook'
     const key = this.#key(event.provider, event.sessionId)
     let session = this.#sessions.get(key)
@@ -245,6 +348,7 @@ export class Workload {
     )
       return
     if (!session || (starting && !sameTerminal)) {
+      if (session) this.#measure(session, { at, closed: true }, now)
       session = {
         provider: event.provider,
         sessionId: event.sessionId,
@@ -254,7 +358,11 @@ export class Workload {
         closed: false,
         samples: new Map(),
         waiting: new Set(),
-        accountedAt: now,
+        accountedAt: at,
+        baseline: emptyMeasurement(),
+        baselineAt: session ? at : now - Math.min(this.#freshMs, 60 * minute),
+        changes: [],
+        runs: new Map(),
         lastHook: -Infinity,
       }
       this.#sessions.set(key, session)
@@ -277,11 +385,18 @@ export class Workload {
       event.canDelegate
     )
       session.client = 'cli'
-    session.samples.set(source, {
-      status: event.status,
-      at,
-      until: at + this.#freshMs,
-    })
+    const sample = { status: event.status, at, until: at + this.#freshMs }
+    session.samples.set(source, sample)
+    this.#measure(
+      session,
+      {
+        at,
+        source,
+        sample,
+        ...(session.closed ? { closed: true, waiting: 0 } : {}),
+      },
+      now,
+    )
   }
 
   /** A successful complete poll can explicitly withdraw a previously reported view. */
@@ -303,13 +418,13 @@ export class Workload {
         session.provider === 'claude' &&
         !found.has(key)
       ) {
-        this.#account(session, now)
         session.missingFromRosterAt = at
+        this.#measure(session, { at, absent: true }, now)
       }
       const previous = session.samples.get(source)
       if (completeRoster && previous && previous.at <= at && !found.has(key)) {
-        this.#account(session, now)
         session.samples.delete(source)
+        this.#measure(session, { at, source }, now)
       }
     }
     for (const observation of observations) {
@@ -319,11 +434,49 @@ export class Workload {
       )
       if (
         source === 'claude-agents' &&
-        current &&
-        (current.missingFromRosterAt ?? -Infinity) <= at
-      )
+        current?.missingFromRosterAt !== undefined &&
+        current.missingFromRosterAt <= at
+      ) {
         current.missingFromRosterAt = undefined
+        this.#measure(current, { at, absent: false }, now)
+      }
     }
+  }
+
+  /** Detach a long-unconfirmed incarnation without changing any durable card or break membership. */
+  detach(generations: ReadonlySet<string>): void {
+    if (!generations.size) return
+    for (const [key, session] of this.#sessions)
+      if (generations.has(session.generation)) this.#sessions.delete(key)
+  }
+
+  /** Reattach the original generation only after an authenticated native hook identifies it. */
+  restore(
+    id: string,
+    incarnation: string,
+    generation: string,
+    questions: string[],
+    now: number,
+  ): void {
+    const key = this.#key('claude', id)
+    const existing = this.#sessions.get(key)
+    if (existing?.incarnation) return
+    if (!existing)
+      this.observe(
+        {
+          provider: 'claude',
+          sessionId: id,
+          status: 'unknown',
+          source: 'restored',
+        },
+        now,
+        generation,
+      )
+    const session = this.#sessions.get(key)!
+    session.incarnation = incarnation
+    session.generation = generation
+    for (const question of questions) session.waiting.add(question)
+    this.#measure(session, { at: now, waiting: session.waiting.size }, now)
   }
 
   /** Return the matching open incarnation at the gate for a Claude question or commit. */
@@ -354,8 +507,10 @@ export class Workload {
     const session = this.#sessions.get(this.#key('claude', id))
     if (!session) return
     this.#account(session, now)
+    if (session.waiting.has(question) === waiting) return
     if (waiting) session.waiting.add(question)
     else session.waiting.delete(question)
+    this.#measure(session, { at: now, waiting: session.waiting.size }, now)
   }
 
   views(now: number, includeUnconfirmedWaits = true): SessionView[] {

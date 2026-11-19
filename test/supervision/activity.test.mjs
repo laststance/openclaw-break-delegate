@@ -1058,3 +1058,53 @@ test('two same-second native typed replies to different questions are each credi
     )
   assert.equal(supervisor.status().score, 8)
 })
+
+test('a late unmarked Codex offer cannot reopen a known completed call while a second actual wait remains observable', async (t) => {
+  // Arrange
+  const { file, home } = await isolated(t)
+  const native = (id) =>
+    event('item_completed', {
+      thread_id: 'cli',
+      item: {
+        id,
+        type: 'FunctionCallOutput',
+        name: 'request_user_input',
+        output: answer(id).payload.output,
+      },
+    })
+  await writeFile(
+    file,
+    jsonl(session('cli'), event('task_started'), native('finished')),
+  )
+  const detector = new RolloutDetector(home)
+  await detector.read([file])
+  // Act
+  await appendFile(
+    file,
+    jsonl(
+      input('finished'),
+      event('request_user_input', { call_id: 'finished' }),
+    ),
+  )
+  const late = await detector.read([file])
+  await appendFile(file, jsonl(input('second')))
+  const waiting = await detector.read([file])
+  await appendFile(
+    file,
+    jsonl(answer('second'), input('finished', { autoResolutionMs: 0 })),
+  )
+  const done = await detector.read([file])
+  // Assert
+  assert.equal(late.observations[0].status, 'unknown')
+  assert.deepEqual(late.replies, [])
+  assert.equal(waiting.observations[0].status, 'waiting')
+  assert.equal(done.observations[0].status, 'unknown')
+  assert.deepEqual(
+    done.replies.map((r) => r.responseId),
+    ['tool:second'],
+  )
+  assert.deepEqual(
+    done.excludedReplies.map((r) => r.responseId),
+    ['tool:finished'],
+  )
+})

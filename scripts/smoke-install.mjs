@@ -113,69 +113,90 @@ try {
   host(['break-delegate', 'uninstall-hooks', '--settings', settings])
   if (JSON.parse(readFileSync(settings, 'utf8')).hooks?.PreToolUse)
     throw Error('Uninstall retained the hook.')
-  const portProbe = createServer().listen(0, '127.0.0.1')
-  await once(portProbe, 'listening')
-  const port = portProbe.address().port
-  await new Promise((done) => portProbe.close(done))
-  const gateway = spawn(
-    process.execPath,
-    [
-      hostExecutable,
-      'gateway',
-      'run',
-      '--allow-unconfigured',
-      '--bind',
-      'loopback',
-      '--port',
-      String(port),
-    ],
-    { cwd: tmp, env, stdio: ['ignore', 'pipe', 'pipe'] },
-  )
-  let diagnostics = ''
-  const collect = (data) => {
-    diagnostics = (diagnostics + data.toString()).slice(-12000)
-  }
-  gateway.stdout.on('data', collect)
-  gateway.stderr.on('data', collect)
-  const exited = once(gateway, 'close')
-  try {
-    const until = Date.now() + 55000
-    let live
-    while (
-      Date.now() < until &&
-      gateway.exitCode === null &&
-      gateway.signalCode === null
-    ) {
-      try {
-        live = await requestGateway(
-          env.BREAK_DELEGATE_STATE_DIR,
-          { op: 'status' },
-          750,
-        )
-        break
-      } catch {
-        await delay(250)
-      }
-    }
-    if (live?.supervision?.threshold !== 45)
-      throw Error(
-        'Isolated Gateway did not start the packed service. ' +
-          diagnostics.replaceAll(env.OPENCLAW_GATEWAY_TOKEN, '[redacted]'),
-      )
-    const status = host(['break-delegate', 'status'])
-    if (!status.includes('"supervision"'))
-      throw Error('Installed CLI could not read the live service.')
-    console.log(
-      'The real isolated Gateway started the installed service; workload threshold:',
-      live.supervision.threshold,
+  // Another process can claim a probed port before the actual host binds it.
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const portProbe = createServer().listen(0, '127.0.0.1')
+    await once(portProbe, 'listening')
+    const port = portProbe.address().port
+    await new Promise((done) => portProbe.close(done))
+    const gateway = spawn(
+      process.execPath,
+      [
+        hostExecutable,
+        'gateway',
+        'run',
+        '--allow-unconfigured',
+        '--bind',
+        'loopback',
+        '--port',
+        String(port),
+      ],
+      { cwd: tmp, env, stdio: ['ignore', 'pipe', 'pipe'] },
     )
-  } finally {
-    if (gateway.exitCode === null && gateway.signalCode === null)
-      gateway.kill('SIGTERM')
-    const force = setTimeout(() => gateway.kill('SIGKILL'), 8000)
-    force.unref()
-    await exited
-    clearTimeout(force)
+    let diagnostics = ''
+    const collect = (data) => {
+      diagnostics = (diagnostics + data.toString()).slice(-12000)
+    }
+    gateway.stdout.on('data', collect)
+    gateway.stderr.on('data', collect)
+    let launchError
+    gateway.on('error', (err) => {
+      launchError = err
+    })
+    const exited = new Promise((done) => gateway.once('close', done))
+    try {
+      await once(gateway, 'spawn')
+      const until = Date.now() + 55000
+      let live
+      while (
+        Date.now() < until &&
+        gateway.exitCode === null &&
+        gateway.signalCode === null &&
+        !launchError
+      ) {
+        try {
+          live = await requestGateway(
+            env.BREAK_DELEGATE_STATE_DIR,
+            { op: 'status' },
+            750,
+          )
+          break
+        } catch {
+          await delay(250)
+        }
+      }
+      if (launchError) throw launchError
+      if (live?.supervision?.threshold !== 45) {
+        if (gateway.exitCode !== null || gateway.signalCode !== null)
+          await exited
+        if (
+          /EADDRINUSE|port .{0,80}(?:already in use|is in use)|address already in use/i.test(
+            diagnostics,
+          ) &&
+          attempt < 3
+        )
+          continue
+        throw Error(
+          'Isolated Gateway did not start the packed service. ' +
+            diagnostics.replaceAll(env.OPENCLAW_GATEWAY_TOKEN, '[redacted]'),
+        )
+      }
+      const status = host(['break-delegate', 'status'])
+      if (!status.includes('"supervision"'))
+        throw Error('Installed CLI could not read the live service.')
+      console.log(
+        'The real isolated Gateway started the installed service; workload threshold:',
+        live.supervision.threshold,
+      )
+      break
+    } finally {
+      if (gateway.exitCode === null && gateway.signalCode === null)
+        gateway.kill('SIGTERM')
+      const force = setTimeout(() => gateway.kill('SIGKILL'), 8000)
+      force.unref()
+      await exited
+      clearTimeout(force)
+    }
   }
   console.log(
     'Isolated OpenClaw archive installation, plugin CLI registration and Claude hook setup/removal passed.',

@@ -72,8 +72,10 @@ export interface ParseState {
     hash: string
     at: number
     unmatched?: Brief
+    inferred?: Brief
   }
   brief?: Brief
+  recentBriefs?: Brief[]
 }
 export interface ParseCounts {
   unverified: number
@@ -495,18 +497,35 @@ function codexText(
     if (
       speaker === 'user' &&
       human &&
-      previous.unmatched &&
-      replyTo &&
-      replyTo === previous.unmatched.messageId
+      previous.format === 'legacy' &&
+      replyTo
     ) {
-      db.cancelTypedInstruction(
-        { source: 'codex', sessionId: state.session! },
-        text,
-        previous.at,
+      const session = { source: 'codex' as const, sessionId: state.session! }
+      const inferred = previous.inferred ?? previous.unmatched
+      if (inferred)
+        db.rejectTypedTarget(
+          { ...session, toolUseId: inferred.tool },
+          inferred.question,
+          text,
+          previous.at,
+        )
+      db.cancelTypedInstruction(session, text, previous.at)
+      // Only a native message ID resolves an explicit link. A nearby offer with a different ID cannot inherit this answer.
+      const resolved = (state.recentBriefs ?? []).filter(
+        (b) => b.messageId === replyTo,
       )
-      state.brief = previous.unmatched
+      if (
+        inferred?.messageId === replyTo &&
+        !resolved.some((b) => b.tool === inferred.tool)
+      )
+        resolved.push(inferred)
+      const target = resolved.length === 1 ? resolved[0] : undefined
       delete previous.unmatched
-      humanText(db, 'codex', state, text, at, true, clientId, counts, replyTo)
+      delete previous.inferred
+      if (target) {
+        state.brief = target
+        humanText(db, 'codex', state, text, at, true, clientId, counts, replyTo)
+      }
       return
     }
     if (speaker === 'user' && human)
@@ -523,6 +542,10 @@ function codexText(
       messageId
     )
       state.brief.messageId = messageId
+    if (speaker === 'agent' && state.brief?.messageId && state.recentBriefs) {
+      const saved = state.recentBriefs.find((b) => b.tool === state.brief!.tool)
+      if (saved) saved.messageId = state.brief.messageId
+    }
     return
   }
   state.lastText = { speaker, format, hash, at }
@@ -531,13 +554,20 @@ function codexText(
     format === 'legacy' &&
     !human &&
     !replyTo &&
-    state.brief &&
-    !isTypedReply(text, state.brief.labels)
+    state.brief
   )
-    state.lastText.unmatched = state.brief
-  if (speaker === 'agent')
+    state.lastText.inferred = state.brief
+  if (speaker === 'agent') {
     rememberBrief(db, 'codex', state, text, at, messageId)
-  else humanText(db, 'codex', state, text, at, human, clientId, counts, replyTo)
+    if (state.brief)
+      state.recentBriefs = [
+        ...(state.recentBriefs ?? []).filter(
+          (b) => b.tool !== state.brief!.tool,
+        ),
+        state.brief,
+      ].slice(-8)
+  } else
+    humanText(db, 'codex', state, text, at, human, clientId, counts, replyTo)
 }
 
 function codexRow(
@@ -572,6 +602,7 @@ function codexRow(
       state.interactive && threadSource === 'user' && !!originator
     delete state.lastText
     delete state.brief
+    delete state.recentBriefs
     setCwd(
       state,
       str(payload.cwd),

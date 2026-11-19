@@ -92,6 +92,39 @@ export class ExecutionApprovals {
         group.approvals.set(key, at + delta)
     }
   }
+  /** Remove unconfirmed tracking from the live hook path after one workload window.
+   * Durable questions retain their original identity and stay held until the provider confirms their outcome.
+   * @example tracker.prune(now, currentGenerations)
+   */
+  prune(now: number, confirmed: ReadonlySet<string>): string[] {
+    const evicted: string[] = []
+    for (const [id, group] of this.#groups) {
+      if (group.lastSeen >= now - 3_600_000 || confirmed.has(id)) continue
+      this.#groups.delete(id)
+      evicted.push(id)
+    }
+    return evicted
+  }
+
+  /** Restore only still-open permissions proven to belong to a returning original terminal. */
+  restore(
+    generation: string,
+    approvals: { key: string; toolName: string; at: number }[],
+    now: number,
+  ): void {
+    if (!approvals.length) return
+    const group = this.#edit(generation, now)
+    for (const { key, toolName, at } of approvals) {
+      group.approvals.set(key, at)
+      if (!key.startsWith('approval:unidentified:'))
+        group.attempts.set(key.slice('approval:'.length), {
+          toolName,
+          at,
+          completed: false,
+        })
+    }
+  }
+
   /** Forget the native records once the original terminal closes. */
   close(generation: string): void {
     this.#groups.delete(generation)
@@ -119,9 +152,6 @@ export class ExecutionApprovals {
     input: ExecutionObservation,
     at: number,
   ): Matches {
-    for (const [id, group] of this.#groups)
-      if (!group.approvals.size && group.lastSeen < at - 3_600_000)
-        this.#groups.delete(id)
     const group = this.#edit(generation, at)
     const result: Matches = { completed: [] }
     if (at <= group.endedAt) return result

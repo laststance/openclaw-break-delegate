@@ -169,6 +169,8 @@ export class EvidenceDatabase {
         PRIMARY KEY(source,session,hash,at));
       CREATE TABLE IF NOT EXISTS pref_typed_candidates(source TEXT,session TEXT,tool TEXT,question TEXT,hash TEXT,label TEXT,at INTEGER,response_id TEXT,
         PRIMARY KEY(source,session,tool,question,hash,at));
+      CREATE TABLE IF NOT EXISTS pref_misdirected_typed(source TEXT,session TEXT,tool TEXT,question TEXT,hash TEXT,at INTEGER,
+        PRIMARY KEY(source,session,tool,question,hash,at));
       CREATE INDEX IF NOT EXISTS pref_typed_candidate_times ON pref_typed_candidates(source,session,hash,at);
       CREATE TABLE IF NOT EXISTS pref_submissions(source TEXT,session TEXT,hash TEXT,at INTEGER,submission TEXT,PRIMARY KEY(source,session,hash,at,submission));
       CREATE TABLE IF NOT EXISTS pref_fallback_links(source TEXT,session TEXT,tool TEXT,question TEXT,at INTEGER,PRIMARY KEY(source,session,tool,question,at));
@@ -280,6 +282,21 @@ export class EvidenceDatabase {
       }
       if (language.length) db.exec(dirty)
       // Older fallback identities can merge separate simultaneous replies. Re-read affected sessions and withdraw their previous aggregate identity.
+      for (const row of db
+        .prepare(
+          `SELECT DISTINCT c.source,c.session,c.tool,c.question FROM pref_typed_candidates c
+          JOIN pref_fallback_links f USING(source,session,tool,question,at) WHERE c.response_id GLOB 'typed:[0-9a-f]*'`,
+        )
+        .all()) {
+        this.restoreDirectSelection(
+          {
+            source: row.source as EvidenceSource,
+            sessionId: String(row.session),
+            toolUseId: String(row.tool),
+          },
+          String(row.question),
+        )
+      }
       db.prepare(
         "INSERT OR REPLACE INTO pref_lost_typed SELECT source,session,response_id,? FROM pref_responses WHERE response_id GLOB 'typed:[0-9a-f]*'",
       ).run(Date.now())
@@ -287,6 +304,52 @@ export class EvidenceDatabase {
         DELETE FROM pref_fallback_links AS f WHERE EXISTS(SELECT 1 FROM pref_typed_candidates c WHERE (c.source,c.session,c.tool,c.question,c.at)=(f.source,f.session,f.tool,f.question,f.at) AND c.response_id GLOB 'typed:[0-9a-f]*');
         DELETE FROM pref_typed_candidates WHERE response_id GLOB 'typed:[0-9a-f]*';
         DELETE FROM pref_responses WHERE response_id GLOB 'typed:[0-9a-f]*';`)
+    })
+    this.transaction(() => {
+      if (
+        !db
+          .prepare('INSERT OR IGNORE INTO pref_decoder_versions VALUES(?)')
+          .run('orphaned-typed-selection-v1').changes
+      )
+        return
+      // Earlier upgrades could remove a legacy receipt before clearing its learned answer. The historical workload withdrawal identifies the affected sessions.
+      for (const row of db
+        .prepare(
+          `SELECT o.source,o.session,o.tool,o.question FROM pref_offers o WHERE o.tool GLOB 'brief-*' AND o.answered IS NOT NULL
+        AND EXISTS(SELECT 1 FROM pref_lost_typed l WHERE l.source=o.source AND l.session=o.session AND l.response_id GLOB 'typed:[0-9a-f]*')
+        AND NOT EXISTS(SELECT 1 FROM pref_fallback_links f WHERE (f.source,f.session,f.tool,f.question)=(o.source,o.session,o.tool,o.question))
+        AND NOT EXISTS(SELECT 1 FROM pref_responses r WHERE (r.source,r.session,r.tool)=(o.source,o.session,o.tool))`,
+        )
+        .all()) {
+        this.restoreDirectSelection(
+          {
+            source: row.source as EvidenceSource,
+            sessionId: String(row.session),
+            toolUseId: String(row.tool),
+          },
+          String(row.question),
+        )
+      }
+      // Reassess older accepted matches when both native and anonymous receipts were available, and reread Codex sessions whose native reply links were previously ignored.
+      const mixed = db
+        .prepare(
+          `SELECT DISTINCT c.source,c.session,c.hash,c.at FROM pref_typed_candidates c
+        WHERE EXISTS(SELECT 1 FROM pref_submissions r WHERE (r.source,r.session,r.hash)=(c.source,c.session,c.hash) AND r.submission='' AND r.at BETWEEN c.at-2000 AND c.at+2000)
+        AND EXISTS(SELECT 1 FROM pref_submissions r WHERE (r.source,r.session,r.hash)=(c.source,c.session,c.hash) AND r.submission<>'' AND r.at BETWEEN c.at-2000 AND c.at+2000)`,
+        )
+        .all()
+      for (const row of mixed)
+        this.reconcileTyped(
+          {
+            source: row.source as EvidenceSource,
+            sessionId: String(row.session),
+          },
+          String(row.hash),
+          Number(row.at),
+        )
+      db.exec(`DELETE FROM pref_files WHERE json_type(state,'$.interactive') IS NOT NULL AND json_extract(state,'$.session') IN
+        (SELECT DISTINCT c.session FROM pref_typed_candidates c WHERE c.source='codex' AND EXISTS
+          (SELECT 1 FROM pref_submissions r WHERE (r.source,r.session,r.hash)=(c.source,c.session,c.hash) AND r.submission<>'' AND r.at BETWEEN c.at-2000 AND c.at+2000))`)
     })
   }
 
@@ -810,15 +873,18 @@ export class EvidenceDatabase {
     ] as const
     const candidates = this.db
       .prepare(
-        'SELECT tool,question,label,at,response_id FROM pref_typed_candidates WHERE source=? AND session=? AND hash=? AND at BETWEEN ? AND ?',
+        `SELECT c.tool,c.question,c.label,c.at,c.response_id, EXISTS(SELECT 1 FROM pref_misdirected_typed x WHERE (x.source,x.session,x.tool,x.question,x.hash,x.at)=(c.source,c.session,c.tool,c.question,c.hash,c.at)) AS misdirected
+         FROM pref_typed_candidates c WHERE c.source=? AND c.session=? AND c.hash=? AND c.at BETWEEN ? AND ?`,
       )
-      .all(...query) as unknown as TypedCandidate[]
+      .all(...query) as unknown as (TypedCandidate & { misdirected: number })[]
     const receipts = this.db
       .prepare(
         'SELECT at,submission FROM pref_submissions WHERE source=? AND session=? AND hash=? AND at BETWEEN ? AND ?',
       )
       .all(...query) as unknown as TypedReceipt[]
     const matches = uniqueTypedMatches(candidates, receipts)
+    // A native correction disqualifies that inferred target. Its receipt still cannot verify another nearby ambiguous candidate.
+    for (const c of candidates) if (c.misdirected) matches.delete(c)
     const affected = candidates.filter(
       (c) => Math.abs(c.at - at) <= 2 * receiptWindow,
     )
@@ -832,15 +898,7 @@ export class EvidenceDatabase {
         .run(...fields(origin), c.question, c.at)
       if (!previous.changes) continue
       // Retract only evidence established by this fallback. A separately attested native submission still stands.
-      const withdrawn = this.db
-        .prepare(
-          `UPDATE pref_offers AS o SET (selected,answered)=
-        (SELECT d.selected,d.at FROM pref_direct_answers d WHERE
-          (d.source,d.session,d.tool,d.question,d.selected)=(o.source,o.session,o.tool,o.question,o.selected))
-        WHERE o.source=? AND o.session=? AND o.tool=? AND o.question=? AND o.answered IS NOT NULL`,
-        )
-        .run(...fields(origin), c.question)
-      if (withdrawn.changes) this.db.exec(dirty)
+      this.restoreDirectSelection(origin, c.question)
       if (
         !this.db
           .prepare(
@@ -872,6 +930,35 @@ export class EvidenceDatabase {
       this.humanResponse(origin, c.response_id, c.at)
       this.answer(origin, c.question, c.label, c.at, true)
     }
+  }
+
+  private restoreDirectSelection(origin: Origin, question: string): void {
+    const withdrawn = this.db
+      .prepare(
+        `UPDATE pref_offers AS o SET (selected,answered)=
+      (SELECT d.selected,d.at FROM pref_direct_answers d WHERE (d.source,d.session,d.tool,d.question,d.selected)=(o.source,o.session,o.tool,o.question,o.selected))
+      WHERE o.source=? AND o.session=? AND o.tool=? AND o.question=? AND o.answered IS NOT NULL`,
+      )
+      .run(...fields(origin), question)
+    if (withdrawn.changes) this.db.exec(dirty)
+  }
+
+  /** Withdraw a role-only pairing when the native user event identifies a different target or submission.
+   * @example evidence.rejectTypedTarget(origin,question,text,at)
+   */
+  rejectTypedTarget(
+    origin: Origin,
+    question: string,
+    text: string,
+    at: number,
+  ): void {
+    const hash = digest(text.trim())
+    const rejected = this.db
+      .prepare(
+        'INSERT OR IGNORE INTO pref_misdirected_typed SELECT source,session,tool,question,hash,at FROM pref_typed_candidates WHERE source=? AND session=? AND tool=? AND question=? AND hash=? AND at=?',
+      )
+      .run(...fields(origin), cleanQuestion(question), hash, at)
+    if (rejected.changes) this.reconcileTyped(origin, hash, at)
   }
 
   /** Preserve an independently human-authored text reply when a separate role-only mirror later becomes ambiguous.

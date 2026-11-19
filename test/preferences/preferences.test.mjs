@@ -7,6 +7,7 @@ import {
   rmSync,
   writeFileSync,
   appendFileSync,
+  renameSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
@@ -733,7 +734,13 @@ test('incomplete lines resume across restarts, oversized records are bounded, an
 
   // Act
   const final = await restarted.importHistory({ claude })
-  saveLines(path, [claudeAsk(repo, 'q'), claudeAnswer(repo, 'q')])
+  saveLines(path + '.replacement', [
+    claudeAsk(repo, 'q'),
+    claudeAnswer(repo, 'q'),
+    claudeAsk(repo, 'q3', 2),
+    claudeAnswer(repo, 'q3', 2),
+  ])
+  renameSync(path + '.replacement', path)
   const rotated = await restarted.importHistory({ claude })
 
   // Assert
@@ -743,7 +750,11 @@ test('incomplete lines resume across restarts, oversized records are bounded, an
   assert.equal(oversized.malformed, 1)
   assert.equal(final.oversized, 0)
   assert.equal(final.observations, 2)
-  assert.equal(rotated.observations, 2)
+  assert.equal(rotated.observations, 3)
+  assert.deepEqual(
+    store.humanResponsesSince(0).map((r) => r.responseId),
+    ['tool:q', 'tool:q2', 'tool:q3'],
+  )
 })
 
 test('unknown and multi-question cards count one verified native response without poisoning preferences', async (t) => {

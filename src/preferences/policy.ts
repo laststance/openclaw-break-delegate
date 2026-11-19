@@ -207,7 +207,7 @@ export function isStandingReplyInstruction(text: string): boolean {
   )
 }
 
-function languageTarget(text: string): string | null {
+function languageTargets(text: string): string[] {
   const document =
     /\b(?:documents?|documentation|docs|guides?|readme|reports?)\b|文書|ドキュメント|資料|報告|レポート/u.test(
       text,
@@ -216,11 +216,14 @@ function languageTarget(text: string): string | null {
     /\b(?:chat|repl(?:y|ies)|responses?|answers?|conversation|explanation)\b|会話|返答|回答|チャット|説明/u.test(
       text,
     )
-  return document === chat
-    ? null
-    : document
-      ? 'documentation-language'
-      : 'response-language'
+  return [
+    ...(document ? ['documentation-language'] : []),
+    ...(chat ? ['response-language'] : []),
+  ]
+}
+const languageTarget = (text: string) => {
+  const targets = languageTargets(text)
+  return targets.length === 1 ? targets[0]! : null
 }
 
 /** Return the offered option index when a typed answer explicitly names its letter or number.
@@ -510,21 +513,42 @@ export function instructionConstraints(
       .replace(/^(?:always |only )+/u, '')
       .replace(/(?:だけ|のみ|でお願いします|をお願いします|でお願い)$/u, '')
     const result = decisionTypes.flatMap((type) => {
-      if (!withinVocabulary(normalized, type)) return []
+      const targets =
+        type.kind === 'response-language' ? languageTargets(normalized) : []
+      const terms =
+        targets.length === 2
+          ? normalized.replace(/\band\b|および|及び/gu, ' ')
+          : normalized
+      if (!withinVocabulary(terms, type)) return []
       const choices = meanings(normalized, type)
-      return choices.length === 1
-        ? [
-            {
-              kind:
-                type.kind === 'response-language'
-                  ? (languageTarget(normalized) ?? type.kind)
-                  : type.kind,
-              required: choices[0]!,
-            },
-          ]
-        : []
+      if (choices.length !== 1) return []
+      if (type.kind !== 'response-language')
+        return [{ kind: type.kind, required: choices[0]! }]
+      // Explicitly named scopes may each use the same language. An unspecified target cannot narrow the rule to chat alone.
+      return (
+        targets.length
+          ? targets
+          : ['response-language', 'documentation-language']
+      ).map((kind) => ({ kind, required: targets.length ? choices[0]! : '*' }))
     })
-    if (result.length === 1) return result
+    if (
+      result.length === 1 ||
+      (result.length === 2 && result.every((r) => r.kind.endsWith('-language')))
+    )
+      return result
+    if (
+      /^(?:please\s+)?(?:use|write|reply|answer|speak|communicate|i (?:prefer|want))\b/u.test(
+        text,
+      ) &&
+      /\b(?:japanese|english)\b|英語|日本語/u.test(text)
+    ) {
+      const targets = languageTargets(text)
+      return (
+        targets.length
+          ? targets
+          : ['response-language', 'documentation-language']
+      ).map((kind) => ({ kind, required: '*' }))
+    }
   }
   return explicit || restriction.test(text) || isStandingReplyInstruction(text)
     ? [{ kind: '*', required: '*' }]

@@ -120,8 +120,16 @@ test('Claude conveys an incomplete instruction and a qualified answer without co
   assert.equal(JSON.stringify(observed).includes(note), false)
 })
 
-test('an interrupted stdin stream reaches the instruction veto as unreadable input', async () => {
+test('an interrupted stdin stream sends an incomplete-instruction hold for the submitting process', async (t) => {
   // Arrange
+  const directory = await mkdtemp(join(tmpdir(), 'bd-read-error-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const requests = []
+  const close = await listenGateway(directory, async (request) => {
+    requests.push(request)
+    return true
+  })
+  t.after(close)
   async function* interruptedInput() {
     yield Buffer.from('{"session_id":')
     throw Error('Closed input stream')
@@ -129,9 +137,76 @@ test('an interrupted stdin stream reaches the instruction veto as unreadable inp
 
   // Act
   const body = await readHookInput(interruptedInput())
+  await runHook(
+    directory,
+    body,
+    async () => {},
+    'submitting-terminal',
+    'UserPromptSubmit',
+  )
 
   // Assert
-  assert.equal(body, undefined)
+  assert.deepEqual(requests, [
+    { op: 'incomplete-instruction', incarnation: 'submitting-terminal' },
+  ])
+})
+
+test('an oversized question pauses and resumes the original card without submitting its private preview', async (t) => {
+  // Arrange
+  const directory = await mkdtemp(join(tmpdir(), 'bd-question-overflow-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const requests = [],
+    written = []
+  const close = await listenGateway(directory, async (request) => {
+    requests.push(request)
+    return null
+  })
+  t.after(close)
+  const payload = {
+    cwd: directory,
+    session_id: 'terminal-a',
+    tool_name: 'AskUserQuestion',
+    tool_use_id: 'original-card',
+    tool_input: {
+      questions: [
+        {
+          ...card,
+          options: [
+            {
+              label: 'Fix in this PR',
+              preview: 'private-preview'.repeat(24_000),
+            },
+            card.options[1],
+          ],
+        },
+      ],
+    },
+  }
+  // Act
+  for (const event of ['PreToolUse', 'PostToolUse']) {
+    const body = await readHookInput(
+      Readable.from([
+        Buffer.from(JSON.stringify({ ...payload, hook_event_name: event })),
+      ]),
+    )
+    await runHook(
+      directory,
+      body,
+      async (value) => written.push(value),
+      'interactive-pty',
+      event,
+    )
+  }
+  // Assert
+  assert.deepEqual(
+    requests.map((r) => [r.event, r.sessionId, r.questionId, r.unsupported]),
+    [
+      ['PreToolUse', 'terminal-a', 'original-card', true],
+      ['PostToolUse', 'terminal-a', 'original-card', true],
+    ],
+  )
+  assert.equal(JSON.stringify(requests).includes('private-preview'), false)
+  assert.deepEqual(written, [])
 })
 
 test('a rejected delivery check retires an unwritten answer while a failed stdout write retains its receipt', async (t) => {

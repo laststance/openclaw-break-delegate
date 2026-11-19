@@ -22,12 +22,9 @@ export function uniqueTypedMatches(
   const near = (a: { at: number }, b: { at: number }) =>
     Math.abs(a.at - b.at) <= receiptWindow
   const identified = rawReceipts.filter((r) => r.submission)
-  const receipts = rawReceipts.filter(
-    (r) => r.submission || !identified.some((other) => near(r, other)),
-  )
   // One native submission may appear in both the input log and a completed UI event.
   const copies = new Map<string, TypedReceipt[]>()
-  for (const receipt of receipts) {
+  for (const receipt of rawReceipts) {
     const key = receipt.submission || 'at:' + receipt.at
     const existing = copies.get(key) ?? []
     existing.push(receipt)
@@ -72,6 +69,9 @@ export function uniqueTypedMatches(
   for (const [candidate, eligible] of edges) {
     if (eligible.length !== 1) continue
     const receipt = eligible[0]!
+    // An anonymous timestamp cannot prove a second submission beside a native receipt, nor can it erase that possible ambiguity.
+    if (!receipt.submission && identified.some((other) => near(receipt, other)))
+      continue
     const possible = callers.get(receipt)!
     if (possible.length === 1) unique.add(candidate)
   }

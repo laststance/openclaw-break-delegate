@@ -134,16 +134,15 @@ async function installIfAbsent(
   }
 }
 
-/** Preserve the exact file displaced by setup and give a competing editor's revision priority.
+/** Preserve the exact file displaced by setup for recovery after a concurrent save.
  * {@link configureHooks} prepares the replacement inside a private recovery directory.
  * @example
- * await replaceSettings(file, staged, old, updated);
+ * await replaceSettings(file, staged, old);
  */
 async function replaceSettings(
   file: string,
   staged: string,
   old: string,
-  updated: string,
 ): Promise<void> {
   const previous = join(dirname(staged), 'previous.json')
   const conflict = (path: string) =>
@@ -153,12 +152,8 @@ async function replaceSettings(
         ' and retry.',
     )
   if (exchangeSettings(file, staged)) {
-    if ((await readFile(staged, 'utf8')) !== old) {
-      // Restore the competing edit if our update is still current. The exchange also retains any later write.
-      if ((await readFile(file, 'utf8')) === updated)
-        exchangeSettings(file, staged)
-      throw conflict(staged)
-    }
+    // The editor can save again at any instant. Retain the displaced revision without a second swap.
+    if ((await readFile(staged, 'utf8')) !== old) throw conflict(staged)
     await rename(staged, previous)
     return
   }
@@ -318,7 +313,7 @@ export async function configureHooks(
     if (exists) {
       // After a swap, the staged path can be the only copy of an editor's latest save.
       preserveStaged = true
-      await replaceSettings(file, tmp, old, updated)
+      await replaceSettings(file, tmp, old)
     } else {
       // First-time setup must not overwrite a file created by another writer since the snapshot.
       await installIfAbsent(tmp, file)

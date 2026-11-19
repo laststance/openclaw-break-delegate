@@ -55,6 +55,12 @@ type LaunchOptions = {
   retryMs?: number
 }
 type Pending = { finish: (status: NativeStatus) => void; timer: NodeJS.Timeout }
+type SurfaceUpdate = Exclude<Command, StatusCommand>
+type QueuedUpdate = {
+  command: SurfaceUpdate
+  result: Promise<NativeStatus>
+  finish: (status: NativeStatus) => void
+}
 
 export const nativeHelperExecutable = fileURLToPath(
   new URL(
@@ -176,6 +182,8 @@ export function createNativeBreakUi(
   let failures = 0
   let retry: NodeJS.Timeout | undefined
   const pending = new Map<number, Pending>()
+  // Retain at most one review and one later invitation or active break while the pipe is full.
+  const queued = new Map<'review' | 'surface', QueuedUpdate>()
   let pendingClear: Promise<NativeStatus> | undefined
   const timeoutMs = options.timeoutMs ?? 8_000
   // Match the gateway's normalized profile path without exposing a folder name on a banner or in argv.
@@ -194,6 +202,24 @@ export function createNativeBreakUi(
     instance.once('close', () => clearTimeout(force))
   }
 
+  function scheduleRetry(): void {
+    if (closed || !desired || retry) return
+    const delay = Math.min(
+      60_000,
+      (options.retryMs ?? 1_000) * 2 ** Math.min(failures++, 6),
+    )
+    retry = setTimeout(() => {
+      retry = undefined
+      if (desired) void dispatch(desired)
+    }, delay)
+    retry.unref()
+  }
+
+  function discardQueued(result: NativeStatus): void {
+    for (const update of queued.values()) update.finish(result)
+    queued.clear()
+  }
+
   function disconnect(
     instance: Helper,
     result: NativeStatus,
@@ -207,16 +233,8 @@ export function createNativeBreakUi(
       receipt.finish(result)
     }
     pending.clear()
-    if (closed || !desired || !retryable) return
-    const delay = Math.min(
-      60_000,
-      (options.retryMs ?? 1_000) * 2 ** Math.min(failures++, 6),
-    )
-    retry = setTimeout(() => {
-      retry = undefined
-      if (desired) void dispatch(desired)
-    }, delay)
-    retry.unref()
+    discardQueued(result)
+    if (retryable) scheduleRetry()
   }
 
   function receive(instance: Helper, frame: unknown): void {
@@ -247,6 +265,7 @@ export function createNativeBreakUi(
       if (typeof frame.detail === 'string')
         result.detail = frame.detail.slice(0, 300)
       receipt.finish(result)
+      flushQueued(instance)
       return
     }
     if (frame.type !== 'action' || !desired || frame.id !== desired.id) return
@@ -326,11 +345,70 @@ export function createNativeBreakUi(
     return instance
   }
 
+  function queueUpdate(command: SurfaceUpdate): Promise<NativeStatus> {
+    const key =
+      command.kind === 'summary' || command.kind === 'refreshSummary'
+        ? 'review'
+        : 'surface'
+    const previous = queued.get(key)
+    if (
+      previous?.command.id === command.id &&
+      (previous.command.kind === command.kind ||
+        (previous.command.kind === 'summary' &&
+          command.kind === 'refreshSummary'))
+    ) {
+      // A correction can arrive before the initial summary. Keep its banner and use the newest review.
+      previous.command =
+        previous.command.kind === 'summary' && command.kind === 'refreshSummary'
+          ? { ...previous.command, review: command.review }
+          : command
+      return previous.result
+    }
+    previous?.finish(
+      unavailable('A newer native presentation superseded this update.'),
+    )
+    let finish!: (status: NativeStatus) => void
+    const result = new Promise<NativeStatus>((resolve) => {
+      finish = resolve
+    })
+    queued.set(key, { command, result, finish })
+    return result
+  }
+
+  function flushQueued(instance: Helper): void {
+    // Restore a retained review before the foreground surface so a later break remains visible.
+    for (const key of ['review', 'surface'] as const) {
+      const entry = queued.get(key)
+      if (!entry || pending.size >= 32) continue
+      queued.delete(key)
+      const { command } = entry
+      const current = key === 'review' ? latestReview : desired
+      if (
+        current?.id !== command.id ||
+        (key === 'surface' && current.kind !== command.kind)
+      ) {
+        entry.finish(
+          unavailable('A newer native presentation superseded this update.'),
+        )
+        continue
+      }
+      const outgoing =
+        command.kind === 'summary' && desired?.kind !== 'summary'
+          ? { ...command, silent: true }
+          : command
+      void write(instance, outgoing).then(entry.finish, () =>
+        entry.finish(unavailable('The macOS helper disconnected.')),
+      )
+    }
+  }
+
   function write(instance: Helper, command: Command): Promise<NativeStatus> {
     // One additional slot lets the gateway withdraw a stale surface when ordinary traffic is full.
     if (command.kind === 'clear' && pendingClear) return pendingClear
-    if (command.kind !== 'clear' && pending.size >= 32)
+    if (command.kind !== 'clear' && pending.size >= 32) {
+      if ('id' in command) return queueUpdate(command)
       return Promise.resolve(unavailable('The macOS helper is busy.'))
+    }
     pendingClear = undefined
     const request = ++sequence
     const result = new Promise<NativeStatus>((finish) => {
@@ -379,6 +457,8 @@ export function createNativeBreakUi(
       if (fresh && desired && command !== desired) void write(instance, desired)
       return write(instance, command)
     } catch (error) {
+      // A transient launch failure can also happen during a scheduled reconnect.
+      if (options.launch || process.platform === 'darwin') scheduleRetry()
       return Promise.resolve(
         unavailable(
           error instanceof Error
@@ -454,6 +534,7 @@ export function createNativeBreakUi(
       presentationVersion++
       desired = undefined
       latestReview = undefined
+      discardQueued(unavailable('The native presentation was cleared.'))
       if (retry) clearTimeout(retry)
       return dispatch({ kind: 'clear' })
     },
@@ -462,6 +543,7 @@ export function createNativeBreakUi(
       closed = true
       desired = undefined
       latestReview = undefined
+      discardQueued(unavailable('The macOS notification connection is closed.'))
       if (retry) clearTimeout(retry)
       if (child) {
         const instance = child

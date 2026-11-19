@@ -31,6 +31,9 @@ const routingKeys = new Set([
   'agent_id',
   'agent_type',
   'prompt',
+  'cwd',
+  'tool_name',
+  'tool_use_id',
 ])
 
 /** Project oversized hook JSON onto its top-level routing fields for {@link readHookInput}.
@@ -132,14 +135,35 @@ class HookEnvelopeReader {
     if (!isObject(value) || typeof value.hook_event_name !== 'string')
       return undefined
     if (value.agent_id || value.agent_type) return {}
-    if (value.hook_event_name !== 'UserPromptSubmit') return undefined
     if (
       typeof value.session_id !== 'string' ||
-      !/^[^\x00-\x1f]{1,256}$/u.test(value.session_id) ||
-      typeof value.prompt !== 'string'
+      !/^[^\x00-\x1f]{1,256}$/u.test(value.session_id)
     )
       return undefined
-    return new IncompleteHookInstruction(value.session_id)
+    if (
+      value.hook_event_name === 'UserPromptSubmit' &&
+      typeof value.prompt === 'string'
+    )
+      return new IncompleteHookInstruction(value.session_id)
+    // Keep the original question's lifecycle visible without retaining its choices or issuing an answer.
+    if (
+      ['PreToolUse', 'PostToolUse', 'PostToolUseFailure'].includes(
+        value.hook_event_name,
+      ) &&
+      value.tool_name === 'AskUserQuestion' &&
+      typeof value.tool_use_id === 'string' &&
+      /^[^\x00-\x1f]{1,256}$/u.test(value.tool_use_id) &&
+      typeof value.cwd === 'string'
+    )
+      return {
+        hook_event_name: value.hook_event_name,
+        session_id: value.session_id,
+        cwd: value.cwd === '\u0000' ? '' : value.cwd,
+        tool_name: 'AskUserQuestion',
+        tool_use_id: value.tool_use_id,
+        tool_input: {},
+      }
+    return undefined
   }
 }
 

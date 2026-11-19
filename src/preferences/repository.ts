@@ -65,7 +65,9 @@ function remoteIdentity(value: string): string | null {
   return (
     'remote:' +
     digest(
-      (host === 'github.com' ? '' : 'literal-path:') +
+      (host === 'github.com'
+        ? ''
+        : 'literal-service:' + remote.protocol + '//') +
         remote.host.toLowerCase() +
         '/' +
         (host === 'github.com' ? path.toLowerCase() : path),
@@ -105,9 +107,7 @@ export function canonicalRepository(
       resolve(cwd, git(['rev-parse', '--git-common-dir'])),
     )
     try {
-      const origin = remoteIdentity(
-        git(['config', '--local', '--get', 'remote.origin.url']),
-      )
+      const origin = remoteIdentity(git(['remote', 'get-url', 'origin']))
       if (origin) return origin
     } catch {
       /* A local-only repository still has a common Git directory. */

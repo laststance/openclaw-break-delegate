@@ -38,7 +38,7 @@ export interface Gate {
 }
 export type NativeAction = 'accept' | 'snooze' | 'dismiss' | 'return'
 export interface NativeEffect {
-  kind: 'invitation' | 'break' | 'digest'
+  kind: 'invitation' | 'break' | 'digest' | 'review-updated'
   id: string
 }
 export type Outcome =
@@ -121,6 +121,7 @@ CREATE TABLE IF NOT EXISTS sv_questions(
   kind TEXT NOT NULL, live INTEGER NOT NULL, candidate TEXT, disposition TEXT NOT NULL,
   PRIMARY KEY(sessionId,questionId)
 );
+CREATE TABLE IF NOT EXISTS sv_question_origins(sessionId TEXT NOT NULL,questionId TEXT NOT NULL,incarnation TEXT NOT NULL,openedAt INTEGER NOT NULL,PRIMARY KEY(sessionId,questionId));
 CREATE TABLE IF NOT EXISTS sv_reviews(
   breakId TEXT NOT NULL, sessionId TEXT NOT NULL, questionId TEXT NOT NULL, question TEXT NOT NULL,
   answer TEXT, outcome TEXT NOT NULL, reason TEXT, at INTEGER NOT NULL,
@@ -150,6 +151,7 @@ export class Supervision {
   readonly #snoozeMs: number
   readonly #invitationMs: number
   readonly #approvals = new ExecutionApprovals()
+  #nextTrackingSweep = -Infinity
   #writing = false
   #coverage = new Map<string, Coverage>()
   #lastAt: number
@@ -192,6 +194,7 @@ export class Supervision {
     if (this.#writing) return apply()
     this.#db.exec('BEGIN IMMEDIATE')
     this.#writing = true
+    const nextSweep = this.#nextTrackingSweep
     const lastAt = this.#lastAt,
       coverage = this.#coverage
     this.#coverage = new Map(coverage)
@@ -207,6 +210,7 @@ export class Supervision {
         this.#approvals.rebaseClock(this.#lastAt - lastAt)
       return result
     } catch (error) {
+      this.#nextTrackingSweep = nextSweep
       this.#lastAt = lastAt
       this.#coverage = coverage
       if (this.#db.isTransaction) this.#db.exec('ROLLBACK')
@@ -292,6 +296,12 @@ export class Supervision {
       this.#db.exec(
         "UPDATE sv_invitations SET state='clock-changed' WHERE state='open'",
       )
+      this.#nextTrackingSweep = -Infinity
+      this.#db
+        .prepare(
+          'UPDATE sv_question_origins SET openedAt=openedAt+? WHERE EXISTS (SELECT 1 FROM sv_questions q WHERE q.sessionId=sv_question_origins.sessionId AND q.questionId=sv_question_origins.questionId AND q.live=1)',
+        )
+        .run(now - this.#lastAt)
       this.#work.resetClock(now)
       this.#coverage.clear()
       this.#db
@@ -303,6 +313,21 @@ export class Supervision {
     const active = this.#active()
     if (active && now >= active.expiresAt)
       this.#finish(active, active.expiresAt, 'Break ended')
+    if (now >= this.#nextTrackingSweep) {
+      const confirmed = new Set(
+        this.#work
+          .views(now, false)
+          .filter((s) => s.status !== 'unknown' && s.status !== 'closed')
+          .map((s) => s.generation),
+      )
+      if (active && now < active.expiresAt)
+        for (const { generation } of this.#db
+          .prepare('SELECT generation FROM sv_members WHERE breakId=?')
+          .all(active.id))
+          confirmed.add(String(generation))
+      this.#work.detach(new Set(this.#approvals.prune(now, confirmed)))
+      this.#nextTrackingSweep = now + minute
+    }
     this.#db
       .prepare(
         "UPDATE sv_invitations SET state='expired' WHERE state='open' AND expiresAt<=?",
@@ -351,6 +376,49 @@ export class Supervision {
     })
   }
 
+  #restoreOriginal(
+    sessionId: string,
+    incarnation: string | undefined,
+    replacement: boolean,
+    now: number,
+  ) {
+    if (!incarnation || this.#work.claude(sessionId, incarnation, now)) return
+    const rows = this.#db
+      .prepare(
+        `SELECT q.questionId,q.question,q.kind,q.generation,o.incarnation,o.openedAt
+      FROM sv_questions q JOIN sv_question_origins o USING(sessionId,questionId)
+      WHERE q.sessionId=? AND q.live=1 AND (o.incarnation=? OR ?=1)
+      ORDER BY (o.incarnation=?) DESC,o.openedAt DESC`,
+      )
+      .all(sessionId, incarnation, replacement ? 1 : 0, incarnation)
+    if (!rows.length) return
+    const generation = String(rows[0].generation),
+      owner = String(rows[0].incarnation)
+    const same = rows.filter((row) => row.generation === generation)
+    this.#work.restore(
+      sessionId,
+      owner,
+      generation,
+      same.map((row) => String(row.questionId)),
+      now,
+    )
+    if (this.#work.claude(sessionId, owner, now)?.generation !== generation)
+      return
+    this.#approvals.restore(
+      generation,
+      same
+        .filter((row) => row.kind === 'approval')
+        .map((row) => ({
+          key: String(row.questionId),
+          toolName: String(row.question).slice(
+            'Execution approval for '.length,
+          ),
+          at: Number(row.openedAt),
+        })),
+      now,
+    )
+  }
+
   /** Record a lifecycle hook; an ordinary prompt submission supplies no human reply points. */
   observe(observation: Observation): void {
     this.#transaction(() => {
@@ -359,6 +427,13 @@ export class Supervision {
       const lifecycle =
         observation.provider === 'claude' &&
         (observation.source ?? 'hook') === 'hook'
+      if (lifecycle && this.#work.isFresh(observation.at ?? now, now))
+        this.#restoreOriginal(
+          observation.sessionId,
+          observation.incarnation,
+          !!observation.newSession,
+          now,
+        )
       const previous =
         lifecycle && (observation.status === 'closed' || observation.newSession)
           ? this.#work.claude(observation.sessionId, undefined, now)
@@ -612,6 +687,8 @@ export class Supervision {
         canDelegate: true,
         at,
       }
+      if (this.#work.isFresh(at, now))
+        this.#restoreOriginal(input.sessionId, input.incarnation, false, now)
       let currentTerminal = this.#work.claude(
         input.sessionId,
         input.incarnation,
@@ -813,6 +890,17 @@ export class Supervision {
           eligible ? active!.id : null,
           eligible ? 'open' : 'held',
         )
+      if (input.incarnation && session)
+        this.#db
+          .prepare('INSERT INTO sv_question_origins VALUES(?,?,?,?)')
+          .run(
+            input.sessionId,
+            input.questionId,
+            input.incarnation,
+            Number.isFinite(input.openedAt) && input.openedAt! <= now
+              ? input.openedAt!
+              : now,
+          )
       if (member) {
         this.#db
           .prepare(
@@ -890,11 +978,18 @@ export class Supervision {
         "UPDATE sv_questions SET live=0,disposition=CASE WHEN disposition IN ('open','held') THEN 'resolved' ELSE disposition END WHERE sessionId=? AND questionId=?",
       )
       .run(sessionId, questionId)
-    this.#db
+    const changed = this.#db
       .prepare(
-        "UPDATE sv_reviews SET outcome='resolved',reason=?,at=? WHERE sessionId=? AND questionId=? AND outcome='held'",
+        "UPDATE sv_reviews SET outcome='resolved',reason=?,at=? WHERE sessionId=? AND questionId=? AND outcome='held' RETURNING breakId",
       )
-      .run(reason, now, sessionId, questionId)
+      .all(reason, now, sessionId, questionId)
+    // An ended break owns its retained summary even while a later invitation is on screen.
+    for (const { breakId } of changed)
+      this.#db
+        .prepare(
+          "INSERT INTO sv_effects(id,kind,claimed) SELECT id,'review-updated',0 FROM sv_breaks WHERE id=? AND endedAt IS NOT NULL ON CONFLICT(id,kind) DO UPDATE SET claimed=0",
+        )
+        .run(breakId)
     this.#work.setWaiting(sessionId, questionId, false, now)
   }
 
@@ -1125,6 +1220,7 @@ export class Supervision {
         const id = String(row.id)
         if (
           row.kind === 'digest' ||
+          row.kind === 'review-updated' ||
           (row.kind === 'break' && id === active?.id) ||
           (row.kind === 'invitation' && id === invite?.id)
         )

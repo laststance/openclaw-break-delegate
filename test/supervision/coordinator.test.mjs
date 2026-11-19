@@ -685,3 +685,114 @@ test('partial and unavailable polls retain fresh observations until expiry or a 
   poll([], 'available')
   assert.equal(supervisor.status().sessions[0]?.status ?? 'unknown', 'unknown')
 })
+
+test('an unconfirmed permission leaves live tracking after one hour while its held review and a confirmed terminal survive', (t) => {
+  // Arrange
+  const { supervisor: s, observe, clock, advance } = setup(t, { threshold: 4 })
+  observe('lost', 'running', { incarnation: 'lost-source' })
+  observe('alive', 'running', { incarnation: 'live-source' })
+  const id = invite(s)
+  const permission = (sessionId, incarnation, event, toolUseId) =>
+    s.observeExecution({
+      sessionId,
+      incarnation,
+      event,
+      toolUseId,
+      toolName: 'Bash',
+      at: clock(),
+    })
+  permission('lost', 'lost-source', 'PermissionRequest', 'p1')
+  permission('alive', 'live-source', 'PermissionRequest', 'p2')
+  s.action(id, 'return')
+  advance(59 * minute + 50000)
+  observe('alive', 'waiting', { incarnation: 'live-source' })
+  // Act
+  advance(70000)
+  s.tick()
+  // Assert
+  assert.deepEqual(
+    s.status().sessions.map((row) => [row.sessionId, row.status]),
+    [['alive', 'waiting']],
+  )
+  assert.deepEqual(
+    s.review(id).map((row) => row.outcome),
+    ['held', 'held'],
+  )
+  assert.equal(
+    permission('lost', 'unrelated-process', 'PostToolUse', 'p1'),
+    false,
+  )
+  assert.equal(permission('lost', 'lost-source', 'PostToolUse', 'p1'), true)
+  assert.deepEqual(
+    s
+      .review(id)
+      .map((row) => [row.sessionId, row.outcome])
+      .sort(),
+    [
+      ['alive', 'held'],
+      ['lost', 'resolved'],
+    ],
+  )
+})
+
+test('an old complete roster cannot revive a later withdrawal and only a newer observation restores activity', (t) => {
+  // Arrange
+  const {
+    supervisor: s,
+    observe,
+    clock,
+    advance,
+  } = setup(t, { observationTtlMs: 3 * minute })
+  advance(90000)
+  observe('a')
+  const hookAt = clock()
+  advance(10000)
+  s.snapshot('claude-agents', [], {
+    at: clock(),
+    status: 'available',
+    detail: 'Withdrawn',
+  })
+  // Act
+  advance(10000)
+  s.snapshot('claude-agents', [], {
+    at: hookAt - 10000,
+    status: 'available',
+    detail: 'Late older roster',
+  })
+  // Assert
+  assert.equal(s.status().sessions[0].status, 'unknown')
+  assert.equal(s.status().score, 0.166667)
+  observe('a')
+  assert.equal(s.status().sessions[0].status, 'running')
+})
+
+test('a dated idle snapshot ends running credit at observation even after a checkpoint and a newer independent hook', (t) => {
+  // Arrange
+  const {
+    supervisor: s,
+    observe,
+    advance,
+    clock,
+  } = setup(t, { observationTtlMs: 2 * minute })
+  const send = (status, at) =>
+    s.snapshot(
+      'claude-agents',
+      [{ provider: 'claude', sessionId: 'terminal', status }],
+      { at, status: 'available', detail: 'Native roster' },
+    )
+  send('running', clock())
+  const observedIdle = clock() + 10000
+  advance(30000)
+  s.tick()
+  advance(10000)
+  observe('terminal', 'waiting', { incarnation: 'tty' })
+  advance(20000)
+  // Act
+  send('idle', observedIdle)
+  // Assert
+  assert.equal(s.status().score, 0.166667)
+  assert.equal(s.status().sessions[0].status, 'waiting')
+  advance(10000)
+  s.tick()
+  assert.equal(s.status().score, 0.166667)
+})

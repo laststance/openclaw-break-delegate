@@ -13,6 +13,206 @@ import { requestGateway } from '../dist/ipc.js'
 import { PreferenceStore } from '../dist/preferences/index.js'
 import { Supervision } from '../dist/supervision/index.js'
 
+/** Fail the acceptance test when its expected native callback never arrives. */
+function waitForNative(promise) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(
+      () => reject(new Error('The expected native callback did not arrive.')),
+      10_000,
+    )
+    promise.then(resolve, reject).finally(() => clearTimeout(timeout))
+  })
+}
+
+test(
+  'a failed initial database tick closes the native UI and lets the same profile start immediately',
+  { timeout: 5000 },
+  async (t) => {
+    // Arrange
+    const directory = await mkdtemp(join(tmpdir(), 'bd-startup-failure-'))
+    t.after(() => rm(directory, { recursive: true, force: true }))
+    let closed = 0
+    const pass = async () => ({ status: 'authorized' })
+    const ui = {
+      status: pass,
+      authorize: pass,
+      invite: pass,
+      active: pass,
+      summary: pass,
+      clear: pass,
+      close() {
+        closed++
+      },
+    }
+    const options = {
+      directory,
+      roots: {},
+      poll: async () => {},
+      log() {},
+      judge: async () => false,
+      nativeFactory: () => ui,
+    }
+    // Act
+    await assert.rejects(
+      startService({
+        ...options,
+        nativeFactory() {
+          const db = new DatabaseSync(join(directory, 'state.sqlite'))
+          try {
+            db.exec('DROP TABLE bd_hook_times')
+          } finally {
+            db.close()
+          }
+          return ui
+        },
+      }),
+      /bd_hook_times/,
+    )
+    const stop = await startService(options)
+    t.after(stop)
+    const result = await requestGateway(directory, { op: 'status' })
+    // Assert
+    assert.equal(closed, 1)
+    assert.equal(result.supervision.threshold, 45)
+  },
+)
+
+test(
+  'a native helper that cannot display the break invitation leaves a diagnostic in the Gateway log',
+  { timeout: 5000 },
+  async (t) => {
+    // Arrange
+    const directory = await mkdtemp(join(tmpdir(), 'bd-lost-invitation-'))
+    t.after(() => rm(directory, { recursive: true, force: true }))
+    const diagnostic = Promise.withResolvers(),
+      pass = async () => ({ status: 'authorized' })
+    // Act
+    const stop = await startService({
+      directory,
+      roots: {},
+      workload: { threshold: 4 },
+      log(line) {
+        diagnostic.resolve(line)
+      },
+      judge: async () => false,
+      nativeFactory: () => ({
+        status: pass,
+        authorize: pass,
+        active: pass,
+        clear: pass,
+        summary: pass,
+        close() {},
+        invite: async () => ({ status: 'unavailable', detail: 'offline' }),
+      }),
+      async poll(c) {
+        c.observe({
+          provider: 'claude',
+          sessionId: 'a',
+          incarnation: 'native',
+          status: 'running',
+          canDelegate: true,
+        })
+        c.humanReply({
+          provider: 'claude',
+          sessionId: 'a',
+          responseId: 'answer',
+        })
+      },
+    })
+    t.after(stop)
+    // Assert
+    assert.match(
+      await diagnostic.promise,
+      /break invitation could not be displayed/,
+    )
+  },
+)
+
+test(
+  'the retained return review removes a held question when the original terminal reports its cancellation',
+  { timeout: 5000 },
+  async (t) => {
+    // Arrange
+    const directory = await mkdtemp(join(tmpdir(), 'bd-settled-held-'))
+    t.after(() => rm(directory, { recursive: true, force: true }))
+    const invitation = Promise.withResolvers(),
+      summary = Promise.withResolvers(),
+      refreshed = Promise.withResolvers(),
+      pass = async () => ({ status: 'authorized' })
+    let act,
+      now = Date.now()
+    const stop = await startService({
+      directory,
+      roots: {},
+      now: () => now,
+      workload: { threshold: 4 },
+      log() {},
+      judge: async () => false,
+      nativeFactory(handler) {
+        act = handler
+        return {
+          status: pass,
+          authorize: pass,
+          active: pass,
+          clear: pass,
+          close() {},
+          async invite(id) {
+            invitation.resolve(id)
+            return pass()
+          },
+          async summary(id, review) {
+            summary.resolve({ id, review })
+            return pass()
+          },
+          async refreshSummary(id, review) {
+            refreshed.resolve({ id, review })
+            return pass()
+          },
+        }
+      },
+      async poll(c) {
+        c.observe({
+          provider: 'claude',
+          sessionId: 'a',
+          incarnation: 'terminal',
+          status: 'running',
+          canDelegate: true,
+        })
+        c.humanReply({ provider: 'claude', sessionId: 'a', responseId: 'one' })
+      },
+    })
+    t.after(stop)
+    const question = {
+      op: 'hook',
+      sessionId: 'a',
+      incarnation: 'terminal',
+      cwd: directory,
+      questionId: 'held',
+      toolName: 'AskUserQuestion',
+      unsupported: true,
+      question: 'Select a new font.',
+    }
+    await act({ kind: 'start', id: await invitation.promise })
+    now++
+    await requestGateway(directory, { ...question, event: 'PreToolUse' })
+    await requestGateway(directory, { op: 'return' })
+    const original = await summary.promise
+    // Act
+    await requestGateway(directory, {
+      ...question,
+      event: 'PostToolUseFailure',
+    })
+    const updated = await refreshed.promise
+    // Assert
+    assert.deepEqual(
+      original.review.held.map((row) => row.question),
+      ['Select a new font.'],
+    )
+    assert.equal(updated.id, original.id)
+    assert.deepEqual(updated.review.held, [])
+  },
+)
+
 test('an accepted break answers the original Claude card once and keeps its reply out of human history', async (t) => {
   // Arrange
   const root = await mkdtemp(join(tmpdir(), 'bd-flow-'))
@@ -58,7 +258,9 @@ test('an accepted break answers the original Claude card once and keeps its repl
     JSON.stringify(replay),
   )
   db.close()
-  let onAction, invite, active
+  const invitation = Promise.withResolvers()
+  const activation = Promise.withResolvers()
+  let onAction
   let seeded = false
   let supersede = false
   let judgeCalls = 0
@@ -99,11 +301,11 @@ test('an accepted break answers the original Claude card once and keeps its repl
         status: pass,
         authorize: pass,
         invite: async (id) => {
-          invite = id
+          invitation.resolve(id)
           return pass()
         },
         active: async (id) => {
-          active = id
+          activation.resolve(id)
           return pass()
         },
         summary: pass,
@@ -133,12 +335,9 @@ test('an accepted break answers the original Claude card once and keeps its repl
     },
   })
   t.after(stop)
-  for (let i = 0; i < 30 && !invite; i++)
-    await new Promise((r) => setTimeout(r, 10))
-  assert.ok(invite)
   now += 10
-  await onAction({ kind: 'start', id: invite })
-  assert.ok(active)
+  await onAction({ kind: 'start', id: await waitForNative(invitation.promise) })
+  const active = await waitForNative(activation.promise)
   now += 10
   const hook = {
     hook_event_name: 'PreToolUse',
@@ -435,8 +634,8 @@ test('a large task veto follows the resumed Claude session and permits a differe
   preferences.replay()
   db.close()
   const pass = async () => ({ status: 'authorized' })
-  let invite,
-    onAction,
+  const invitation = Promise.withResolvers()
+  let onAction,
     seeded = false
   const base = {
     directory,
@@ -450,7 +649,7 @@ test('a large task veto follows the resumed Claude session and permits a differe
         status: pass,
         authorize: pass,
         invite: async (id) => {
-          invite = id
+          invitation.resolve(id)
           return pass()
         },
         active: pass,
@@ -506,10 +705,7 @@ test('a large task veto follows the resumed Claude session and permits a differe
     },
   })
   t.after(stopResumed)
-  for (let i = 0; i < 50 && !invite; i++)
-    await new Promise((resolve) => setTimeout(resolve, 10))
-  assert.ok(invite)
-  await onAction({ kind: 'start', id: invite })
+  await onAction({ kind: 'start', id: await waitForNative(invitation.promise) })
   const answers = []
 
   // Act

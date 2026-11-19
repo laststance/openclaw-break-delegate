@@ -270,81 +270,22 @@ async function importFile(
     let stat = info
     let pending: Buffer[] = []
     let length = 0
+    const changedDuringParse = Symbol('source changed during parse')
+    const retry = async () => {
+      if (retries < 2) await importFile(db, file, report, retries + 1)
+      else report.unreadable++
+    }
     while (offset < size) {
       const chunk = Buffer.allocUnsafe(Math.min(chunkSize, size - offset))
       const received = readSync(fd, chunk, 0, chunk.length, offset)
       if (!received) break
       report.bytesRead += received
-      let start = 0
-      let commit = saved
-      let skipAtCommit = skipping
-      db.transaction(() => {
-        while (start < received) {
-          const newline = chunk.subarray(0, received).indexOf(end, start)
-          const until = newline === -1 ? received : newline
-          const part = chunk.subarray(start, until)
-          if (!skipping) {
-            length += part.length
-            if (length > maxLine) {
-              skipping = true
-              pending = []
-              delete state.brief
-              report.oversized++
-            } else if (part.length) pending.push(part)
-          }
-          if (newline === -1) {
-            // Do not consume an unfinished ordinary line. An oversized one can be discarded before its newline arrives.
-            if (skipping) {
-              commit = offset + received
-              skipAtCommit = true
-            }
-            break
-          }
-          if (!skipping && length) {
-            const line = Buffer.concat(pending, length).toString('utf8')
-            let parsed: unknown
-            try {
-              parsed = JSON.parse(line)
-            } catch {
-              report.malformed++
-              delete state.brief
-            }
-            if (parsed !== undefined)
-              parseHistoryRow(db, file.format, state, parsed, report)
-          }
-          pending = []
-          length = 0
-          skipping = false
-          start = until + 1
-          commit = offset + start
-          skipAtCommit = false
-        }
-        if (commit > saved) {
-          addSegment.run(key, saved, commit, rangeHash(fd, saved, commit))
-          save.run(
-            key,
-            identity,
-            commit,
-            checkpointHash(fd, commit),
-            Number(skipAtCommit),
-            JSON.stringify(state),
-          )
-          saved = commit
-          saveVersion.run(key, fileVersion(stat))
-        }
-      })
-      offset += received
-      // The synchronous SQLite transaction has committed before live hooks or other source readers can run.
+      // Keep this chunk private until the source bytes and the parser state they extend have been verified.
       await yieldToGateway()
       const current = fstatSync(fd, { bigint: true })
-      if (
-        current.size !== stat.size ||
-        current.mtimeNs !== stat.mtimeNs ||
-        current.ctimeNs !== stat.ctimeNs
-      ) {
-        // Append-only writers keep the same prefix. A replacement must never inherit parser state or an offset from the prior file.
-        const priorChunkMatches =
-          rangeHash(fd, offset - received, offset) ===
+      if (fileVersion(current) !== fileVersion(stat)) {
+        const bytesMatch =
+          rangeHash(fd, offset, offset + received) ===
           createHash('sha256').update(chunk.subarray(0, received)).digest('hex')
         const partialMatches =
           offset === saved ||
@@ -352,27 +293,93 @@ async function importFile(
             createHash('sha256')
               .update(Buffer.concat(pending, length))
               .digest('hex')
-        const unchanged =
-          Number(current.size) >= offset &&
-          priorChunkMatches &&
+        const valid =
+          Number(current.size) >= offset + received &&
+          bytesMatch &&
           partialMatches &&
           (await matchesPrefix(db, fd, key, saved)) &&
           fileVersion(current) === fileVersion(fstatSync(fd, { bigint: true }))
-        if (!unchanged) {
-          db.transaction(() => {
-            db.db.prepare('DELETE FROM pref_files WHERE path=?').run(key)
-            db.db
-              .prepare('DELETE FROM pref_file_segments WHERE path=?')
-              .run(key)
-          })
-          // A continuously rewritten source can be retried by the next import without monopolizing the gateway.
-          if (retries < 2) await importFile(db, file, report, retries + 1)
-          else report.unreadable++
+        if (!valid) {
+          await retry()
           return
         }
         stat = current
-        saveVersion.run(key, fileVersion(stat))
       }
+      const counts = { oversized: 0, malformed: 0, unverified: 0, mirrors: 0 }
+      let start = 0
+      let commit = saved
+      let skipAtCommit = skipping
+      try {
+        db.transaction(() => {
+          while (start < received) {
+            const newline = chunk.subarray(0, received).indexOf(end, start)
+            const until = newline === -1 ? received : newline
+            const part = chunk.subarray(start, until)
+            if (!skipping) {
+              length += part.length
+              if (length > maxLine) {
+                skipping = true
+                pending = []
+                delete state.brief
+                counts.oversized++
+              } else if (part.length) pending.push(part)
+            }
+            if (newline === -1) {
+              // Do not consume an unfinished ordinary line. An oversized one can be discarded before its newline arrives.
+              if (skipping) {
+                commit = offset + received
+                skipAtCommit = true
+              }
+              break
+            }
+            if (!skipping && length) {
+              const line = Buffer.concat(pending, length).toString('utf8')
+              let parsed: unknown
+              try {
+                parsed = JSON.parse(line)
+              } catch {
+                counts.malformed++
+                delete state.brief
+              }
+              if (parsed !== undefined)
+                parseHistoryRow(db, file.format, state, parsed, counts)
+            }
+            pending = []
+            length = 0
+            skipping = false
+            start = until + 1
+            commit = offset + start
+            skipAtCommit = false
+          }
+          if (commit > saved) {
+            addSegment.run(key, saved, commit, rangeHash(fd, saved, commit))
+            save.run(
+              key,
+              identity,
+              commit,
+              checkpointHash(fd, commit),
+              Number(skipAtCommit),
+              JSON.stringify(state),
+            )
+            saved = commit
+            saveVersion.run(key, fileVersion(stat))
+          }
+          // An external writer can run while synchronous row decoding performs Git or filesystem I/O.
+          if (
+            fileVersion(stat) !== fileVersion(fstatSync(fd, { bigint: true }))
+          )
+            throw changedDuringParse
+        })
+      } catch (error) {
+        if (error !== changedDuringParse) throw error
+        await retry()
+        return
+      }
+      report.oversized += counts.oversized
+      report.malformed += counts.malformed
+      report.unverified += counts.unverified
+      report.mirrors += counts.mirrors
+      offset += received
     }
   } finally {
     closeSync(fd)

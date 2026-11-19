@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { decodeCards } from './hooks.js'
 import {
+  boundedGatewayStatus,
   isObject,
   listenGateway,
   type ObjectValue,
@@ -183,9 +184,18 @@ export async function startService(
         for (const effect of coordinator.takeEffects()) {
           if (closing) return
           try {
+            if (effect.kind === 'review-updated') {
+              refreshRetainedDigest(effect.id)
+              continue
+            }
             if (effect.kind === 'invitation') {
               visibleInvitation = effect.id
-              nativeStatus = await ui.invite(effect.id)
+              const result = await ui.invite(effect.id)
+              nativeStatus = result
+              if (result.status === 'unavailable')
+                options.log(
+                  'The break invitation could not be displayed. Check the native helper with openclaw break-delegate status.',
+                )
             } else {
               visibleInvitation = undefined
             }
@@ -658,11 +668,11 @@ export async function startService(
     if (!ready || closing) throw Error('Gateway is starting.')
     switch (r.op) {
       case 'status':
-        return {
+        return boundedGatewayStatus({
           supervision: coordinator.status(),
           native: nativeStatus,
           history: lastImport,
-        }
+        })
       case 'review-page':
         return coordinator.reviewPage({
           breakId: typeof r.breakId === 'string' ? r.breakId : undefined,
@@ -744,6 +754,38 @@ export async function startService(
     return task
   })
   let openedDatabase: DatabaseSync | undefined
+  let openedUi: NativeUi | undefined
+  let timer: NodeJS.Timeout | undefined
+  function refresh(): void {
+    if (closing) return
+    tick()
+    if (now() - lastImportAt >= 300000) void refreshHistory()
+    // Wall-clock deadlines and native reviews continue while a provider is slow.
+    if (!polling)
+      void refreshActivity()
+        .then(() => {
+          if (!closing) tick()
+        })
+        .catch(() =>
+          options.log('The latest workload sample could not be recorded.'),
+        )
+  }
+  async function stop() {
+    closing = true
+    ready = false
+    stopSignal.abort()
+    if (timer) clearInterval(timer)
+    try {
+      await closeSocket()
+    } finally {
+      try {
+        openedUi?.close()
+      } finally {
+        await Promise.allSettled([polling, importing, effectsTask, ...requests])
+        openedDatabase?.close()
+      }
+    }
+  }
   try {
     const dbPath = join(options.directory, 'state.sqlite')
     closeSync(openSync(dbPath, 'a', 0o600))
@@ -775,7 +817,7 @@ export async function startService(
     }
     coordinator = new Supervision(db, { ...options.workload, now })
     preferences = new PreferenceStore(db)
-    ui = (options.nativeFactory ?? createNativeBreakUi)(
+    ui = openedUi = (options.nativeFactory ?? createNativeBreakUi)(
       async (action) => {
         if (closing) return
         // Freeze the known session set as soon as the native callback arrives.
@@ -794,43 +836,26 @@ export async function startService(
       { profileDirectory: options.directory },
     )
     ready = true
+    refresh()
+    void ui
+      .status()
+      .then((v) => {
+        nativeStatus = v
+      })
+      .catch(() => {
+        nativeStatus = { status: 'unavailable' }
+      })
+    timer = setInterval(() => {
+      try {
+        refresh()
+      } catch {
+        options.log('The workload clock could not update.')
+      }
+    }, options.tickMs ?? 15000)
+    timer.unref()
   } catch (err) {
-    try {
-      await closeSocket()
-    } finally {
-      openedDatabase?.close()
-    }
+    await stop()
     throw err
   }
-  const refresh = () => {
-    if (closing) return
-    tick()
-    if (now() - lastImportAt >= 300000) void refreshHistory()
-    // Wall-clock deadlines and native reviews continue while a provider is slow.
-    if (!polling)
-      void refreshActivity().then(() => {
-        if (!closing) tick()
-      })
-  }
-  void ui
-    .status()
-    .then((v) => {
-      nativeStatus = v
-    })
-    .catch(() => {
-      nativeStatus = { status: 'unavailable' }
-    })
-  refresh()
-  const timer = setInterval(refresh, options.tickMs ?? 15000)
-  timer.unref()
-  return async () => {
-    closing = true
-    ready = false
-    stopSignal.abort()
-    clearInterval(timer)
-    await closeSocket()
-    ui.close()
-    await Promise.allSettled([polling, importing, effectsTask, ...requests])
-    db.close()
-  }
+  return stop
 }

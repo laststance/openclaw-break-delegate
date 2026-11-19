@@ -34,6 +34,8 @@ await Promise.all(
 execFileSync('/usr/bin/git', ['init', '-q', cwd])
 const cliVersion = execFileSync(claude, ['--version'], {
   encoding: 'utf8',
+  timeout: 5000,
+  killSignal: 'SIGKILL',
 }).trim()
 const sessionId = randomUUID()
 const tool = 'toolu_fixture_break_delegate_01'
@@ -288,15 +290,25 @@ const terminal = spawn(
   [driver, run, claude, sessionId, address, fakeKey],
   { stdio: ['ignore', 'ignore', 'inherit'] },
 )
-const terminalEnded = once(terminal, 'close')
+// Observe startup errors immediately. ChildProcess emits close even when its executable cannot launch.
+let launchError
+terminal.once('error', (error) => {
+  launchError = error
+})
+const terminalEnded = new Promise((done) =>
+  terminal.once('close', (...result) => done(result)),
+)
 try {
+  await once(terminal, 'spawn')
   const transcriptFolder = join(config, 'projects')
   const until = Date.now() + 55_000
   while (
     Date.now() < until &&
     !evidence.transcriptCompleted &&
     !evidence.error &&
-    terminal.exitCode === null
+    terminal.exitCode === null &&
+    terminal.signalCode === null &&
+    !launchError
   ) {
     if (evidence.continuation) {
       const paths = await readdir(transcriptFolder, { recursive: true }).catch(
@@ -389,7 +401,8 @@ try {
         terminal.kill('SIGKILL')
         exited = await waitForExit(2000)
       }
-      assert.equal(exited?.[0], 0, 'The isolated PTY did not exit cleanly.')
+      if (!launchError)
+        assert.equal(exited?.[0], 0, 'The isolated PTY did not exit cleanly.')
     } finally {
       try {
         const closed = new Promise((done) => server.close(done))

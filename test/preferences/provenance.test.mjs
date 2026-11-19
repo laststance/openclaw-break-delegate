@@ -11,7 +11,7 @@ import {
   chmodSync,
 } from 'node:fs'
 import { fixtureGit } from './git-fixture.mjs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { DatabaseSync } from 'node:sqlite'
 import {
@@ -809,7 +809,7 @@ test('a late anonymous receipt cannot certify either of two existing candidates,
 
 test('a history rewritten and regrown during a yielded import replays the replacement prefix and resumes at its correct end', async (t) => {
   // Arrange
-  const { store, repo, file, codex } = fixture(t)
+  const { store, repo, file, codex, db } = fixture(t)
   const pad = { type: 'padding', value: 'X'.repeat(145000) }
   const leading = { type: 'padding', value: 'same prefix '.repeat(36) }
   const rows = (id, questions) =>
@@ -823,7 +823,16 @@ test('a history rewritten and regrown during a yielded import replays the replac
     ]
       .map((r) => JSON.stringify(r))
       .join('\n') + '\n'
-  writeFileSync(file, rows('original', []))
+  writeFileSync(
+    file,
+    rows('original', [
+      typed('obsolete-task', 'Never change the code.', 1, {
+        prompt_source: 'typed',
+      }),
+      ask('obsolete-choice'),
+      reply('obsolete-choice'),
+    ]),
+  )
   const replacing = rows('replacement', [
     ask('from-prefix'),
     reply('from-prefix'),
@@ -842,6 +851,14 @@ test('a history rewritten and regrown during a yielded import replays the replac
 
   // Assert
   assert.equal(first.observations, 1)
+  assert.equal(
+    db
+      .prepare(
+        "SELECT count(*) AS n FROM pref_constraints WHERE session='original'",
+      )
+      .get().n,
+    0,
+  )
   assert.equal(first.unreadable, 0)
   assert.deepEqual(
     store.humanResponsesSince(0).map((r) => [r.sessionId, r.responseId]),
@@ -1164,7 +1181,7 @@ test('corrected middle rows with identical size and endpoint anchors retract ear
 
 test('a gateway task can run during validation of an append-only multi-megabyte prefix and a concurrent rewrite invalidates that validation', async (t) => {
   // Arrange
-  const { store, codex, file } = fixture(t)
+  const { store, codex, file, db } = fixture(t)
   append(file, [
     ask('watched'),
     reply('watched', { timed_out: false }),
@@ -1174,18 +1191,32 @@ test('a gateway task can run during validation of an append-only multi-megabyte 
     })),
   ])
   await store.importHistory({ codex })
+  const committedBytes = readFileSync(file).length
   append(file, [{ type: 'append' }])
-  let ticks = 0,
-    done = false
-  const pulse = () => {
-    if (!done) {
-      ticks++
-      setImmediate(pulse)
+  const progress = []
+  const prepare = db.prepare.bind(db)
+  const probe = t.mock.method(db, 'prepare', (sql) => {
+    const statement = prepare(sql)
+    if (sql.includes('SELECT start,stop,hash FROM pref_file_segments')) {
+      const get = statement.get.bind(statement)
+      t.mock.method(statement, 'get', (...args) => {
+        const segment = get(...args)
+        if (segment?.start === 0) {
+          progress.push('first segment')
+          setImmediate(() => progress.push('gateway callback'))
+        }
+        if (segment?.stop === committedBytes) progress.push('last segment')
+        return segment
+      })
     }
+    return statement
+  })
+  let resumed
+  try {
+    resumed = await store.importHistory({ codex })
+  } finally {
+    probe.mock.restore()
   }
-  setImmediate(pulse)
-  const resumed = await store.importHistory({ codex })
-  done = true
   const original = readFileSync(file, 'utf8')
   append(file, [{ type: 'append-two' }])
   const scanning = store.importHistory({ codex })
@@ -1202,7 +1233,11 @@ test('a gateway task can run during validation of an append-only multi-megabyte 
   const revised = await scanning
 
   // Assert
-  assert.ok(ticks >= 10)
+  assert.deepEqual(progress, [
+    'first segment',
+    'gateway callback',
+    'last segment',
+  ])
   assert.equal(resumed.bytesRead, Buffer.byteLength('{"type":"append"}\n'))
   assert.equal(revised.observations, 0)
   assert.deepEqual(
@@ -1267,4 +1302,277 @@ test('Git variables and a rejecting developer hook cannot redirect a fixture com
   assert.equal(existsSync(join(repo, '.git', ref)), true)
   assert.equal(existsSync(join(inherited, '.git', ref)), false)
   assert.equal(existsSync(marker), false)
+  assert.throws(
+    () => fixtureGit(root, repo, ['not-a-git-fixture-command']),
+    (err) => err.stderr.toString().includes('not-a-git-fixture-command'),
+  )
+})
+
+test('upgrading an absent legacy transcript removes fallback-only selections and preserves the independently validated choice', async (t) => {
+  // Arrange
+  const { store, codex, file, db, repo } = fixture(t)
+  append(join(codex, 'history.jsonl'), [receipt(400), receipt(5400)])
+  append(file, [
+    question('weak', 100),
+    typed(undefined, 'A', 400),
+    question('strong', 5100),
+    typed(undefined, 'A', 5400),
+    question('strong', 5100),
+    typed('independent', 'A', 5600, { prompt_source: 'typed' }),
+  ])
+  const before = await store.importHistory({ codex })
+  // Recreate the unscoped response IDs present immediately before the earlier migration.
+  db.exec(`UPDATE pref_typed_candidates SET response_id='typed:abcd:'||at;
+    UPDATE pref_responses SET response_id='typed:abcd:'||at WHERE response_id LIKE 'typed:q:%';
+    DELETE FROM pref_decoder_versions WHERE version='language-target-and-typed-question-v1';`)
+  rmSync(file)
+
+  // Act
+  const restarted = new PreferenceStore(db)
+  const migrated = await restarted.importHistory({ codex })
+  // Recreate the orphan left by an installation that had already run the older migration.
+  db.prepare(
+    "UPDATE pref_offers SET selected='current-change',answered=? WHERE asked=?",
+  ).run(base + 400, base + 100)
+  db.exec(
+    "DELETE FROM pref_decoder_versions WHERE version='orphaned-typed-selection-v1'",
+  )
+  const repaired = new PreferenceStore(db).replay()
+
+  // Assert
+  assert.equal(before.observations, 2)
+  assert.equal(migrated.observations, 1)
+  assert.equal(repaired.observations, 1)
+  assert.equal(
+    restarted.evaluate(card, { cwd: repo, now: base + 5500 }).summary
+      .currentTotal,
+    0,
+  )
+  assert.equal(
+    restarted.evaluate(card, { cwd: repo, now: base + 5700 }).summary
+      .currentTotal,
+    1,
+  )
+  assert.deepEqual(
+    restarted.humanResponsesSince(0).map((r) => r.responseId),
+    ['prompt:independent'],
+  )
+})
+
+test('a second nearby same-text receipt with a different or missing submission identity withdraws a formerly unique anonymous answer', async (t) => {
+  // Arrange
+  const { store, codex, file } = fixture(t)
+  append(file, [question('one', 100), typed(undefined, 'A', 250)])
+  append(join(codex, 'history.jsonl'), [receipt(200)])
+  const unique = await store.importHistory({ codex })
+  append(join(codex, 'history.jsonl'), [receipt(300, 'explicit-but-distinct')])
+
+  // Act
+  const ambiguous = await store.importHistory({ codex })
+
+  // Assert
+  assert.equal(unique.observations, 1)
+  assert.equal(ambiguous.observations, 0)
+  assert.deepEqual(store.humanResponsesSince(0), [])
+})
+
+test('one language instruction can constrain both documents and chat, and chat-only instructions leave documents eligible', (t) => {
+  // Arrange
+  const { store, repo } = fixture(t)
+  const options = [{ label: 'English' }, { label: 'Japanese' }]
+  const docs = {
+    question: 'Which language should we use for documentation?',
+    options,
+  }
+  const chat = { question: 'Which language should we use in chat?', options }
+  for (const [name, kind] of [
+    ['docs', docs],
+    ['chat', chat],
+  ]) {
+    for (let i = 0; i < 25; i++)
+      store.recordHumanSelection({
+        source: 'claude',
+        sessionId: 'training',
+        toolUseId: name + i,
+        cwd: repo,
+        card: kind,
+        label: 'English',
+        askedAt: base + i * 20,
+        answeredAt: base + i * 20 + 1,
+      })
+  }
+  store.replay()
+  const evaluate = (kind, sessionId) =>
+    store.evaluate(kind, {
+      cwd: repo,
+      session: { source: 'claude', sessionId },
+    })
+
+  // Act
+  store.recordInstruction(
+    'claude',
+    'both',
+    'Please use Japanese in documentation and chat',
+    base + 2000,
+  )
+  store.recordInstruction(
+    'claude',
+    'chat',
+    'Please use Japanese in chat',
+    base + 2000,
+  )
+  store.recordInstruction(
+    'claude',
+    'unknown',
+    'Please use Japanese on the boards',
+    base + 2000,
+  )
+
+  // Assert
+  assert.equal(evaluate(docs, 'both').reason, 'current-instructions')
+  assert.equal(evaluate(chat, 'both').reason, 'current-instructions')
+  assert.equal(evaluate(docs, 'chat').eligibleLabel, 'English')
+  assert.equal(evaluate(chat, 'chat').reason, 'current-instructions')
+  assert.equal(evaluate(docs, 'unknown').reason, 'current-instructions')
+  assert.equal(evaluate(chat, 'unknown').reason, 'current-instructions')
+})
+
+test('a native reply link retracts the nearest legacy attribution, credits its actual offer once and holds an unresolved target', async (t) => {
+  // Arrange
+  const { store, codex, file, repo } = fixture(t)
+  const mirror = (client, target, t) =>
+    native(
+      {
+        type: 'UserMessage',
+        id: client,
+        client_id: client,
+        reply_to: target,
+        content: [{ type: 'text', text: 'A' }],
+      },
+      t,
+    )
+  const reversed = brief.replace(
+    'A) Fix in this PR\nB) Open a separate issue',
+    'A) Open a separate issue\nB) Fix in this PR',
+  )
+  append(join(codex, 'history.jsonl'), [
+    receipt(400),
+    receipt(5400),
+    receipt(10400),
+  ])
+  append(file, [
+    question('actual', 100, reversed),
+    question('inferred', 300),
+    typed('linked', 'A', 400),
+  ])
+  const early = await store.importHistory({ codex })
+  append(file, [
+    mirror('linked', 'actual', 410),
+    question('unknown', 5300),
+    typed('unresolved', 'A', 5400),
+    mirror('unresolved', 'missing-target', 5410),
+    question('right', 10300),
+    typed('same', 'A', 10400),
+    mirror('same', 'right', 10410),
+  ])
+
+  // Act
+  const final = await store.importHistory({ codex })
+
+  // Assert
+  assert.equal(early.observations, 1)
+  assert.equal(final.observations, 2)
+  assert.deepEqual(store.evaluate(card, { cwd: repo }).summary.choices, [
+    { meaning: 'current-change', current: 1, other: 0 },
+    { meaning: 'separate-issue', current: 1, other: 0 },
+  ])
+  assert.deepEqual(
+    store.humanResponsesSince(0).map((r) => r.responseId),
+    ['prompt:linked', 'prompt:same'],
+  )
+})
+
+test('Git URL aliases match their expanded history, generic services stay separate and GitHub keeps its historical repository key', (t) => {
+  // Arrange
+  const { repo } = fixture(t)
+  const root = dirname(repo)
+  fixtureGit(root, repo, [
+    'config',
+    'url.https://github.com/fixture-org/.insteadOf',
+    'work:',
+  ])
+  fixtureGit(root, repo, ['remote', 'add', 'origin', 'work:example.git'])
+
+  // Act
+  const alias = canonicalRepository(repo)
+  const reported = canonicalRepository(
+    '',
+    'https://github.com/fixture-org/example.git',
+  )
+  const generic = ['http', 'https', 'git'].map((s) =>
+    canonicalRepository('', s + '://git.example/team/app'),
+  )
+
+  // Assert
+  assert.equal(alias, reported)
+  assert.equal(
+    alias,
+    'remote:8a505d0ce3631dad53fc8b996c703bf58644be2c050095b09efe3cef6b3a7126',
+  )
+  assert.equal(
+    alias,
+    canonicalRepository('', 'git@github.com:Fixture-Org/Example.git'),
+  )
+  assert.equal(new Set(generic).size, 3)
+  assert.ok(generic.every((value) => value?.startsWith('remote:')))
+})
+
+test('a history rewrite during synchronous decoding rolls back the obsolete instruction and its cursor together', async (t) => {
+  // Arrange
+  const { store, codex, file, db, repo } = fixture(t)
+  append(file, [
+    typed('old', 'Never change the code.', 1, { prompt_source: 'typed' }),
+    ask('obsolete'),
+    reply('obsolete'),
+  ])
+  const metadata = event('session_meta', {
+    id: 'root',
+    source: 'cli',
+    cwd: repo,
+  })
+  const replacement =
+    [metadata, ask('replacement'), reply('replacement')]
+      .map((row) => JSON.stringify(row))
+      .join('\n') + '\n'
+  let changed = false
+  const prepare = db.prepare.bind(db)
+  const probe = t.mock.method(db, 'prepare', (sql) => {
+    if (!changed && sql.includes('INSERT OR IGNORE INTO pref_constraints')) {
+      changed = true
+      writeFileSync(file, replacement)
+    }
+    return prepare(sql)
+  })
+
+  // Act
+  const scanned = await store.importHistory({ codex })
+  probe.mock.restore()
+  const again = await store.importHistory({ codex })
+
+  // Assert
+  assert.equal(changed, true)
+  assert.equal(scanned.observations, 1)
+  assert.deepEqual(
+    store.humanResponsesSince(0).map((r) => r.responseId),
+    ['tool:replacement'],
+  )
+  assert.equal(
+    db
+      .prepare(
+        "SELECT count(*) AS n FROM pref_constraints WHERE session='root'",
+      )
+      .get().n,
+    0,
+  )
+  assert.equal(again.bytesRead, 0)
 })

@@ -23,7 +23,11 @@ import fs, {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { configureHooks } from '../dist/settings.js'
-import { listenGateway, requestGateway } from '../dist/ipc.js'
+import {
+  boundedGatewayStatus,
+  listenGateway,
+  requestGateway,
+} from '../dist/ipc.js'
 import { nativeHelperExecutable } from '../dist/native/index.js'
 
 const exchangeHelper = process.env.BREAK_DELEGATE_NATIVE_OUTPUT
@@ -433,7 +437,7 @@ test('a competing settings save remains active and its displaced revision is rec
 })
 
 test(
-  'the packaged macOS exchange restores a concurrent editor save and preserves the proposed hooks',
+  'macOS settings conflicts retain the exact displaced edit and leave subsequent saves in place',
   {
     skip: process.platform !== 'darwin',
     timeout: 90_000,
@@ -444,8 +448,11 @@ test(
     t.after(() => rm(root, { recursive: true, force: true }))
     const file = join(root, 'settings.json')
     const backupDir = file + '.break-delegate-backups'
+    const second = join(root, 'second.json')
     const competing = '{"theme":"light","language":"ja"}'
+    const newest = '{"theme":"system","language":"en"}'
     await writeFile(file, '{"theme":"dark"}')
+    await writeFile(second, '{"theme":"dark"}')
     let exchanges = 0
     const run = childProcess.spawnSync
     let candidate = exchangeHelper
@@ -475,8 +482,12 @@ test(
       (path, args, options) => {
         assert.equal(path, nativeHelperExecutable)
         assert.equal(args[0], '--exchange-settings')
-        if (exchanges++ === 0) writeFileSync(file, competing)
-        return run(candidate, args, options)
+        exchanges++
+        // Both editors save before publication. The second editor also saves again immediately afterwards.
+        writeFileSync(args[1], competing)
+        const result = run(candidate, args, options)
+        if (args[1].endsWith('/second.json')) writeFileSync(args[1], newest)
+        return result
       },
     )
     syncBuiltinESMExports()
@@ -485,6 +496,10 @@ test(
     try {
       await assert.rejects(
         configureHooks('install', root, file),
+        /preserved revision/,
+      )
+      await assert.rejects(
+        configureHooks('install', root, second),
         /preserved revision/,
       )
     } finally {
@@ -499,9 +514,59 @@ test(
 
     // Assert
     assert.equal(exchanges, 2)
-    assert.equal(await readFile(file, 'utf8'), competing)
-    assert.equal(snapshots.length, 1)
-    assert.equal(snapshots[0].theme, 'dark')
-    assert.equal(snapshots[0].hooks.UserPromptSubmit.length, 1)
+    assert.equal(
+      JSON.parse(await readFile(file, 'utf8')).hooks.UserPromptSubmit.length,
+      1,
+    )
+    assert.equal(await readFile(second, 'utf8'), newest)
+    assert.deepEqual(snapshots, [{ theme: 'light', language: 'ja' }])
+    const secondBackups = second + '.break-delegate-backups'
+    const [displaced] = await readdir(secondBackups)
+    assert.equal(
+      await readFile(join(secondBackups, displaced), 'utf8'),
+      competing,
+    )
   },
 )
+
+test('large Gateway status reports whole session rows and the omitted count within one UTF-8 frame', async (t) => {
+  // Arrange
+  const profile = await mkdtemp(join(tmpdir(), 'bd-bounded-status-'))
+  t.after(() => rm(profile, { recursive: true, force: true }))
+  const sessions = ['first', 'second', 'third', 'fourth'].map((id) => ({
+    id,
+    detail: '界'.repeat(40_000),
+  }))
+  const close = await listenGateway(profile, async ({ op }) =>
+    op === 'status'
+      ? boundedGatewayStatus({
+          supervision: { score: 42, sessions },
+          native: { status: 'authorized' },
+          history: null,
+        })
+      : 'x'.repeat(256 * 1024),
+  )
+  t.after(close)
+
+  // Act
+  const result = await requestGateway(profile, { op: 'status' })
+  await assert.rejects(
+    requestGateway(profile, { op: 'oversize' }),
+    /could not fit in an IPC frame/,
+  )
+
+  // Assert
+  assert.deepEqual(
+    result.supervision.sessions.map(({ id }) => id),
+    ['first', 'second'],
+  )
+  assert.equal(result.supervision.sessionsOmitted, 2)
+  assert.equal(result.supervision.score, 42)
+  assert.equal(result.native.status, 'authorized')
+  assert.equal(result.supervision.sessions[1].detail.length, 40_000)
+  assert.ok(
+    Buffer.byteLength(JSON.stringify({ ok: true, value: result }) + '\n') <=
+      256 * 1024,
+  )
+  assert.equal(sessions.length, 4)
+})

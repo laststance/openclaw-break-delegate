@@ -120,7 +120,14 @@ interface Request {
 interface Turn {
   state: Activity
   pending: Map<string, Request | null>
-  calls: Map<string, { kind: 'question' | 'other' | 'marked'; at: number }>
+  calls: Map<
+    string,
+    {
+      kind:
+        'question' | 'completed' | 'other' | 'unidentified-result' | 'marked'
+      at: number
+    }
+  >
   nextPruneAt: number
   previousQuestion?: { id: string; text: string }
 }
@@ -260,15 +267,25 @@ function applyEvent(
     ...envelopes: Json[]
   ) => {
     turn.previousQuestion = undefined
-    const marked = turn.calls.get(id)?.kind === 'marked'
+    const known = turn.calls.get(id)?.kind
+    const marked = known === 'marked'
+    // Offers can be mirrored after the provider's final result. Keep provenance without recreating a wait.
+    if (known === 'completed' || known === 'unidentified-result' || marked) {
+      if (
+        marked ||
+        automaticCodexRequest(args ?? {}, value, payload, ...envelopes)
+      )
+        record('tool:' + id, true)
+      turn.calls.set(id, { kind: 'completed', at })
+      return
+    }
     turn.calls.set(id, { kind: 'question', at })
     if (!args) {
-      if (marked || [value, payload, ...envelopes].some(automaticCodexRecord))
+      if ([value, payload, ...envelopes].some(automaticCodexRecord))
         record('tool:' + id, true)
       return
     }
     const request = requestFor(args, value, payload, ...envelopes)
-    request.automatic ||= marked
     const previous = turn.pending.get(id)
     // The app-server may report an automatic choice on another envelope for the same call.
     if (previous) {
@@ -289,7 +306,11 @@ function applyEvent(
     const request = turn.pending.get(id)
     const known = turn.calls.get(id)?.kind
     if (complete) turn.pending.delete(id)
-    const question = namedQuestion || !!request || known === 'question'
+    const question =
+      namedQuestion ||
+      !!request ||
+      known === 'question' ||
+      known === 'completed'
     if (!question && (known === 'other' || !couldBeCodexQuestionResult(raw)))
       return
     const { output, automatic } = readCodexResult(
@@ -300,10 +321,18 @@ function applyEvent(
     )
     if (!question) {
       // An unnamed answer can precede its offer. Only a later question identity confirms this exclusion.
-      if (automatic) turn.calls.set(id, { kind: 'marked', at })
+      if (automatic || complete)
+        turn.calls.set(id, {
+          kind:
+            automatic || known === 'marked' ? 'marked' : 'unidentified-result',
+          at,
+        })
       return
     }
-    turn.calls.set(id, { kind: 'question', at })
+    turn.calls.set(id, {
+      kind: complete || known === 'completed' ? 'completed' : 'question',
+      at,
+    })
     // A late marked mirror excludes the same call even after its pending request has closed.
     if (automatic || request?.automatic) record('tool:' + id, true)
     else if (complete && request && selectionsMatch(request, output))

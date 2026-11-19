@@ -546,3 +546,29 @@ test('SessionEnd retires only live held cards and approvals in the exiting incar
     'resolved',
   )
 })
+
+test('resolving an old held question refreshes only its retained break review and leaves the current invitation intact', (t) => {
+  // Arrange
+  const { s, context, start, advance } = setup(t),
+    old = start()
+  s.question({ ...context, questionId: 'held', question: 'Which?' })
+  s.hold(context.sessionId, 'held', 'Person needed')
+  s.action(old, 'return')
+  assert.deepEqual(s.takeEffects(), [{ kind: 'digest', id: old }])
+  advance()
+  s.humanReply({
+    provider: 'claude',
+    sessionId: 'terminal',
+    responseId: 'prompt:new',
+  })
+  const [invitation] = s.takeEffects()
+  assert.equal(invitation.kind, 'invitation')
+  // Act
+  s.resolveQuestion(context.sessionId, 'held', 'failed')
+  // Assert
+  assert.deepEqual(s.takeEffects(), [{ kind: 'review-updated', id: old }])
+  assert.equal(s.status().invitationId, invitation.id)
+  assert.equal(s.review(old)[0].outcome, 'resolved')
+  s.resolveQuestion(context.sessionId, 'held')
+  assert.deepEqual(s.takeEffects(), [])
+})

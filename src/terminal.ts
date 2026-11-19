@@ -24,7 +24,12 @@ export function claudeTerminal(): string | undefined {
           '-o',
           'comm=',
         ],
-        { encoding: 'utf8', timeout: 800, maxBuffer: 64_000 },
+        {
+          env: { TZ: 'UTC0', LC_ALL: 'C' },
+          encoding: 'utf8',
+          timeout: 800,
+          maxBuffer: 64_000,
+        },
       ).trim()
       const match = fields.match(
         /^(\d+)\s+(\S+)\s+(\S+\s+\S+\s+\d+\s+\S+\s+\d{4})\s+(.+)$/,
@@ -44,10 +49,11 @@ export function claudeTerminal(): string | undefined {
           },
         ).trim()
         if (mode === 'headless') return
-        if (mode === 'interactive')
-          return tty === '??' || tty === '?'
-            ? undefined
-            : pid + ':' + started.replace(/\s+/g, ' ')
+        if (mode === 'interactive') {
+          const startedAt = Date.parse(started + ' GMT')
+          if (tty === '??' || tty === '?' || !Number.isFinite(startedAt)) return
+          return pid + ':' + Math.floor(startedAt / 1000)
+        }
       }
       pid = Number(parent)
     } catch {

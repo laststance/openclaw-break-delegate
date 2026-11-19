@@ -13,6 +13,6 @@ export function fixtureGit(root, cwd, args) {
   )
   execFileSync('git', ['-c', 'core.hooksPath=' + hooks, '-C', cwd, ...args], {
     env: { ...env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' },
-    stdio: 'ignore',
+    stdio: ['ignore', 'ignore', 'pipe'],
   })
 }

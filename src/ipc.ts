@@ -18,6 +18,36 @@ import {
 const maxFrame = 256 * 1024
 export type ObjectValue = Record<string, unknown>
 
+/** Keep the CLI status within one authenticated response, reporting how many session rows did not fit.
+ * @example
+ * const response = boundedGatewayStatus({ supervision: coordinator.status(), native, history });
+ */
+export function boundedGatewayStatus<
+  T extends { supervision: { sessions: readonly object[] } },
+>(status: T) {
+  const source = status.supervision.sessions
+  const sessions: object[] = []
+  const supervision = {
+    ...status.supervision,
+    sessions,
+    sessionsOmitted: source.length,
+  }
+  const result = { ...status, supervision }
+  // Reserve the envelope, delimiter and largest possible omission count before admitting rows.
+  let available =
+    maxFrame -
+    Buffer.byteLength(JSON.stringify({ ok: true, value: result }) + '\n')
+  for (const session of source) {
+    const cost =
+      Buffer.byteLength(JSON.stringify(session)) + (sessions.length ? 1 : 0)
+    if (cost > available) break
+    sessions.push(session)
+    available -= cost
+  }
+  supervision.sessionsOmitted -= sessions.length
+  return result
+}
+
 /** Identify a JSON object before reading external hook or socket data.
  * @example
  * if (isObject(value)) console.log(Object.keys(value));
@@ -166,8 +196,19 @@ export async function listenGateway(
           socket.setTimeout(190000)
         void handler(msg, ctx).then(
           (value) => {
-            if (ctx.connected())
-              socket.end(JSON.stringify({ ok: true, value }) + '\n')
+            if (!ctx.connected()) return
+            try {
+              const frame = JSON.stringify({ ok: true, value }) + '\n'
+              if (Buffer.byteLength(frame) <= maxFrame) {
+                socket.end(frame)
+                return
+              }
+            } catch {
+              // Serialization failures and oversized responses receive a bounded diagnostic.
+            }
+            socket.end(
+              '{"ok":false,"error":"Local response could not fit in an IPC frame."}\n',
+            )
           },
           () => {
             if (ctx.connected())
