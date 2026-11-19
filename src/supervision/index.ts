@@ -17,3 +17,7 @@ export type {
   Provider,
   SessionView,
 } from './workload.js'
+
+export { toolInputFingerprint } from './execution.js'
+export type { ExecutionObservation } from './execution.js'
+export type { ReviewPage, ReviewQuery } from './review.js'

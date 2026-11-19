@@ -3,8 +3,10 @@ import { homedir } from 'node:os'
 import { join, relative, isAbsolute } from 'node:path'
 import { isObject, requestGateway, type ObjectValue } from './ipc.js'
 import { claudeTerminal } from './terminal.js'
+import { toolInputFingerprint } from './supervision/index.js'
 import {
   normalizeQuestionCard,
+  hasAnswerNotes,
   type QuestionCard,
 } from './preferences/index.js'
 
@@ -140,11 +142,32 @@ export async function runHook(
       const prior = previousQuestion(rows, sessionId, body.prompt_id)
       await requestGateway(directory, {
         ...common,
-        prompt: body.prompt.slice(0, 16000),
+        prompt: body.prompt.slice(0, 16_384),
+        truncated: body.prompt.length > 16_384,
         replyTo: prior,
         clientId:
           typeof body.prompt_id === 'string' ? body.prompt_id : undefined,
       })
+      return
+    }
+    const event = body.hook_event_name
+    if (
+      (event === 'PermissionRequest' && body.tool_name !== 'AskUserQuestion') ||
+      (body.tool_name !== 'AskUserQuestion' &&
+        ['PreToolUse', 'PostToolUse', 'PostToolUseFailure'].includes(event))
+    ) {
+      if (typeof body.tool_name !== 'string') return
+      // For execution events only the tool identity and an opaque fingerprint leave the hook.
+      await requestGateway(
+        directory,
+        {
+          ...common,
+          questionId,
+          toolName: body.tool_name,
+          fingerprint: toolInputFingerprint(body.tool_input),
+        },
+        1800,
+      )
       return
     }
     if (
@@ -195,6 +218,9 @@ export async function runHook(
           questionId,
           ...surface,
           answers: cards ? result.answers : undefined,
+          conditional: cards
+            ?.filter((c) => hasAnswerNotes(result.annotations, c.question))
+            .map((c) => c.question),
           selected:
             !cards &&
             isObject(result.answers) &&
@@ -212,7 +238,9 @@ export async function runHook(
         !cards ||
         !isObject(v) ||
         !isObject(v.answers) ||
-        typeof v.receipt !== 'string'
+        typeof v.receipt !== 'string' ||
+        typeof v.deliverBefore !== 'number' ||
+        !Number.isFinite(v.deliverBefore)
       )
         return
       const answers = v.answers
@@ -222,6 +250,20 @@ export async function runHook(
         )
       )
         return
+      // Recheck consent on the live Gateway and the absolute deadline after a paused or sleeping hook resumes.
+      const live = await requestGateway(
+        directory,
+        { op: 'can-deliver', receipt: v.receipt },
+        1200,
+      )
+      if (live !== true || Date.now() >= v.deliverBefore) {
+        await requestGateway(
+          directory,
+          { op: 'undelivered', receipt: v.receipt },
+          1200,
+        )
+        return
+      }
       await output(
         JSON.stringify({
           hookSpecificOutput: {
@@ -244,7 +286,17 @@ export async function runHook(
         : typeof body.source === 'string'
           ? body.source
           : undefined
-    await requestGateway(directory, { ...common, questionId, reason }, 1800)
+    await requestGateway(
+      directory,
+      {
+        ...common,
+        questionId,
+        reason,
+        toolName:
+          typeof body.tool_name === 'string' ? body.tool_name : undefined,
+      },
+      1800,
+    )
   } catch {
     /* Claude can still present its original question when the delegate is unavailable. */
   }

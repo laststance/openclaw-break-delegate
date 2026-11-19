@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { startService } from '../dist/service.js'
+import { requestReview } from '../dist/commands.js'
 import { runHook } from '../dist/hooks.js'
 import { requestGateway } from '../dist/ipc.js'
 import { PreferenceStore } from '../dist/preferences/index.js'
@@ -57,6 +58,7 @@ test('an accepted break answers the original Claude card once and keeps its repl
   db.close()
   let onAction, invite, active
   let seeded = false
+  let supersede = false
   const pass = async () => ({ status: 'authorized' })
   const stop = await startService({
     directory,
@@ -67,6 +69,16 @@ test('an accepted break answers the original Claude card once and keeps its repl
     judge: async (payload) => {
       assert.equal(payload[0].candidate, 'Fix in this PR')
       assert.equal(payload[0].header, 'Bug')
+      if (supersede) {
+        const updates = new DatabaseSync(join(directory, 'state.sqlite'))
+        new PreferenceStore(updates).recordInstruction(
+          'claude',
+          'terminal-A',
+          'Do not fix this bug in the current PR.',
+          now,
+        )
+        updates.close()
+      }
       assert.equal(JSON.stringify(payload).includes(cwd), false)
       return true
     },
@@ -156,10 +168,14 @@ test('an accepted break answers the original Claude card once and keeps its repl
     async (value) => sent.push(JSON.parse(value)),
     'instance-A',
   )
-  const review = await requestGateway(directory, {
-    op: 'review',
-    breakId: active,
-  })
+  supersede = true
+  await runHook(
+    directory,
+    { ...hook, tool_use_id: 'preference-changed' },
+    async (value) => sent.push(JSON.parse(value)),
+    'instance-A',
+  )
+  const review = await requestReview(directory, active)
   await requestGateway(directory, { op: 'return' })
   const state = await requestGateway(directory, { op: 'status' })
   // Assert
@@ -174,6 +190,10 @@ test('an accepted break answers the original Claude card once and keeps its repl
   )
   assert.equal(
     review.find((row) => row.questionId === 'preview-card')?.outcome,
+    'held',
+  )
+  assert.equal(
+    review.find((row) => row.questionId === 'preference-changed')?.outcome,
     'held',
   )
   assert.equal(state.supervision.activeBreakId, null)

@@ -10,6 +10,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import { startService } from '../dist/service.js'
 import { configureHooks } from '../dist/settings.js'
+import { requestReview } from '../dist/commands.js'
 import { requestGateway } from '../dist/ipc.js'
 import { PreferenceStore } from '../dist/preferences/index.js'
 
@@ -348,7 +349,7 @@ try {
       ).trim(),
     }
   }
-  evidence.review = await requestGateway(directory, { op: 'review', breakId })
+  evidence.review = await requestReview(directory, breakId)
   assert.ok(
     evidence.capturedTerminal &&
       evidence.judged &&

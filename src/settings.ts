@@ -19,9 +19,9 @@ const events = {
   SessionEnd: '',
   UserPromptSubmit: '',
   Stop: '',
-  PreToolUse: 'AskUserQuestion',
-  PostToolUse: 'AskUserQuestion',
-  PostToolUseFailure: 'AskUserQuestion',
+  PreToolUse: '',
+  PostToolUse: '',
+  PostToolUseFailure: '',
   PermissionRequest: '',
   Notification: 'idle_prompt|permission_prompt',
 }

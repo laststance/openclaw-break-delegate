@@ -1,5 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import type { DatabaseSync } from 'node:sqlite'
+import { ExecutionApprovals, type ExecutionObservation } from './execution.js'
+import { readReviewPage, type ReviewPage, type ReviewQuery } from './review.js'
 import {
   Workload,
   minute,
@@ -39,7 +41,8 @@ export interface NativeEffect {
   kind: 'invitation' | 'break' | 'digest'
   id: string
 }
-export type Outcome = 'held' | 'pending' | 'sent' | 'ambiguous' | 'human'
+export type Outcome =
+  'held' | 'pending' | 'sent' | 'ambiguous' | 'human' | 'resolved'
 export interface ReviewReceipt {
   sessionId: string
   questionId: string
@@ -76,7 +79,23 @@ interface Card {
   live: number
   candidate: string | null
   kind: 'choice' | 'approval'
-  disposition: 'open' | 'held' | 'human' | 'pending' | 'sent' | 'ambiguous'
+  disposition:
+    'open' | 'held' | 'human' | 'pending' | 'sent' | 'ambiguous' | 'resolved'
+}
+
+interface ReplyOrigin {
+  provider: Provider
+  sessionId: string
+  responseId: string
+  originId?: string
+}
+function replyKey(input: ReplyOrigin): string {
+  return createHash('sha256')
+    .update(
+      input.originId ??
+        [input.provider, input.sessionId, input.responseId].join(':'),
+    )
+    .digest('hex')
 }
 
 const schema = `
@@ -129,6 +148,7 @@ export class Supervision {
   readonly #breakMs: number
   readonly #snoozeMs: number
   readonly #invitationMs: number
+  readonly #approvals = new ExecutionApprovals()
   readonly #coverage = new Map<string, Coverage>()
   #lastAt: number
 
@@ -403,12 +423,13 @@ export class Supervision {
       )
         return false
       const responseId = questionId ? 'tool:' + questionId : input.responseId
-      const key = createHash('sha256')
-        .update(
-          input.originId ??
-            [input.provider, input.sessionId, responseId].join(':'),
-        )
-        .digest('hex')
+      const key = replyKey({ ...input, responseId })
+      if (
+        this.#db
+          .prepare('SELECT 1 FROM sv_replies WHERE id=? AND credited=-1')
+          .get(key)
+      )
+        return false
       const added = this.#db
         .prepare('INSERT OR IGNORE INTO sv_replies VALUES(?,?,?)')
         .run(key, at, this.#active() || at < this.#control().resetAt ? 0 : 1)
@@ -432,6 +453,117 @@ export class Supervision {
       this.#considerInvitation(now)
       return added.changes === 1
     })
+  }
+
+  /**
+   * Withdraw points when later provenance identifies an automated or mirrored response.
+   * A durable exclusion wins even when an importer repeats the event or arrives out of order.
+   * @example supervisor.retractHumanReply({provider:'codex',sessionId:'s',responseId:'tool:q'})
+   */
+  retractHumanReply(input: ReplyOrigin): void {
+    this.#transaction(() => {
+      const now = this.#now()
+      this.#advance(now)
+      const key = replyKey(input)
+      this.#db
+        .prepare(
+          'INSERT INTO sv_replies VALUES(?,?,-1) ON CONFLICT(id) DO UPDATE SET credited=-1',
+        )
+        .run(key, now)
+      if (input.provider === 'claude' && input.responseId.startsWith('tool:')) {
+        const id = input.responseId.slice(5)
+        this.#db
+          .prepare(
+            "UPDATE sv_questions SET disposition='resolved' WHERE sessionId=? AND questionId=? AND disposition='human'",
+          )
+          .run(input.sessionId, id)
+        this.#db
+          .prepare(
+            "UPDATE sv_reviews SET outcome='resolved',reason='Completed without a verified human answer' WHERE sessionId=? AND questionId=? AND outcome='human'",
+          )
+          .run(input.sessionId, id)
+      }
+      this.#considerInvitation(now)
+    })
+  }
+
+  /**
+   * Track a local Claude operation without granting permission or inferring a human reply.
+   * Original tool IDs win; an ID-less permission uses the exact terminal, tool and input fingerprint.
+   * @example supervisor.observeExecution({event:'PostToolUse',sessionId:'s',incarnation:'p',toolUseId:'t',toolName:'Bash'})
+   */
+  observeExecution(input: ExecutionObservation): boolean {
+    const now = this.#now(),
+      at = input.at ?? now
+    if (
+      !input.sessionId ||
+      !input.incarnation ||
+      !input.toolName ||
+      !Number.isFinite(at) ||
+      at > now
+    )
+      return false
+    const base = {
+      provider: 'claude' as const,
+      sessionId: input.sessionId,
+      incarnation: input.incarnation,
+      canDelegate: true,
+      at,
+    }
+    let currentTerminal = this.#work.claude(
+      input.sessionId,
+      input.incarnation,
+      now,
+    )
+    const isOpening =
+      input.event === 'PreToolUse' || input.event === 'PermissionRequest'
+    if (!currentTerminal && isOpening) {
+      this.observe({ ...base, status: 'running' })
+      currentTerminal = this.#work.claude(
+        input.sessionId,
+        input.incarnation,
+        now,
+      )
+    }
+    if (!currentTerminal) return false
+    if (input.event === 'PreToolUse' && input.toolUseId)
+      this.observe({
+        ...base,
+        status: currentTerminal.status === 'waiting' ? 'waiting' : 'running',
+      })
+    const match = this.#approvals.observe(currentTerminal.generation, input, at)
+    if (match.registered) {
+      if (this.#card(input.sessionId, match.registered)?.live === 0)
+        return false
+      this.observe({ ...base, status: 'waiting' })
+      this.question({
+        sessionId: input.sessionId,
+        questionId: match.registered,
+        incarnation: input.incarnation,
+        kind: 'approval',
+        question: 'Execution approval for ' + input.toolName,
+        openedAt: at,
+      })
+    }
+    if (match.completed.length) {
+      this.#transaction(() => {
+        for (const questionId of match.completed) {
+          this.#db
+            .prepare(
+              "UPDATE sv_questions SET live=0,disposition='resolved' WHERE sessionId=? AND questionId=? AND kind='approval' AND generation=?",
+            )
+            .run(input.sessionId, questionId, currentTerminal.generation)
+          this.#db
+            .prepare(
+              "UPDATE sv_reviews SET outcome='resolved',reason='Tool completed; the approval is no longer pending',at=? WHERE sessionId=? AND questionId=? AND outcome='held' AND breakId IN (SELECT id FROM sv_breaks WHERE endedAt IS NULL)",
+            )
+            .run(now, input.sessionId, questionId)
+          this.#work.setWaiting(input.sessionId, questionId, false, now)
+        }
+      })
+      this.observe({ ...base, status: 'running' })
+    }
+    return !!match.registered || match.completed.length > 0
   }
 
   /** Consume a correlated native action; callbacks from expired invitations or old breaks fail closed. */
@@ -757,6 +889,28 @@ export class Supervision {
     })
   }
 
+  /**
+   * Record the original hook's positive confirmation that it wrote no answer bytes.
+   * A held receipt keeps the original request claim consumed and its candidate private.
+   * @example supervisor.discardUndelivered('session', 'question')
+   */
+  discardUndelivered(sessionId: string, questionId: string): void {
+    this.#transaction(() => {
+      const card = this.#card(sessionId, questionId)
+      if (card?.disposition !== 'pending') return
+      this.#db
+        .prepare(
+          "UPDATE sv_questions SET disposition='held' WHERE sessionId=? AND questionId=? AND disposition='pending'",
+        )
+        .run(sessionId, questionId)
+      this.#db
+        .prepare(
+          "UPDATE sv_reviews SET outcome='held',answer=NULL,reason='Original hook confirmed no answer was delivered',at=? WHERE breakId=? AND sessionId=? AND questionId=? AND outcome='pending'",
+        )
+        .run(this.#now(), card.candidate, sessionId, questionId)
+    })
+  }
+
   /** Claim ready native side effects once across repeated polling, racing actions, and restarts. */
   takeEffects(): NativeEffect[] {
     return this.#transaction(() => {
@@ -786,22 +940,26 @@ export class Supervision {
     })
   }
 
+  /** Load a bounded local IPC page while pinning the chosen break and receipt order. */
+  reviewPage(query: ReviewQuery = {}): ReviewPage {
+    this.tick()
+    return readReviewPage(this.#db, query)
+  }
+
   /** Read private review details for a specific break or the most recently started one. */
   review(breakId?: string): ReviewReceipt[] {
     this.tick()
-    const id =
-      breakId ??
-      this.#db
-        .prepare(
-          'SELECT id FROM sv_breaks ORDER BY startedAt DESC,rowid DESC LIMIT 1',
-        )
-        .get()?.id
-    if (id === undefined) return []
-    return this.#db
-      .prepare(
-        'SELECT breakId,sessionId,questionId,question,answer,outcome,reason,at FROM sv_reviews WHERE breakId=? ORDER BY at,rowid',
-      )
-      .all(id) as unknown as ReviewReceipt[]
+    const rows: ReviewReceipt[] = []
+    let page = readReviewPage(this.#db, { breakId })
+    rows.push(...page.rows)
+    while (page.nextCursor) {
+      page = readReviewPage(this.#db, {
+        breakId: page.breakId ?? undefined,
+        cursor: page.nextCursor,
+      })
+      rows.push(...page.rows)
+    }
+    return rows
   }
 
   /** Project current load and detector coverage for the local CLI; question text is available through review. */

@@ -1,6 +1,6 @@
 import { resolve } from 'node:path'
 import { configureHooks } from './settings.js'
-import { dataDirectory, requestGateway } from './ipc.js'
+import { dataDirectory, requestGateway, isObject } from './ipc.js'
 import { runHook } from './hooks.js'
 
 export const commandDescription =
@@ -83,6 +83,10 @@ export async function runCommand(
     return
   }
   if (!commandNames.some((n) => n === op) || settings) throw Error(usage)
+  if (op === 'review') {
+    console.log(JSON.stringify(await requestReview(directory, extra), null, 2))
+    return
+  }
   const value = await requestGateway(
     directory,
     { op, ...(extra ? { breakId: extra } : {}) },
@@ -93,4 +97,36 @@ export async function runCommand(
         : 10000,
   )
   console.log(JSON.stringify(value, null, 2))
+}
+
+/** Retrieve a complete break from bounded Gateway pages, pinning the first page's break ID.
+ * @example
+ * const rows = await requestReview(profileDir, breakId)
+ */
+export async function requestReview(
+  directory: string,
+  breakId?: string,
+): Promise<unknown[]> {
+  const rows: unknown[] = []
+  let cursor: string | undefined
+  do {
+    const page = await requestGateway(directory, {
+      op: 'review-page',
+      breakId,
+      cursor,
+    })
+    if (
+      !isObject(page) ||
+      !Array.isArray(page.rows) ||
+      (page.breakId !== null && typeof page.breakId !== 'string') ||
+      (page.nextCursor !== null && typeof page.nextCursor !== 'string')
+    )
+      throw Error('Invalid break review page.')
+    rows.push(...page.rows)
+    breakId = page.breakId ?? undefined
+    if (page.nextCursor && page.nextCursor === cursor)
+      throw Error('Review cursor did not advance.')
+    cursor = page.nextCursor ?? undefined
+  } while (cursor)
+  return rows
 }

@@ -42,6 +42,8 @@ interface ServiceOptions {
   tickMs?: number
 }
 interface PendingReceipt {
+  breakId: string
+  deliverBefore: number
   sessionId: string
   questionId: string
   expires: number
@@ -88,7 +90,15 @@ export async function startService(
     importing ??= preferences
       .importHistory(options.roots)
       .then((v) => {
-        for (const reply of preferences.humanResponsesSince(now() - 3600000)) {
+        const since = now() - 3_600_000
+        for (const reply of preferences.excludedResponsesSince(since)) {
+          coordinator.retractHumanReply({
+            provider: reply.source,
+            sessionId: reply.sessionId,
+            responseId: reply.responseId,
+          })
+        }
+        for (const reply of preferences.humanResponsesSince(since)) {
           coordinator.humanReply({
             provider: reply.source,
             sessionId: reply.sessionId,
@@ -141,7 +151,12 @@ export async function startService(
                 .filter((r) => r.outcome === 'sent')
                 .map((r) => ({ question: r.question, answer: r.answer ?? '' })),
               held: rows
-                .filter((r) => r.outcome !== 'sent' && r.outcome !== 'human')
+                .filter(
+                  (r) =>
+                    r.outcome !== 'sent' &&
+                    r.outcome !== 'human' &&
+                    r.outcome !== 'resolved',
+                )
                 .map((r) => ({
                   question: r.question,
                   reason: r.reason ?? r.outcome,
@@ -212,24 +227,44 @@ export async function startService(
       coordinator.observe({ ...base, status: 'idle' })
       return null
     }
-    if (event === 'Notification' || event === 'PermissionRequest') {
-      if (event === 'PermissionRequest' || r.reason === 'permission_prompt') {
+    if (
+      typeof r.toolName === 'string' &&
+      r.toolName !== 'AskUserQuestion' &&
+      (event === 'PreToolUse' ||
+        event === 'PermissionRequest' ||
+        event === 'PostToolUse' ||
+        event === 'PostToolUseFailure')
+    ) {
+      coordinator.observeExecution({
+        event,
+        sessionId,
+        incarnation,
+        toolName: r.toolName,
+        toolUseId: questionId,
+        fingerprint:
+          typeof r.fingerprint === 'string' ? r.fingerprint : undefined,
+        at:
+          typeof r.at === 'number' && Number.isFinite(r.at)
+            ? Math.min(r.at, now())
+            : now(),
+      })
+      return null
+    }
+    if (event === 'Notification') {
+      if (r.reason === 'permission_prompt')
         coordinator.observe({ ...base, status: 'waiting' })
-        if (questionId)
-          coordinator.question({
-            sessionId,
-            questionId,
-            incarnation,
-            question: 'Execution approval',
-            kind: 'approval',
-            openedAt: now(),
-          })
-      } else if (r.reason === 'idle_prompt')
+      else if (r.reason === 'idle_prompt')
         coordinator.observe({ ...base, status: 'idle' })
       return null
     }
     if (event === 'UserPromptSubmit' && typeof r.prompt === 'string') {
-      preferences.recordInstruction('claude', sessionId, r.prompt, now())
+      preferences.recordInstruction(
+        'claude',
+        sessionId,
+        r.prompt,
+        now(),
+        r.truncated === true,
+      )
       if (typeof r.replyTo === 'string')
         coordinator.humanReply({
           provider: 'claude',
@@ -277,6 +312,9 @@ export async function startService(
               cwd,
               card,
               label,
+              conditional:
+                Array.isArray(r.conditional) &&
+                r.conditional.includes(card.question),
               askedAt: Number(start.openedAt),
               answeredAt: now(),
             })
@@ -355,6 +393,24 @@ export async function startService(
         coordinator.hold(sessionId, questionId, 'Confirmation unavailable')
         return null
       }
+      // History import and a new explicit instruction can change eligibility while the model is answering.
+      for (const [index, card] of cards.entries()) {
+        const fresh = preferences.evaluate(card, {
+          cwd,
+          now: now(),
+          session: { source: 'claude', sessionId },
+        })
+        if (fresh.eligibleLabel !== payload[index]!.candidate) {
+          coordinator.hold(
+            sessionId,
+            questionId,
+            fresh.reason ?? 'Preference changed during confirmation',
+          )
+          return null
+        }
+      }
+      const authorizedBreak = coordinator.status().break
+      if (!authorizedBreak || authorizedBreak.id !== ticket.breakId) return null
       const answers = Object.fromEntries(
         payload.map((c) => [c.question, c.candidate]),
       )
@@ -374,8 +430,14 @@ export async function startService(
         )
       )
         return null
-      pending.set(receipt, { sessionId, questionId, expires: now() + 15000 })
-      return { answers, receipt }
+      pending.set(receipt, {
+        sessionId,
+        questionId,
+        breakId: ticket.breakId,
+        deliverBefore: authorizedBreak.endsAt,
+        expires: now() + 15000,
+      })
+      return { answers, receipt, deliverBefore: authorizedBreak.endsAt }
     } finally {
       activeAsks.delete(id)
     }
@@ -390,10 +452,11 @@ export async function startService(
           native: nativeStatus,
           history: lastImport,
         }
-      case 'review':
-        return coordinator.review(
-          typeof r.breakId === 'string' ? r.breakId : undefined,
-        )
+      case 'review-page':
+        return coordinator.reviewPage({
+          breakId: typeof r.breakId === 'string' ? r.breakId : undefined,
+          cursor: typeof r.cursor === 'string' ? r.cursor : undefined,
+        })
       case 'return': {
         const current = coordinator.status().break
         if (!current) return { returned: false }
@@ -412,6 +475,24 @@ export async function startService(
         const value = await onHook(r, ctx)
         tick()
         return value
+      }
+      case 'can-deliver': {
+        const receipt =
+          typeof r.receipt === 'string' ? pending.get(r.receipt) : undefined
+        return (
+          !!receipt &&
+          now() < receipt.expires &&
+          now() < receipt.deliverBefore &&
+          coordinator.status().break?.id === receipt.breakId
+        )
+      }
+      case 'undelivered': {
+        const receipt =
+          typeof r.receipt === 'string' ? pending.get(r.receipt) : undefined
+        if (!receipt || typeof r.receipt !== 'string') return false
+        pending.delete(r.receipt)
+        coordinator.discardUndelivered(receipt.sessionId, receipt.questionId)
+        return true
       }
       case 'ack': {
         const receipt =
@@ -445,15 +526,18 @@ export async function startService(
     )
     coordinator = new Supervision(db, { ...options.workload, now })
     preferences = new PreferenceStore(db)
-    ui = (options.nativeFactory ?? createNativeBreakUi)(async (action) => {
-      if (closing) return
-      // Freeze the known session set as soon as the native callback arrives.
-      coordinator.action(
-        action.id,
-        action.kind === 'start' ? 'accept' : action.kind,
-      )
-      await effects()
-    })
+    ui = (options.nativeFactory ?? createNativeBreakUi)(
+      async (action) => {
+        if (closing) return
+        // Freeze the known session set as soon as the native callback arrives.
+        coordinator.action(
+          action.id,
+          action.kind === 'start' ? 'accept' : action.kind,
+        )
+        await effects()
+      },
+      { profileDirectory: options.directory },
+    )
     ready = true
   } catch (err) {
     await closeSocket()

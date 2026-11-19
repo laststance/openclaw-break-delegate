@@ -96,7 +96,13 @@ try {
   host(['break-delegate', 'setup', '--settings', settings])
   const registered = JSON.parse(readFileSync(settings, 'utf8'))
   if (
-    !registered.hooks?.PreToolUse?.some((h) => h.matcher === 'AskUserQuestion')
+    !registered.hooks?.PreToolUse?.some(
+      (h) =>
+        !h.matcher &&
+        h.hooks?.some((item) =>
+          item.command?.includes('openclaw-break-delegate-hook-v1'),
+        ),
+    )
   )
     throw Error(
       'The installed command did not configure Claude question hooks.',
