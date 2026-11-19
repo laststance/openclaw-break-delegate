@@ -6,7 +6,7 @@ Break Delegate offers a macOS break when supervising coding agents has taken sus
 
 Use macOS 13 or later, an interactive Claude Code terminal, and OpenClaw 2026.11.5 or later with a configured agent that supports fresh, tool-free inference. The package includes a universal native notification helper. Codex Desktop and CLI contribute observable workload. The status command reports the available coverage on your Mac.
 
-To build from this checkout, install Node.js 24.16 or later in the 24.x series, pnpm 12, and Xcode Command Line Tools. Run these commands in the repository root.
+To build from this checkout, install pnpm 12 and Xcode Command Line Tools. CI uses Node.js 24.x, with 24.16 as the package minimum. The package also accepts Node.js 26.1 or later. Run these commands in the repository root.
 
 ```sh
 pnpm install --frozen-lockfile
@@ -31,7 +31,7 @@ The plugin uses a rolling 60-minute window. Each minute with an active session e
 
 Dismiss the invitation to silence it until the score falls below 45 and reaches it again, or snooze it for 15 minutes. Accepting fixes the participating terminals at that moment. New question cards in those terminals can receive replies for up to 15 minutes. Existing cards, execution approvals, conflicting instructions and questions with insufficient evidence wait for you. Other work continues. On return the workload score starts at zero.
 
-Use **I'm back** from the native menu or the terminal. The local review shows the questions associated with the break and the disposition of each reply.
+Choose **I'm back** in the Mac menu or run `openclaw break-delegate return` in the terminal. The local review shows the questions associated with the break and the disposition of each reply.
 
 ```sh
 openclaw break-delegate return
@@ -56,20 +56,22 @@ The local policy supplies an eligible choice to the configured OpenClaw agent fo
 
 Plugin configuration lives under `plugins.entries.break-delegate.config`. `agentId` selects the configured OpenClaw agent (default `main`). `historyRoots` can override the local state directories for `claude`, `codex` and `gstack`. If you supply this object, only its listed history sources are imported. State and review data are stored in a user-private `break-delegate` directory under the local OpenClaw profile. The service and installed hooks must use the same Mac account and profile.
 
-To adjust break timing, set `workload.threshold` (default 45), `workload.activePointsPerMinute` (1), `workload.additionalPointsPerMinute` (0.1), or `workload.humanReplyPoints` (4) in the plugin configuration, then restart the Gateway.
+To change when the invitation appears, set `workload.threshold` (default 45), `workload.activePointsPerMinute` (1), `workload.additionalPointsPerMinute` (0.1), or `workload.humanReplyPoints` (4) in the plugin configuration, then restart the Gateway. A break runs for up to 15 minutes. Snoozing asks for a reminder 15 minutes later if the score still qualifies and you are still supervising.
 
-To stop delegating immediately, use `return`. To disable the integration, remove the hooks before unloading the plugin. Reinstalling them later uses `setup` again.
+To stop delegating immediately, use `return`. To disable the integration, remove the hooks before unloading the plugin. If you installed the hooks with `setup --settings`, pass the same `--settings` path to `uninstall-hooks`.
 
 ```sh
 openclaw break-delegate uninstall-hooks
 openclaw plugins disable break-delegate
 ```
 
+Apply the change by restarting the Gateway. To resume later, enable `break-delegate`, restart the Gateway and run `setup` with the original settings path if you used one.
+
 ## Verify or prepare publication
 
 `pnpm validate` builds and checks the plugin. On macOS, `pnpm run pack:release` builds and verifies the native helper, runs the tests, and writes the npm-compatible archive under `release/`. `pnpm run smoke:install` installs that archive into a disposable OpenClaw profile and exercises its command surface. The native build accepts `BREAK_DELEGATE_SIGN_IDENTITY` for a Developer ID Application identity. The default local build uses an ad-hoc signature.
 
-The release uses OpenClaw’s regular package installer. It keeps the signed Mac application and the Claude hook executable at stable paths inside the installed package.
+The release uses OpenClaw’s regular package installer. It keeps the signed Mac application and the Claude hook executable at stable paths inside the installed package. For Developer ID signing, notarization and packaging the stapled app, see the [macOS helper guide](native/README.md).
 
 To verify the original Claude session on a Mac with Claude Code installed, run `node scripts/qa-claude-terminal.mjs "$(mktemp -d)" "$(command -v claude)"` after building. The interactive CLI talks to an isolated loopback model. The runner supplies synthetic human history and native consent, and verifies the model’s next request, the terminal’s completion message, and the Gateway’s delivery record.
 
@@ -79,4 +81,4 @@ Preview the ClawHub release from the repository root with this read-only publica
 pnpm dlx clawhub@0.26.0 package publish ./release/laststance-openclaw-break-delegate-0.1.0.tgz --family code-plugin --owner laststance --source-repo laststance/openclaw-break-delegate --source-commit "$(git rev-parse HEAD)" --dry-run --json
 ```
 
-The full requirements and terminology are in the [design](DESIGN.md) and [glossary](GLOSSARY.md).
+For requirements, terminology and release history, see the [design](DESIGN.md), [glossary](GLOSSARY.md) and [changelog](CHANGELOG.md).
