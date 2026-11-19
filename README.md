@@ -25,7 +25,7 @@ openclaw break-delegate status
 
 `setup` registers the hook executable from this installation. Run it again after moving or updating the package. Use `setup --settings /absolute/path/to/settings.json` for a custom Claude settings file. Installing against that file hands its Break Delegate hooks to the selected profile. Removal affects hooks owned by that profile.
 
-When updating an existing settings file, setup moves the original into a private recovery directory and installs its update only while the settings path is free. A concurrent editor save keeps that path. If setup reports a conflict, its message identifies the preserved revision in `settings.json.break-delegate-backups/` beside the settings file. If setup is interrupted while the settings path is empty, rerun the same command to recover the previous file before continuing.
+When updating an existing settings file, setup moves the original into a private recovery directory and installs its update only while the settings path is free. If setup detects an editor save before moving the original, it asks you to retry with the newer file. If an editor saves to the same path after the move, the editor's version stays active and the error gives the path to the preserved revision. The recovery directory sits beside the resolved settings file and uses its name, for example `settings.json.break-delegate-backups/`. If setup is interrupted while the settings path is empty, rerun the same command to recover the previous file before continuing.
 
 Start an interactive Claude session to establish an identifiable terminal instance. Notification permission can also be granted from the Break Delegate menu.
 
@@ -89,4 +89,4 @@ Preview the ClawHub release from the repository root with this read-only publica
 pnpm dlx clawhub@0.26.0 package publish ./release/laststance-openclaw-break-delegate-0.1.0.tgz --family code-plugin --owner laststance --source-repo laststance/openclaw-break-delegate --source-commit "$(git rev-parse HEAD)" --dry-run --json
 ```
 
-For requirements, terminology and release history, see the [design](DESIGN.md), [glossary](GLOSSARY.md) and [changelog](CHANGELOG.md).
+For requirements and terminology, see the [design](DESIGN.md) and [glossary](GLOSSARY.md). The release history is in `CHANGELOG.md` in the [source repository](https://github.com/laststance/openclaw-break-delegate).
