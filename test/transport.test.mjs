@@ -21,7 +21,7 @@ import fs, {
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { configureHooks } from '../dist/settings.js'
+import { configureHooks, installedHookExecutable } from '../dist/settings.js'
 import {
   boundedGatewayStatus,
   listenGateway,
@@ -56,6 +56,31 @@ test('reinstalling and removing Claude hooks preserves unrelated settings and co
   assert.equal(active.hooks.PreToolUse.length, 2)
   assert.equal(active.hooks.PreToolUse[1].matcher, undefined)
   assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), original)
+})
+test('setup records the installed hook executable instead of a transient module copy', async (t) => {
+  // Arrange
+  const tmp = await mkdtemp(join(tmpdir(), 'bd-installed-hook-'))
+  t.after(() => rm(tmp, { recursive: true, force: true }))
+  const root = join(tmp, 'extensions', 'break-delegate')
+  await mkdir(join(root, 'dist'), { recursive: true })
+  await writeFile(join(root, 'dist', 'cli.js'), '')
+  const file = join(tmp, 'settings.json')
+  // Act
+  const executable = installedHookExecutable(root)
+  await configureHooks('install', join(tmp, 'state'), file, executable)
+  const commands = Object.values(
+    JSON.parse(await readFile(file, 'utf8')).hooks,
+  ).flatMap((entries) => entries.flatMap((entry) => entry.hooks))
+  // Assert
+  assert.equal(executable, join(root, 'dist', 'cli.js'))
+  assert.equal(installedHookExecutable(join(tmp, 'missing')), undefined)
+  assert.equal(installedHookExecutable(undefined), undefined)
+  assert.ok(commands.length > 0)
+  for (const { command } of commands)
+    assert.ok(
+      command.includes(" '" + executable + "' "),
+      'hook command uses the installed executable: ' + command,
+    )
 })
 test('a second Gateway cannot claim a live profile or intercept its requests', async (t) => {
   // Arrange

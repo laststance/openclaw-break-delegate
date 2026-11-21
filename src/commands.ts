@@ -199,12 +199,15 @@ export async function readHookInput(
 }
 
 /** Execute a command from either the OpenClaw CLI or the packaged hook executable.
+ * `hookExecutable` overrides the hook command recorded by setup; the OpenClaw CLI
+ * passes the installed package's executable because it may run from a transient copy.
  * @example
  * await runCommand(["status"]);
  */
 export async function runCommand(
   argv: readonly string[],
   defaultDir = dataDirectory(),
+  hookExecutable?: string,
 ): Promise<void> {
   const args = [...argv]
   const take = (flag: string) => {
@@ -243,6 +246,7 @@ export async function runCommand(
       op === 'setup' ? 'install' : 'remove',
       directory,
       settings,
+      hookExecutable,
     )
     console.log(JSON.stringify(result, null, 2))
     return

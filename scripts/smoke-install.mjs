@@ -1,12 +1,14 @@
 import { execFileSync, spawn } from 'node:child_process'
 import {
+  existsSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from 'node:fs'
-import { join, resolve, dirname } from 'node:path'
+import { join, resolve, dirname, sep } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createServer } from 'node:net'
 import { randomBytes } from 'node:crypto'
@@ -110,6 +112,32 @@ try {
     throw Error(
       'The installed command did not configure Claude question hooks.',
     )
+  // The host may load the CLI from a transient copy; hooks must outlive it.
+  const hookCommands = Object.values(registered.hooks)
+    .flat()
+    .flatMap((h) => h.hooks ?? [])
+    .map((item) => item.command)
+    .filter((command) => command?.endsWith(' openclaw-break-delegate-hook-v1'))
+  const unquote = (token) => token.replaceAll("'\\''", "'")
+  const hookExecutables = new Set(
+    hookCommands.map((command) => {
+      const match = /^'((?:[^']|'\\'')*)' '((?:[^']|'\\'')*)' /.exec(command)
+      if (!match) throw Error('Unrecognized hook command: ' + command)
+      return unquote(match[2])
+    }),
+  )
+  const installedRoot = realpathSync(
+    join(state, 'extensions', 'break-delegate'),
+  )
+  for (const executable of hookExecutables) {
+    if (!existsSync(executable))
+      throw Error('The registered hook executable is missing: ' + executable)
+    if (!realpathSync(executable).startsWith(installedRoot + sep))
+      throw Error(
+        'The registered hook executable is outside the installed package: ' +
+          executable,
+      )
+  }
   host(['break-delegate', 'uninstall-hooks', '--settings', settings])
   if (JSON.parse(readFileSync(settings, 'utf8')).hooks?.PreToolUse)
     throw Error('Uninstall retained the hook.')

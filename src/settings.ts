@@ -12,7 +12,7 @@ import {
   rm,
 } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
-import { constants, realpathSync } from 'node:fs'
+import { constants, existsSync, realpathSync } from 'node:fs'
 import { DatabaseSync } from 'node:sqlite'
 import { basename, dirname, join, resolve } from 'node:path'
 import { homedir } from 'node:os'
@@ -191,8 +191,25 @@ async function settingsTarget(path: string): Promise<string> {
   throw new Error('Too many links in the Claude settings path.')
 }
 
+/** Hook executable inside the installed plugin root.
+ * The OpenClaw CLI can load plugin code from a transient copy that is deleted after
+ * the command exits, so hooks must not point at this module's own location.
+ * @example
+ * installedHookExecutable('/Users/me/.openclaw/extensions/break-delegate')
+ * // => '/Users/me/.openclaw/extensions/break-delegate/dist/cli.js'
+ */
+export function installedHookExecutable(
+  rootDir: string | undefined,
+): string | undefined {
+  if (!rootDir) return
+  const cli = join(rootDir, 'dist', 'cli.js')
+  return existsSync(cli) ? cli : undefined
+}
+
 /** Install or remove this package's hook commands while preserving unrelated Claude settings.
  * Called only by an explicit local setup or uninstall command.
+ * `cli` is the hook executable to register. The OpenClaw CLI can load this module
+ * from a transient copy, so callers pass the installed package's executable.
  * @example
  * await configureHooks("install", profileDir);
  */
@@ -203,6 +220,7 @@ export async function configureHooks(
     process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude'),
     'settings.json',
   ),
+  cli = fileURLToPath(new URL('./cli.js', import.meta.url)),
 ): Promise<{ changed: boolean; file: string }> {
   // Update a managed settings target without replacing its symbolic link.
   file = await settingsTarget(file)
@@ -235,7 +253,6 @@ export async function configureHooks(
       throw new Error('Existing Claude settings must contain a JSON object.')
     const original = JSON.stringify(settings)
     const hooks: ObjectValue = isObject(settings.hooks) ? settings.hooks : {}
-    const cli = fileURLToPath(new URL('./cli.js', import.meta.url))
     const profile = profileIdentity(stateDir)
     const owners = new Map<string, string>()
     function managed(h: unknown): boolean {

@@ -3,6 +3,7 @@ import { Type } from 'typebox'
 import { commandDescription, commandNames, runCommand } from './commands.js'
 import { isAbsolute } from 'node:path'
 import { dataDirectory, isObject } from './ipc.js'
+import { installedHookExecutable } from './settings.js'
 import { createJudge } from './model.js'
 import { startService } from './service.js'
 
@@ -153,7 +154,11 @@ entry.register = (api) => {
           if (name === 'review' && cmd.args[0]) args.push(cmd.args[0])
           if (flags.stateDir) args.push('--state-dir', flags.stateDir)
           if (flags.settings) args.push('--settings', flags.settings)
-          await runCommand(args)
+          await runCommand(
+            args,
+            undefined,
+            installedHookExecutable(api.rootDir),
+          )
         })
       }
     },
