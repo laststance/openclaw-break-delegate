@@ -4,6 +4,7 @@ import { commandDescription, commandNames, runCommand } from './commands.js'
 import { isAbsolute } from 'node:path'
 import { dataDirectory, isObject } from './ipc.js'
 import { installedHookExecutable } from './settings.js'
+import { installedHelperExecutable } from './native/index.js'
 import { createJudge } from './model.js'
 import { startService } from './service.js'
 
@@ -111,6 +112,7 @@ entry.register = (api) => {
             ? api.pluginConfig.maxConfirmationsPerBreak
             : undefined,
         directory: dataDirectory(ctx.stateDir),
+        helperExecutable: installedHelperExecutable(api.rootDir),
         roots,
         judge: createJudge(api, agentId),
         log: (message) => ctx.logger.warn(message),

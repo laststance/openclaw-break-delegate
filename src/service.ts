@@ -40,6 +40,8 @@ interface ServiceOptions {
   >
   roots?: HistoryRoots
   nativeFactory?: UiFactory
+  /** Native helper inside the installed package. */
+  helperExecutable?: string
   poll?: (coordinator: Supervision) => Promise<void>
   now?: () => number
   tickMs?: number
@@ -849,7 +851,10 @@ export async function startService(
         )
           return 'restore-invitation' as const
       },
-      { profileDirectory: options.directory },
+      {
+        profileDirectory: options.directory,
+        executable: options.helperExecutable,
+      },
     )
     ready = true
     refresh()

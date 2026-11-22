@@ -15,12 +15,36 @@ import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import {
   createNativeBreakUi,
+  installedHelperExecutable,
   nativeHelperExecutable,
 } from '../../dist/native/index.js'
 import { claudeTerminal } from '../../dist/terminal.js'
 
 const fixture = fileURLToPath(new URL('./pipe-fixture.mjs', import.meta.url))
 const repo = fileURLToPath(new URL('../../', import.meta.url))
+
+test('the Gateway launches the native helper from the installed package root', (t) => {
+  // Arrange
+  const root = mkdtempSync(join(tmpdir(), 'bd-installed-helper-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const macos = join(root, 'native/generated/BreakDelegate.app/Contents/MacOS')
+  mkdirSync(macos, { recursive: true })
+  const executable = join(macos, 'BreakDelegate')
+  writeFileSync(executable, '', { mode: 0o755 })
+  const plain = mkdtempSync(join(tmpdir(), 'bd-plain-helper-'))
+  t.after(() => rmSync(plain, { recursive: true, force: true }))
+  const plainMacos = join(
+    plain,
+    'native/generated/BreakDelegate.app/Contents/MacOS',
+  )
+  mkdirSync(plainMacos, { recursive: true })
+  writeFileSync(join(plainMacos, 'BreakDelegate'), '', { mode: 0o644 })
+  // Act & Assert
+  assert.equal(installedHelperExecutable(root), executable)
+  assert.equal(installedHelperExecutable(plain), undefined)
+  assert.equal(installedHelperExecutable(join(root, 'missing')), undefined)
+  assert.equal(installedHelperExecutable(undefined), undefined)
+})
 
 test(
   'the packaged process classifier reads exact argv boundaries from live Darwin Node launchers',

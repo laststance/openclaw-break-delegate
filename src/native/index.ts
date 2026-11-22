@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessByStdio } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { accessSync, constants } from 'node:fs'
-import { resolve } from 'node:path'
+import { join, resolve } from 'node:path'
 import type { Readable, Writable } from 'node:stream'
 import { fileURLToPath } from 'node:url'
 import { dataDirectory, isObject } from '../ipc.js'
@@ -50,6 +50,8 @@ type ActionHandler = (
 ) => ActionResult | Promise<ActionResult>
 type LaunchOptions = {
   profileDirectory?: string
+  /** Helper inside the installed package; defaults to the copy beside this module. */
+  executable?: string
   launch?: (profileKey: string) => Helper
   timeoutMs?: number
   retryMs?: number
@@ -72,6 +74,30 @@ export const nativeHelperExecutable = fileURLToPath(
     import.meta.url,
   ),
 )
+/**
+ * Native helper inside the installed plugin root.
+ * OpenClaw can load plugin code from a transient copy, so the Gateway launches the
+ * helper from the stable installation when it is present.
+ *
+ * @example
+ * installedHelperExecutable('/Users/me/.openclaw/extensions/break-delegate')
+ */
+export function installedHelperExecutable(
+  rootDir: string | undefined,
+): string | undefined {
+  if (!rootDir) return
+  const executable = join(
+    rootDir,
+    'native/generated/BreakDelegate.app/Contents/MacOS/BreakDelegate',
+  )
+  try {
+    accessSync(executable, constants.X_OK)
+    return executable
+  } catch {
+    return undefined
+  }
+}
+
 const unavailable = (detail: string): NativeStatus => ({
   status: 'unavailable',
   detail,
@@ -90,11 +116,15 @@ const statuses = new Set([
  * @example
  * const child = launchHelper(profileKey, profileDirectory);
  */
-function launchHelper(profileKey: string, profileDirectory: string): Helper {
+function launchHelper(
+  profileKey: string,
+  profileDirectory: string,
+  executable = nativeHelperExecutable,
+): Helper {
   if (process.platform !== 'darwin')
     throw new Error('Native notifications require a macOS desktop session.')
   try {
-    accessSync(nativeHelperExecutable, constants.X_OK)
+    accessSync(executable, constants.X_OK)
   } catch {
     throw new Error(
       'The signed Break Delegate app is missing or cannot be executed. Install a package containing the native helper.',
@@ -116,7 +146,7 @@ function launchHelper(profileKey: string, profileDirectory: string): Helper {
   ]) {
     if (process.env[key]) env[key] = process.env[key]
   }
-  return spawn(nativeHelperExecutable, ['--bridge', profileKey], {
+  return spawn(executable, ['--bridge', profileKey], {
     stdio: ['pipe', 'pipe', 'ignore'],
     env,
   })
@@ -333,7 +363,7 @@ export function createNativeBreakUi(
     retry = undefined
     const instance = options.launch
       ? options.launch(profileKey)
-      : launchHelper(profileKey, profileDirectory)
+      : launchHelper(profileKey, profileDirectory, options.executable)
     child = instance
     let buffer = ''
     const fail = () =>
